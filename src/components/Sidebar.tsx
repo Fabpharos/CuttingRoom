@@ -1,6 +1,6 @@
 import ThemeSwitch from "./ThemeSwitch";
 
-export type TabId = "album" | "matching" | "detection";
+export type TabId = "album" | "matching" | "detection" | "stripMetadata";
 
 type Theme = "light" | "dark";
 
@@ -57,6 +57,25 @@ function DetectionTabIcon({ color }: { color: string }) {
       <path d="M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16" />
       <path d="M8 20H5.5A1.5 1.5 0 0 1 4 18.5V16" />
       <rect x="9" y="9" width="6" height="6" rx="0.5" />
+    </svg>
+  );
+}
+
+function MetadataTabIcon({ color }: { color: string }) {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      style={{ stroke: color }}
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M11 3h6a2 2 0 0 1 2 2v6l-8.5 8.5a2 2 0 0 1-2.8 0L3 15.3a2 2 0 0 1 0-2.8L11 3Z" />
+      <circle cx="15.5" cy="7.5" r="1.2" fill={color} stroke="none" />
+      <path d="M4 4l16 16" />
     </svg>
   );
 }
@@ -227,6 +246,13 @@ export default function Sidebar({
           active={activeTab === "detection"}
           collapsed={collapsed}
           onClick={() => onSelectTab("detection")}
+        />
+        <NavItem
+          icon={<MetadataTabIcon color={iconColorFor("stripMetadata")} />}
+          label="Strip Metadata"
+          active={activeTab === "stripMetadata"}
+          collapsed={collapsed}
+          onClick={() => onSelectTab("stripMetadata")}
         />
       </nav>
 

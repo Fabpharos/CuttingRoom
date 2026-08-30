@@ -4,6 +4,7 @@ import Sidebar, { type TabId } from "./components/Sidebar";
 import AlbumTab from "./components/AlbumTab";
 import MatchingTab from "./components/MatchingTab";
 import DetectionTab from "./components/DetectionTab";
+import StripMetadataTab from "./components/StripMetadataTab";
 
 type Theme = "light" | "dark";
 
@@ -57,6 +58,9 @@ export default function App() {
         </TabPanel>
         <TabPanel active={activeTab === "detection"}>
           <DetectionTab />
+        </TabPanel>
+        <TabPanel active={activeTab === "stripMetadata"}>
+          <StripMetadataTab />
         </TabPanel>
       </div>
     </div>
