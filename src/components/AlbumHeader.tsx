@@ -7,6 +7,7 @@ export default function AlbumHeader({
   totalCount,
   onChangeFolder,
   onCommitName,
+  onRefresh,
   revertToken,
 }: {
   albumName: string;
@@ -15,6 +16,7 @@ export default function AlbumHeader({
   totalCount: number;
   onChangeFolder: () => void;
   onCommitName: (newName: string) => void;
+  onRefresh: () => void;
   // Bumped by the parent whenever a commit attempt fails, so the field
   // resyncs to `albumName` even though that string itself didn't change.
   revertToken?: number;
@@ -98,6 +100,17 @@ export default function AlbumHeader({
               ? `${photoCount} PHOTO${photoCount === 1 ? "" : "S"}`
               : `${photoCount} OF ${totalCount} PHOTOS`}
           </span>
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault();
+              onRefresh();
+            }}
+            title="Look for newly added photos"
+            style={{ fontSize: 13, fontWeight: 600, whiteSpace: "nowrap" }}
+          >
+            Refresh
+          </a>
           <a
             href="#"
             onClick={(e) => {

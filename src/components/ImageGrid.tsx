@@ -1,10 +1,11 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import {
   DndContext,
   closestCenter,
   useSensor,
   useSensors,
   type DragEndEvent,
+  type DragStartEvent,
 } from "@dnd-kit/core";
 import { SortableContext, arrayMove, rectSortingStrategy } from "@dnd-kit/sortable";
 import AlbumHeader from "./AlbumHeader";
@@ -67,6 +68,7 @@ export default function ImageGrid({
   needsEditFilterOn,
   favoritesFilterOn,
   onChangeFolder,
+  onRefresh,
   onCommitName,
   onReorder,
   onToggleTag,
@@ -76,6 +78,7 @@ export default function ImageGrid({
   onOpenViewer,
   onToggleNeedsEditFilter,
   onToggleFavoritesFilter,
+  onContextMenu,
   nameRevertToken,
 }: {
   folderPath: string;
@@ -88,6 +91,7 @@ export default function ImageGrid({
   needsEditFilterOn: boolean;
   favoritesFilterOn: boolean;
   onChangeFolder: () => void;
+  onRefresh: () => void;
   onCommitName: (newName: string) => void;
   onReorder: (newOrder: string[]) => void;
   onToggleTag: (name: string) => void;
@@ -97,6 +101,7 @@ export default function ImageGrid({
   onOpenViewer: (index: number) => void;
   onToggleNeedsEditFilter: () => void;
   onToggleFavoritesFilter: () => void;
+  onContextMenu: (index: number, x: number, y: number) => void;
   nameRevertToken?: number;
 }) {
   // Distance-based activation: the drag starts the instant the pointer moves
@@ -110,13 +115,54 @@ export default function ImageGrid({
     }),
   );
 
+  // Tracked purely so every thumbnail in a multi-selection can be dimmed
+  // together while one of them is being dragged — dnd-kit only marks the
+  // one item actually under the pointer as "dragging".
+  const [activeId, setActiveId] = useState<string | null>(null);
+
+  function handleDragStart(event: DragStartEvent) {
+    setActiveId(String(event.active.id));
+  }
+
   function handleDragEnd(event: DragEndEvent) {
+    setActiveId(null);
     const { active, over } = event;
     if (!over || active.id === over.id) return;
-    const oldIndex = images.findIndex((img) => img.name === active.id);
-    const newIndex = images.findIndex((img) => img.name === over.id);
-    if (oldIndex === -1 || newIndex === -1) return;
-    onReorder(arrayMove(images, oldIndex, newIndex).map((img) => img.name));
+    const activeName = String(active.id);
+    const overName = String(over.id);
+
+    const isGroupDrag = selectedNames.size > 1 && selectedNames.has(activeName);
+    if (!isGroupDrag) {
+      const oldIndex = images.findIndex((img) => img.name === activeName);
+      const newIndex = images.findIndex((img) => img.name === overName);
+      if (oldIndex === -1 || newIndex === -1) return;
+      onReorder(arrayMove(images, oldIndex, newIndex).map((img) => img.name));
+      return;
+    }
+
+    // Move the whole selected block together, preserving the moved items'
+    // relative order, dropped just before/after the target depending on
+    // drag direction. Dropping onto another selected item is a no-op —
+    // there's no unambiguous place to put the group relative to one of
+    // its own members.
+    if (selectedNames.has(overName)) return;
+
+    const movingItems = images.filter((img) => selectedNames.has(img.name));
+    const remaining = images.filter((img) => !selectedNames.has(img.name));
+    const overIndexInRemaining = remaining.findIndex((img) => img.name === overName);
+    if (overIndexInRemaining === -1) return;
+
+    const activeOriginalIndex = images.findIndex((img) => img.name === activeName);
+    const overOriginalIndex = images.findIndex((img) => img.name === overName);
+    const insertAfter = activeOriginalIndex < overOriginalIndex;
+    const insertIndex = overIndexInRemaining + (insertAfter ? 1 : 0);
+
+    const newOrder = [
+      ...remaining.slice(0, insertIndex),
+      ...movingItems,
+      ...remaining.slice(insertIndex),
+    ];
+    onReorder(newOrder.map((img) => img.name));
   }
 
   return (
@@ -127,6 +173,7 @@ export default function ImageGrid({
         photoCount={images.length}
         totalCount={totalCount}
         onChangeFolder={onChangeFolder}
+        onRefresh={onRefresh}
         onCommitName={onCommitName}
         revertToken={nameRevertToken}
       />
@@ -181,7 +228,9 @@ export default function ImageGrid({
         <DndContext
           sensors={sensors}
           collisionDetection={closestCenter}
+          onDragStart={handleDragStart}
           onDragEnd={handleDragEnd}
+          onDragCancel={() => setActiveId(null)}
         >
           <SortableContext
             items={images.map((img) => img.name)}
@@ -195,21 +244,31 @@ export default function ImageGrid({
                 gap: 12,
               }}
             >
-              {images.map((img, i) => (
-                <Thumbnail
-                  key={img.name}
-                  id={img.name}
-                  src={img.src}
-                  name={img.name}
-                  needsEdit={!!tags[img.name]}
-                  favorite={!!favorites[img.name]}
-                  selected={selectedNames.has(img.name)}
-                  onToggleTag={() => onToggleTag(img.name)}
-                  onToggleFavorite={() => onToggleFavorite(img.name)}
-                  onSelect={(shiftKey, ctrlKey) => onSelect(i, shiftKey, ctrlKey)}
-                  onOpen={() => onOpenViewer(i)}
-                />
-              ))}
+              {images.map((img, i) => {
+                const isGroupDragging =
+                  activeId !== null &&
+                  activeId !== img.name &&
+                  selectedNames.size > 1 &&
+                  selectedNames.has(activeId) &&
+                  selectedNames.has(img.name);
+                return (
+                  <Thumbnail
+                    key={img.name}
+                    id={img.name}
+                    src={img.src}
+                    name={img.name}
+                    needsEdit={!!tags[img.name]}
+                    favorite={!!favorites[img.name]}
+                    selected={selectedNames.has(img.name)}
+                    dimmed={isGroupDragging}
+                    onToggleTag={() => onToggleTag(img.name)}
+                    onToggleFavorite={() => onToggleFavorite(img.name)}
+                    onSelect={(shiftKey, ctrlKey) => onSelect(i, shiftKey, ctrlKey)}
+                    onOpen={() => onOpenViewer(i)}
+                    onContextMenu={(x, y) => onContextMenu(i, x, y)}
+                  />
+                );
+              })}
             </div>
           </SortableContext>
         </DndContext>

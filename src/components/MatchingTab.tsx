@@ -1,20 +1,24 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readDir } from "@tauri-apps/plugin-fs";
 import { join } from "@tauri-apps/api/path";
-import { isImageFile, naturalCompare } from "../lib/images";
+import { extensionOf, isImageFile, naturalCompare } from "../lib/images";
 import { getThumbnailUrl } from "../lib/thumbnails";
 import {
   findImageMatches,
   cancelMatch,
   copyFilesToFolder,
   matchConfidenceLabel,
+  computeAssignment,
+  type CopyJob,
+  type MatchMatrix,
   type MatchProgress,
 } from "../lib/matching";
 import type { ImageEntry } from "./ImageGrid";
 
 type ReviewRow = {
   albumName: string;
+  albumPath: string;
   albumSrc: string;
   matchPath: string | null;
   matchSrc: string | null;
@@ -28,12 +32,67 @@ export default function MatchingTab() {
   const [leftFolder, setLeftFolder] = useState<string | null>(null);
   const [leftImages, setLeftImages] = useState<ImageEntry[]>([]);
   const [phase, setPhase] = useState<Phase>("pickLeft");
+  const [matrix, setMatrix] = useState<MatchMatrix | null>(null);
   const [rows, setRows] = useState<ReviewRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [destDir, setDestDir] = useState<string | null>(null);
   const [copiedCount, setCopiedCount] = useState(0);
   const [progress, setProgress] = useState<MatchProgress | null>(null);
+  // Hamming distance over a 64-bit hash tops out at 64; matches farther
+  // apart than this are visually unrelated, not just a weak match.
+  const [maxDistance, setMaxDistance] = useState(20);
+  // Off by default: each target photo is claimed by at most one source
+  // photo. Turning this on restores the simpler "closest match, ties and
+  // reuse allowed" behavior.
+  const [allowDuplicates, setAllowDuplicates] = useState(false);
   const runIdRef = useRef<string | null>(null);
+  const rowsRef = useRef<ReviewRow[]>([]);
+
+  useEffect(() => {
+    rowsRef.current = rows;
+  }, [rows]);
+
+  // Re-derives the assignment (and, only for rows whose match actually
+  // changed, their thumbnail) whenever the matrix, threshold, or
+  // duplicates setting changes — so both settings can be tuned instantly
+  // after the scan completes, with no re-hashing.
+  useEffect(() => {
+    if (!matrix) return;
+    let cancelled = false;
+    const assignment = computeAssignment(matrix.distances, maxDistance, allowDuplicates);
+    (async () => {
+      const prev = rowsRef.current;
+      const nextRows = await Promise.all(
+        matrix.albumPaths.map(async (albumPath, i) => {
+          const sourceIndex = assignment[i];
+          const matchPath = sourceIndex !== null ? matrix.sourcePaths[sourceIndex] : null;
+          const distance = sourceIndex !== null ? matrix.distances[i][sourceIndex] : null;
+          const albumImg = leftImages[i] as ImageEntry | undefined;
+          const prevRow = prev[i];
+          const unchanged = !!prevRow && prevRow.matchPath === matchPath;
+          const matchSrc = unchanged
+            ? prevRow.matchSrc
+            : matchPath
+              ? await getThumbnailUrl(matchPath)
+              : (albumImg?.src ?? null);
+          return {
+            albumName: albumImg?.name ?? "",
+            albumPath,
+            albumSrc: albumImg?.src ?? "",
+            matchPath,
+            matchSrc,
+            distance,
+            included: unchanged ? prevRow.included : true,
+          };
+        }),
+      );
+      if (!cancelled) setRows(nextRows);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [matrix, maxDistance, allowDuplicates]);
 
   async function chooseLeftFolder() {
     const dir = await open({ directory: true, multiple: false });
@@ -54,6 +113,7 @@ export default function MatchingTab() {
       setLeftFolder(dir);
       setLeftImages(withThumbs);
       setPhase("idle");
+      setMatrix(null);
       setRows([]);
     } catch (err) {
       setError(`Couldn't open folder: ${String(err)}`);
@@ -79,24 +139,14 @@ export default function MatchingTab() {
         leftImages.map((img) => join(leftFolder, img.name)),
       );
 
-      const matches = await findImageMatches(runId, albumPaths, sourcePaths, setProgress);
+      const result = await findImageMatches(runId, albumPaths, sourcePaths, setProgress);
       // Cancelling doesn't reject this promise — the Rust side just returns
       // an empty result — so without this check, a cancelled run's success
       // path would still fire afterward and stomp the "idle" state the
       // cancel button just set, with an empty review list.
       if (runIdRef.current !== runId) return;
 
-      const withThumbs = await Promise.all(
-        matches.map(async (m, i) => ({
-          albumName: leftImages[i].name,
-          albumSrc: leftImages[i].src,
-          matchPath: m.matchPath,
-          matchSrc: m.matchPath ? await getThumbnailUrl(m.matchPath) : null,
-          distance: m.distance,
-          included: m.matchPath !== null,
-        })),
-      );
-      setRows(withThumbs);
+      setMatrix(result);
       setPhase("review");
     } catch (err) {
       if (runIdRef.current !== runId) return;
@@ -111,19 +161,36 @@ export default function MatchingTab() {
     );
   }
 
+  // The copied file's content comes from whichever photo won the match,
+  // but its name should read as the source photo — only borrowing the
+  // matched file's extension when it actually differs (e.g. the match was
+  // a PNG re-save of a photo the source folder has as a JPEG).
+  function destinationNameFor(row: ReviewRow): string {
+    const sourcePath = row.matchPath ?? row.albumPath;
+    const sourceBaseName = sourcePath.split(/[\\/]/).pop() ?? sourcePath;
+    const sourceExt = extensionOf(sourceBaseName);
+    const albumExt = extensionOf(row.albumName);
+    if (!sourceExt || sourceExt === albumExt) return row.albumName;
+    const stem = albumExt ? row.albumName.slice(0, -albumExt.length) : row.albumName;
+    return `${stem}${sourceExt}`;
+  }
+
   async function chooseDestAndCopy() {
     const dest = await open({ directory: true, multiple: false });
     if (typeof dest !== "string") return;
-    const toCopy = rows
-      .filter((r) => r.included && r.matchPath)
-      .map((r) => r.matchPath as string);
-    if (toCopy.length === 0) return;
+    // Every included row contributes something now — its matched target
+    // photo if it has one, otherwise a copy of the source photo itself —
+    // but always named after the source photo.
+    const jobs: CopyJob[] = rows
+      .filter((r) => r.included)
+      .map((r) => ({ src: r.matchPath ?? r.albumPath, fileName: destinationNameFor(r) }));
+    if (jobs.length === 0) return;
     setPhase("copying");
     setError(null);
     try {
-      await copyFilesToFolder(toCopy, dest);
+      await copyFilesToFolder(jobs, dest);
       setDestDir(dest);
-      setCopiedCount(toCopy.length);
+      setCopiedCount(jobs.length);
       setPhase("done");
     } catch (err) {
       setError(`Couldn't copy files: ${String(err)}`);
@@ -138,7 +205,7 @@ export default function MatchingTab() {
     }
   }
 
-  const includedCount = rows.filter((r) => r.included && r.matchPath).length;
+  const includedCount = rows.filter((r) => r.included).length;
   const isBusy = phase === "loading" || phase === "copying";
 
   return (
@@ -156,7 +223,8 @@ export default function MatchingTab() {
           Compares every photo in a folder against a second folder and finds each one's
           closest visual match — even at a different resolution (handy for tracking down
           the original, un-upscaled file). Review the matches, then copy the ones you
-          want into a destination folder.
+          want into a destination folder. A photo with no acceptable match copies over
+          as-is instead of being skipped.
         </div>
       </div>
 
@@ -240,6 +308,7 @@ export default function MatchingTab() {
                   setPhase("pickLeft");
                   setLeftFolder(null);
                   setLeftImages([]);
+                  setMatrix(null);
                   setRows([]);
                 }}
                 style={{ fontSize: 13, fontWeight: 600, whiteSpace: "nowrap" }}
@@ -340,6 +409,79 @@ export default function MatchingTab() {
             <div>
               <div
                 style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 10,
+                  marginBottom: 12,
+                  padding: "10px 14px",
+                  background: "var(--bg-card)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 8,
+                }}
+              >
+                <label
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    fontSize: 12.5,
+                    fontWeight: 600,
+                    cursor: "pointer",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={allowDuplicates}
+                    onChange={(e) => setAllowDuplicates(e.target.checked)}
+                  />
+                  Allow duplicates
+                  <span
+                    style={{
+                      fontSize: 11.5,
+                      color: "var(--muted)",
+                      fontWeight: 400,
+                      fontFamily: "system-ui, sans-serif",
+                    }}
+                  >
+                    — let the same target photo match more than one source photo
+                  </span>
+                </label>
+
+                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  <span
+                    style={{
+                      fontSize: 12.5,
+                      fontWeight: 600,
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    Max distance to keep
+                  </span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={64}
+                    value={maxDistance}
+                    onChange={(e) => setMaxDistance(Number(e.target.value))}
+                    style={{ flex: 1, accentColor: "var(--accent)" }}
+                  />
+                  <span
+                    style={{
+                      fontSize: 11.5,
+                      color: "var(--muted)",
+                      fontFamily: "'IBM Plex Mono', monospace",
+                      whiteSpace: "nowrap",
+                      minWidth: 130,
+                      textAlign: "right",
+                    }}
+                  >
+                    {maxDistance} · up to “{matchConfidenceLabel(maxDistance)}”
+                  </span>
+                </div>
+              </div>
+
+              <div
+                style={{
                   maxHeight: "55vh",
                   overflowY: "auto",
                   border: "1px solid var(--border)",
@@ -357,13 +499,11 @@ export default function MatchingTab() {
                       padding: "10px 0",
                       borderBottom:
                         i < rows.length - 1 ? "1px solid var(--border)" : "none",
-                      opacity: r.matchPath ? 1 : 0.5,
                     }}
                   >
                     <input
                       type="checkbox"
                       checked={r.included}
-                      disabled={!r.matchPath}
                       onChange={() => toggleIncluded(i)}
                     />
                     <img
@@ -399,6 +539,8 @@ export default function MatchingTab() {
                           objectFit: "cover",
                           borderRadius: 6,
                           flexShrink: 0,
+                          outline: r.matchPath ? "none" : "1px dashed var(--dashed)",
+                          outlineOffset: -1,
                         }}
                       />
                     ) : (
@@ -435,7 +577,7 @@ export default function MatchingTab() {
                       >
                         {r.matchPath
                           ? `${matchConfidenceLabel(r.distance)} · distance ${r.distance}`
-                          : "No match found"}
+                          : "No match within threshold — copying original"}
                       </div>
                     </div>
                   </div>
@@ -451,7 +593,7 @@ export default function MatchingTab() {
                 }}
               >
                 <span style={{ fontSize: 12.5, color: "var(--muted)" }}>
-                  {includedCount} selected
+                  {includedCount} of {rows.length} selected
                 </span>
                 <button
                   onClick={() => void chooseDestAndCopy()}

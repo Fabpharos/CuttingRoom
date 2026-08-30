@@ -12,10 +12,12 @@ export default function Thumbnail({
   needsEdit,
   favorite,
   selected,
+  dimmed,
   onToggleTag,
   onToggleFavorite,
   onSelect,
   onOpen,
+  onContextMenu,
 }: {
   id: string;
   src: string;
@@ -23,10 +25,12 @@ export default function Thumbnail({
   needsEdit: boolean;
   favorite: boolean;
   selected: boolean;
+  dimmed?: boolean;
   onToggleTag: () => void;
   onToggleFavorite: () => void;
   onSelect: (shiftKey: boolean, ctrlKey: boolean) => void;
   onOpen: () => void;
+  onContextMenu: (x: number, y: number) => void;
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id });
@@ -52,10 +56,15 @@ export default function Thumbnail({
         onSelect(e.shiftKey, e.ctrlKey || e.metaKey);
       }}
       onDoubleClick={onOpen}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        onContextMenu(e.clientX, e.clientY);
+      }}
       style={{
         transform: CSS.Transform.toString(transform),
         transition,
-        opacity: isDragging ? 0.4 : 1,
+        opacity: isDragging ? 0.4 : dimmed ? 0.55 : 1,
         cursor: "grab",
         outline: selected ? "2px solid var(--accent)" : "none",
         outlineOffset: selected ? -2 : 0,

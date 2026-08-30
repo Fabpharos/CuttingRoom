@@ -46,10 +46,21 @@ export function getThumbnailUrl(path: string): Promise<string> {
 
 // A folder/photo rename doesn't change the image bytes, just its path — move
 // the cached thumbnail rather than re-reading and re-decoding the file.
-export function moveThumbnailCache(oldPath: string, newPath: string): void {
-  const entry = cache.get(oldPath);
-  if (entry) {
+//
+// Takes the whole batch of moves at once rather than one pair at a time: a
+// reorder-then-rename can produce a genuine swap (one photo's new path is
+// another photo's old path), and applying moves one at a time would let a
+// later move silently overwrite or delete an earlier one's freshly-written
+// entry before it's ever read back out. Reading every old entry first, then
+// writing every new one, makes the whole batch atomic with respect to that
+// collision.
+export function moveThumbnailCache(pairs: { oldPath: string; newPath: string }[]): void {
+  const carried = pairs.map(({ oldPath }) => cache.get(oldPath));
+  for (const { oldPath } of pairs) {
     cache.delete(oldPath);
-    cache.set(newPath, entry);
   }
+  pairs.forEach(({ newPath }, i) => {
+    const entry = carried[i];
+    if (entry) cache.set(newPath, entry);
+  });
 }
