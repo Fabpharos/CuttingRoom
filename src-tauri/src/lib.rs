@@ -2,7 +2,7 @@ mod detection;
 mod matching;
 
 use detection::{DetectionOutput, DetectionProgress, PixelateJob};
-use matching::{MatchProgress, MatchResult};
+use matching::{CopyJob, MatchMatrix, MatchProgress};
 use tauri::{Emitter, Manager};
 
 #[tauri::command]
@@ -10,6 +10,19 @@ fn copy_files_to_clipboard(paths: Vec<String>) -> Result<(), String> {
     let mut result = Ok(());
     clipboard_win::with_clipboard_attempts(10, || {
         result = clipboard_win::raw::set_file_list_with(&paths, clipboard_win::options::DoClear);
+        if result.is_ok() {
+            // Windows Explorer's Paste button checks this format to decide
+            // whether the clipboard holds a copy vs. a cut; without it,
+            // Explorer's ribbon/command-bar Paste can stay disabled even
+            // though the file list itself is genuinely on the clipboard.
+            if let Some(format) = clipboard_win::raw::register_format("Preferred DropEffect") {
+                const DROPEFFECT_COPY: u32 = 5;
+                let _ = clipboard_win::raw::set_without_clear(
+                    format.get(),
+                    &DROPEFFECT_COPY.to_le_bytes(),
+                );
+            }
+        }
     })
     .map_err(|e| e.to_string())?;
     result.map_err(|e| e.to_string())
@@ -26,7 +39,7 @@ async fn find_image_matches(
     run_id: String,
     album_paths: Vec<String>,
     source_paths: Vec<String>,
-) -> Vec<MatchResult> {
+) -> MatchMatrix {
     // Explicitly off the main thread regardless of how the IPC call itself
     // was dispatched: hashing hundreds of images is CPU-bound work that
     // would otherwise make the window appear to hang.
@@ -53,8 +66,8 @@ fn cancel_match(run_id: String) {
 }
 
 #[tauri::command]
-async fn copy_files_to_folder(paths: Vec<String>, dest_dir: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || matching::copy_files_to_folder(paths, dest_dir))
+async fn copy_files_to_folder(jobs: Vec<CopyJob>, dest_dir: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || matching::copy_files_to_folder(jobs, dest_dir))
         .await
         .map_err(|e| e.to_string())?
 }

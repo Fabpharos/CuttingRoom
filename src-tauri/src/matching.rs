@@ -1,15 +1,35 @@
 use image::imageops::FilterType;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-#[derive(Serialize, Clone)]
+// Pairs the file to actually copy with the name it should be given in the
+// destination — matching always copies photo *content* from whichever
+// file won the match, but the caller wants the result named after the
+// source photo, not whatever the matched target photo happened to be
+// called.
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MatchResult {
-    pub album_path: String,
-    pub match_path: Option<String>,
-    pub distance: Option<u32>,
+pub struct CopyJob {
+    pub src: String,
+    pub file_name: String,
+}
+
+// The full pairwise distance matrix, rather than just each album image's
+// single best match — resolving matches down to a one-to-one assignment
+// (see `computeAssignment` on the frontend) needs every candidate's
+// distance, not just the winner, and both the max-distance threshold and
+// the allow-duplicates toggle can then be re-applied instantly without
+// re-hashing anything.
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MatchMatrix {
+    pub album_paths: Vec<String>,
+    pub source_paths: Vec<String>,
+    /// distances[i][j] is the Hamming distance between album_paths[i] and
+    /// source_paths[j], or None if either image failed to hash.
+    pub distances: Vec<Vec<Option<u32>>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -75,75 +95,87 @@ pub fn find_matches(
     album_paths: Vec<String>,
     source_paths: Vec<String>,
     mut on_progress: impl FnMut(usize, usize),
-) -> Vec<MatchResult> {
+) -> MatchMatrix {
     let total = album_paths.len() + source_paths.len();
     let mut done = 0usize;
     on_progress(done, total);
 
-    let mut source_hashes: Vec<(String, u64)> = Vec::new();
-    for p in source_paths {
+    let empty = || MatchMatrix {
+        album_paths: Vec::new(),
+        source_paths: Vec::new(),
+        distances: Vec::new(),
+    };
+
+    let mut source_hashes: Vec<Option<u64>> = Vec::with_capacity(source_paths.len());
+    for p in &source_paths {
         if is_cancelled(&run_id) {
             clear_cancelled(&run_id);
-            return Vec::new();
+            return empty();
         }
-        if let Ok(h) = compute_dhash(&p) {
-            source_hashes.push((p, h));
-        }
+        source_hashes.push(compute_dhash(p).ok());
         done += 1;
         on_progress(done, total);
     }
 
-    let mut results = Vec::new();
-    for album_path in album_paths {
+    let mut distances = Vec::with_capacity(album_paths.len());
+    for album_path in &album_paths {
         if is_cancelled(&run_id) {
             clear_cancelled(&run_id);
-            return Vec::new();
+            return empty();
         }
 
-        let album_hash = compute_dhash(&album_path).ok();
+        let album_hash = compute_dhash(album_path).ok();
+        let row: Vec<Option<u32>> = source_hashes
+            .iter()
+            .map(|source_hash| match (album_hash, source_hash) {
+                (Some(a), Some(b)) => Some(hamming_distance(a, *b)),
+                _ => None,
+            })
+            .collect();
+        distances.push(row);
         done += 1;
         on_progress(done, total);
-
-        let result = match album_hash {
-            None => MatchResult {
-                album_path,
-                match_path: None,
-                distance: None,
-            },
-            Some(album_hash) => {
-                let best = source_hashes
-                    .iter()
-                    .map(|(p, h)| (p, hamming_distance(album_hash, *h)))
-                    .min_by_key(|(_, d)| *d);
-                match best {
-                    Some((p, d)) => MatchResult {
-                        album_path,
-                        match_path: Some(p.clone()),
-                        distance: Some(d),
-                    },
-                    None => MatchResult {
-                        album_path,
-                        match_path: None,
-                        distance: None,
-                    },
-                }
-            }
-        };
-        results.push(result);
     }
 
     clear_cancelled(&run_id);
-    results
+    MatchMatrix {
+        album_paths,
+        source_paths,
+        distances,
+    }
 }
 
-pub fn copy_files_to_folder(paths: Vec<String>, dest_dir: String) -> Result<(), String> {
+pub fn copy_files_to_folder(jobs: Vec<CopyJob>, dest_dir: String) -> Result<(), String> {
     std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
-    for p in paths {
-        let file_name = Path::new(&p)
-            .file_name()
-            .ok_or_else(|| format!("invalid path: {p}"))?;
-        let dest = Path::new(&dest_dir).join(file_name);
-        std::fs::copy(&p, &dest).map_err(|e| format!("{p}: {e}"))?;
+    // A copy batch can mix matched target photos with fallback copies of
+    // the source photos themselves, and several rows can independently
+    // want the same destination name, so two entries landing on the same
+    // filename is a real possibility, not just a theoretical edge case —
+    // number the later one instead of silently overwriting the first.
+    let mut used: HashSet<String> = HashSet::new();
+    for job in jobs {
+        let file_name = job.file_name;
+        let stem = Path::new(&file_name)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| file_name.clone());
+        let ext = Path::new(&file_name)
+            .extension()
+            .map(|s| s.to_string_lossy().to_string());
+
+        let mut candidate = file_name.clone();
+        let mut n = 1u32;
+        while used.contains(&candidate) || Path::new(&dest_dir).join(&candidate).exists() {
+            candidate = match &ext {
+                Some(e) => format!("{stem} ({n}).{e}"),
+                None => format!("{stem} ({n})"),
+            };
+            n += 1;
+        }
+        used.insert(candidate.clone());
+
+        let dest = Path::new(&dest_dir).join(&candidate);
+        std::fs::copy(&job.src, &dest).map_err(|e| format!("{}: {e}", job.src))?;
     }
     Ok(())
 }

@@ -4,11 +4,16 @@ import { readDir } from "@tauri-apps/plugin-fs";
 import { basename, join } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getThumbnailUrl, moveThumbnailCache } from "../lib/thumbnails";
-import { copyFilesToClipboard, moveFilesToTrash } from "../lib/nativeOps";
+import {
+  copyFilesToClipboard,
+  moveFilesToTrash,
+  revealFilesInExplorer,
+} from "../lib/nativeOps";
 import FolderPicker from "./FolderPicker";
 import ImageGrid, { type ImageEntry } from "./ImageGrid";
 import ImageViewer from "./ImageViewer";
 import ConfirmModal from "./ConfirmModal";
+import ContextMenu from "./ContextMenu";
 import { isImageFile, naturalCompare } from "../lib/images";
 import {
   loadAlbum,
@@ -46,6 +51,11 @@ export default function AlbumTab() {
   const [selectedNames, setSelectedNames] = useState<Set<string>>(new Set());
   const [selectionAnchor, setSelectionAnchor] = useState<number | null>(null);
   const [pendingDelete, setPendingDelete] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    targets: Set<string>;
+  } | null>(null);
   // Bumped on every loadFolder call so in-flight thumbnail decodes from a
   // folder the user has since navigated away from don't write into the
   // current one.
@@ -323,6 +333,59 @@ export default function AlbumTab() {
     }
   }
 
+  function handleContextMenu(index: number, x: number, y: number) {
+    const name = visibleImages[index]?.name;
+    if (!name) return;
+    // Right-clicking a photo that's already part of a multi-selection acts
+    // on the whole selection; right-clicking outside it starts a fresh
+    // single-photo selection instead.
+    let targets = selectedNames;
+    if (!selectedNames.has(name)) {
+      targets = new Set([name]);
+      setSelectedNames(targets);
+      setSelectionAnchor(index);
+    }
+    setContextMenu({ x, y, targets });
+  }
+
+  async function handleRefresh() {
+    if (!folderPath) return;
+    let entries;
+    try {
+      entries = await readDir(folderPath);
+    } catch (err) {
+      setError(`Couldn't refresh folder: ${String(err)}`);
+      return;
+    }
+    const currentNames = new Set(images.map((i) => i.name));
+    const newNames = entries
+      .filter((e) => e.isFile && isImageFile(e.name) && !currentNames.has(e.name))
+      .map((e) => e.name)
+      .sort(naturalCompare);
+    if (newNames.length === 0) return;
+
+    const newImages = [...images, ...newNames.map((name) => ({ name, src: "" }))];
+    setImages(newImages);
+    setIsDirty(true);
+    await saveAlbum(folderPath, {
+      name: albumName,
+      order: newImages.map((i) => i.name),
+      tags,
+      favorites,
+    });
+
+    const myLoad = loadTokenRef.current;
+    for (const name of newNames) {
+      (async () => {
+        const src = await getThumbnailUrl(await join(folderPath, name));
+        if (loadTokenRef.current !== myLoad) return;
+        setImages((prev) =>
+          prev.map((img) => (img.name === name ? { ...img, src } : img)),
+        );
+      })();
+    }
+  }
+
   async function doDeleteSelected() {
     setPendingDelete(false);
     if (!folderPath || selectedNames.size === 0) return;
@@ -361,13 +424,18 @@ export default function AlbumTab() {
       await moveAlbum(folderPath, newPath);
       setRecentFolders(await renameRecentFolder(folderPath, newPath));
 
+      const paths = await Promise.all(
+        images.map(async (img) => ({
+          oldPath: await join(folderPath, img.name),
+          newPath: await join(newPath, img.name),
+        })),
+      );
+      moveThumbnailCache(paths);
       const updatedImages = await Promise.all(
-        images.map(async (img) => {
-          const oldPath = await join(folderPath, img.name);
-          const newImgPath = await join(newPath, img.name);
-          moveThumbnailCache(oldPath, newImgPath);
-          return { name: img.name, src: await getThumbnailUrl(newImgPath) };
-        }),
+        images.map(async (img, i) => ({
+          name: img.name,
+          src: await getThumbnailUrl(paths[i].newPath),
+        })),
       );
 
       setFolderPath(newPath);
@@ -406,13 +474,18 @@ export default function AlbumTab() {
     const plan = buildRenamePlan(name, order);
     try {
       await renamePhotos(dir, plan);
+      const paths = await Promise.all(
+        plan.map(async (p) => ({
+          oldPath: await join(dir, p.oldName),
+          newPath: await join(dir, p.newName),
+        })),
+      );
+      moveThumbnailCache(paths);
       const newImages = await Promise.all(
-        plan.map(async (p) => {
-          const oldPath = await join(dir, p.oldName);
-          const newPath = await join(dir, p.newName);
-          moveThumbnailCache(oldPath, newPath);
-          return { name: p.newName, src: await getThumbnailUrl(newPath) };
-        }),
+        plan.map(async (p, i) => ({
+          name: p.newName,
+          src: await getThumbnailUrl(paths[i].newPath),
+        })),
       );
       const newTags: Record<string, boolean> = {};
       const newFavorites: Record<string, boolean> = {};
@@ -503,6 +576,7 @@ export default function AlbumTab() {
           needsEditFilterOn={needsEditFilterOn}
           favoritesFilterOn={favoritesFilterOn}
           onChangeFolder={chooseFolder}
+          onRefresh={() => void handleRefresh()}
           onCommitName={handleCommitName}
           onReorder={handleReorder}
           onToggleTag={handleToggleTag}
@@ -512,6 +586,7 @@ export default function AlbumTab() {
           onOpenViewer={setViewerIndex}
           onToggleNeedsEditFilter={() => setNeedsEditFilterOn((v) => !v)}
           onToggleFavoritesFilter={() => setFavoritesFilterOn((v) => !v)}
+          onContextMenu={handleContextMenu}
           nameRevertToken={nameRevertToken}
         />
       ) : (
@@ -557,6 +632,41 @@ export default function AlbumTab() {
           onConfirm={() => void handleCloseSaveAndExit()}
           onMiddle={() => void handleCloseDiscard()}
           onCancel={() => setShowCloseConfirm(false)}
+        />
+      )}
+
+      {contextMenu && folderPath && (
+        <ContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          onClose={() => setContextMenu(null)}
+          items={[
+            {
+              label: contextMenu.targets.size === 1 ? "Copy" : "Copy photos",
+              onClick: () => void copySelectedToClipboard(folderPath, images, contextMenu.targets),
+            },
+            {
+              label: "View in Explorer",
+              onClick: () => {
+                void (async () => {
+                  const toReveal = images.filter((img) => contextMenu.targets.has(img.name));
+                  const paths = await Promise.all(
+                    toReveal.map((img) => join(folderPath, img.name)),
+                  );
+                  try {
+                    await revealFilesInExplorer(paths);
+                  } catch (err) {
+                    setError(`Couldn't open Explorer: ${String(err)}`);
+                  }
+                })();
+              },
+            },
+            {
+              label: contextMenu.targets.size === 1 ? "Delete" : "Delete photos",
+              danger: true,
+              onClick: () => setPendingDelete(true),
+            },
+          ]}
         />
       )}
 
