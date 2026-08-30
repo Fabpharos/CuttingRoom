@@ -1,8 +1,10 @@
 mod detection;
 mod matching;
+mod strip_metadata;
 
 use detection::{DetectionOutput, DetectionProgress, PixelateJob};
 use matching::{CopyJob, MatchMatrix, MatchProgress};
+use strip_metadata::{StripProgress, StripSummary};
 use tauri::{Emitter, Manager};
 
 #[tauri::command]
@@ -144,6 +146,30 @@ async fn apply_pixelation(
     .map_err(|e| e.to_string())?
 }
 
+#[tauri::command]
+async fn strip_metadata(app: tauri::AppHandle, run_id: String, root_dir: String) -> StripSummary {
+    let progress_run_id = run_id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        strip_metadata::strip_metadata_recursive(run_id, root_dir, |done, total| {
+            let _ = app.emit(
+                "strip-metadata-progress",
+                StripProgress {
+                    run_id: progress_run_id.clone(),
+                    done,
+                    total,
+                },
+            );
+        })
+    })
+    .await
+    .unwrap_or_default()
+}
+
+#[tauri::command]
+fn cancel_strip_metadata(run_id: String) {
+    strip_metadata::cancel_run(&run_id);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -159,7 +185,9 @@ pub fn run() {
             copy_files_to_folder,
             detect_bulk_images,
             cancel_detection,
-            apply_pixelation
+            apply_pixelation,
+            strip_metadata,
+            cancel_strip_metadata
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
