@@ -1,9 +1,11 @@
 mod detection;
 mod matching;
+mod pdf_export;
 mod strip_metadata;
 
 use detection::{DetectionOutput, DetectionProgress, PixelateJob};
 use matching::{CopyJob, MatchMatrix, MatchProgress};
+use pdf_export::PdfExportProgress;
 use strip_metadata::{StripProgress, StripSummary};
 use tauri::{Emitter, Manager};
 
@@ -170,6 +172,42 @@ fn cancel_strip_metadata(run_id: String) {
     strip_metadata::cancel_run(&run_id);
 }
 
+#[tauri::command]
+async fn export_images_to_pdf(
+    app: tauri::AppHandle,
+    run_id: String,
+    image_paths: Vec<String>,
+    output_path: String,
+    border_px: f32,
+) -> Result<bool, String> {
+    let progress_run_id = run_id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        pdf_export::export_images_to_pdf(
+            run_id,
+            image_paths,
+            output_path,
+            border_px,
+            |done, total| {
+                let _ = app.emit(
+                    "pdf-export-progress",
+                    PdfExportProgress {
+                        run_id: progress_run_id.clone(),
+                        done,
+                        total,
+                    },
+                );
+            },
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn cancel_pdf_export(run_id: String) {
+    pdf_export::cancel_run(&run_id);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -187,7 +225,9 @@ pub fn run() {
             cancel_detection,
             apply_pixelation,
             strip_metadata,
-            cancel_strip_metadata
+            cancel_strip_metadata,
+            export_images_to_pdf,
+            cancel_pdf_export
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
