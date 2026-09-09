@@ -8,6 +8,8 @@ export default function AlbumHeader({
   onChangeFolder,
   onCommitName,
   onRefresh,
+  onRenameFiles,
+  onExportPdf,
   revertToken,
 }: {
   albumName: string;
@@ -17,6 +19,8 @@ export default function AlbumHeader({
   onChangeFolder: () => void;
   onCommitName: (newName: string) => void;
   onRefresh: () => void;
+  onRenameFiles: () => void;
+  onExportPdf: () => void;
   // Bumped by the parent whenever a commit attempt fails, so the field
   // resyncs to `albumName` even though that string itself didn't change.
   revertToken?: number;
@@ -110,6 +114,28 @@ export default function AlbumHeader({
             style={{ fontSize: 13, fontWeight: 600, whiteSpace: "nowrap" }}
           >
             Refresh
+          </a>
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault();
+              onRenameFiles();
+            }}
+            title="Rename the photo files to match the album's order"
+            style={{ fontSize: 13, fontWeight: 600, whiteSpace: "nowrap" }}
+          >
+            Rename Files
+          </a>
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault();
+              onExportPdf();
+            }}
+            title="Save every photo as a single PDF, in album order"
+            style={{ fontSize: 13, fontWeight: 600, whiteSpace: "nowrap" }}
+          >
+            Export as PDF
           </a>
           <a
             href="#"

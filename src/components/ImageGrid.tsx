@@ -69,6 +69,8 @@ export default function ImageGrid({
   favoritesFilterOn,
   onChangeFolder,
   onRefresh,
+  onRenameFiles,
+  onExportPdf,
   onCommitName,
   onReorder,
   onToggleTag,
@@ -92,6 +94,8 @@ export default function ImageGrid({
   favoritesFilterOn: boolean;
   onChangeFolder: () => void;
   onRefresh: () => void;
+  onRenameFiles: () => void;
+  onExportPdf: () => void;
   onCommitName: (newName: string) => void;
   onReorder: (newOrder: string[]) => void;
   onToggleTag: (name: string) => void;
@@ -174,6 +178,8 @@ export default function ImageGrid({
         totalCount={totalCount}
         onChangeFolder={onChangeFolder}
         onRefresh={onRefresh}
+        onRenameFiles={onRenameFiles}
+        onExportPdf={onExportPdf}
         onCommitName={onCommitName}
         revertToken={nameRevertToken}
       />

@@ -14,6 +14,8 @@ import ImageGrid, { type ImageEntry } from "./ImageGrid";
 import ImageViewer from "./ImageViewer";
 import ConfirmModal from "./ConfirmModal";
 import ContextMenu from "./ContextMenu";
+import RenamePreviewModal from "./RenamePreviewModal";
+import PdfExportDialog from "./PdfExportDialog";
 import { isImageFile, naturalCompare } from "../lib/images";
 import {
   loadAlbum,
@@ -56,6 +58,8 @@ export default function AlbumTab() {
     y: number;
     targets: Set<string>;
   } | null>(null);
+  const [showRenamePreview, setShowRenamePreview] = useState(false);
+  const [showPdfExport, setShowPdfExport] = useState(false);
   // Bumped on every loadFolder call so in-flight thumbnail decodes from a
   // folder the user has since navigated away from don't write into the
   // current one.
@@ -577,6 +581,8 @@ export default function AlbumTab() {
           favoritesFilterOn={favoritesFilterOn}
           onChangeFolder={chooseFolder}
           onRefresh={() => void handleRefresh()}
+          onRenameFiles={() => setShowRenamePreview(true)}
+          onExportPdf={() => setShowPdfExport(true)}
           onCommitName={handleCommitName}
           onReorder={handleReorder}
           onToggleTag={handleToggleTag}
@@ -678,6 +684,32 @@ export default function AlbumTab() {
           cancelLabel="Cancel"
           onConfirm={() => void doDeleteSelected()}
           onCancel={() => setPendingDelete(false)}
+        />
+      )}
+
+      {showRenamePreview && folderPath && (
+        <RenamePreviewModal
+          plan={buildRenamePlan(albumName, images.map((i) => i.name))}
+          onConfirm={() => {
+            setShowRenamePreview(false);
+            void renamePhotosToMatch(
+              folderPath,
+              albumName,
+              images.map((i) => i.name),
+              tags,
+              favorites,
+            );
+          }}
+          onCancel={() => setShowRenamePreview(false)}
+        />
+      )}
+
+      {showPdfExport && folderPath && (
+        <PdfExportDialog
+          folderPath={folderPath}
+          albumName={albumName}
+          images={images}
+          onClose={() => setShowPdfExport(false)}
         />
       )}
     </>
