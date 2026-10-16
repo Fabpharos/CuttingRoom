@@ -1,6 +1,6 @@
 import ThemeSwitch from "./ThemeSwitch";
 
-export type TabId = "album" | "matching" | "detection" | "stripMetadata";
+export type TabId = "album" | "matching" | "detection" | "stripMetadata" | "generate";
 
 type Theme = "light" | "dark";
 
@@ -57,6 +57,24 @@ function DetectionTabIcon({ color }: { color: string }) {
       <path d="M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16" />
       <path d="M8 20H5.5A1.5 1.5 0 0 1 4 18.5V16" />
       <rect x="9" y="9" width="6" height="6" rx="0.5" />
+    </svg>
+  );
+}
+
+function GenerateTabIcon({ color }: { color: string }) {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      style={{ stroke: color }}
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3Z" />
+      <path d="M18.5 15l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2Z" />
     </svg>
   );
 }
@@ -253,6 +271,13 @@ export default function Sidebar({
           active={activeTab === "stripMetadata"}
           collapsed={collapsed}
           onClick={() => onSelectTab("stripMetadata")}
+        />
+        <NavItem
+          icon={<GenerateTabIcon color={iconColorFor("generate")} />}
+          label="Generate"
+          active={activeTab === "generate"}
+          collapsed={collapsed}
+          onClick={() => onSelectTab("generate")}
         />
       </nav>
 

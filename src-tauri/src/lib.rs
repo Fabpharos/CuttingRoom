@@ -1,5 +1,6 @@
 mod detection;
 mod matching;
+mod novelai;
 mod pdf_export;
 mod strip_metadata;
 
@@ -208,6 +209,50 @@ fn cancel_pdf_export(run_id: String) {
     pdf_export::cancel_run(&run_id);
 }
 
+#[tauri::command]
+async fn nai_account_status() -> Result<Option<novelai::AccountStatus>, String> {
+    novelai::account_status().await
+}
+
+#[tauri::command]
+async fn nai_set_token(token: String) -> Result<novelai::AccountStatus, String> {
+    novelai::set_token(token).await
+}
+
+#[tauri::command]
+async fn nai_clear_token() -> Result<(), String> {
+    novelai::clear_token().await
+}
+
+#[tauri::command]
+async fn nai_generate_batch(
+    app: tauri::AppHandle,
+    run_id: String,
+    requests: Vec<novelai::GenerateRequest>,
+    output_dir: String,
+    guard_anlas: bool,
+) -> Result<novelai::BatchSummary, String> {
+    novelai::generate_batch(run_id, requests, output_dir, guard_anlas, |progress| {
+        let _ = app.emit("nai-batch-progress", progress);
+    })
+    .await
+}
+
+#[tauri::command]
+fn nai_cancel_batch(run_id: String) {
+    novelai::cancel_batch(&run_id);
+}
+
+#[tauri::command]
+async fn nai_read_image_metadata(path: String) -> Result<novelai::ImportedSettings, String> {
+    novelai::read_image_metadata(path).await
+}
+
+#[tauri::command]
+async fn nai_read_prompt_file(path: String) -> Result<Vec<String>, String> {
+    novelai::read_prompt_file(path).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -227,7 +272,14 @@ pub fn run() {
             strip_metadata,
             cancel_strip_metadata,
             export_images_to_pdf,
-            cancel_pdf_export
+            cancel_pdf_export,
+            nai_account_status,
+            nai_set_token,
+            nai_clear_token,
+            nai_generate_batch,
+            nai_cancel_batch,
+            nai_read_image_metadata,
+            nai_read_prompt_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
