@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { readDir } from "@tauri-apps/plugin-fs";
 import { basename, join } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -8,6 +8,8 @@ import {
   copyFilesToClipboard,
   moveFilesToTrash,
   revealFilesInExplorer,
+  getFileSizes,
+  formatBytes,
 } from "../lib/nativeOps";
 import FolderPicker from "./FolderPicker";
 import ImageGrid, { type ImageEntry } from "./ImageGrid";
@@ -59,7 +61,8 @@ export default function AlbumTab() {
     targets: Set<string>;
   } | null>(null);
   const [showRenamePreview, setShowRenamePreview] = useState(false);
-  const [showPdfExport, setShowPdfExport] = useState(false);
+  const [pdfExportTarget, setPdfExportTarget] = useState<string | null>(null);
+  const [selectedBytes, setSelectedBytes] = useState(0);
   // Bumped on every loadFolder call so in-flight thumbnail decodes from a
   // folder the user has since navigated away from don't write into the
   // current one.
@@ -101,6 +104,26 @@ export default function AlbumTab() {
   useEffect(() => {
     getRecentFolders().then(setRecentFolders);
   }, []);
+
+  useEffect(() => {
+    if (!folderPath || selectedNames.size === 0) {
+      setSelectedBytes(0);
+      return;
+    }
+    // A later selection change can resolve before an earlier one's sizes
+    // come back; only the latest selection's total should land.
+    let cancelled = false;
+    (async () => {
+      const paths = await Promise.all(
+        [...selectedNames].map((name) => join(folderPath, name)),
+      );
+      const sizes = await getFileSizes(paths);
+      if (!cancelled) setSelectedBytes(sizes.reduce((sum, s) => sum + s, 0));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [folderPath, selectedNames]);
 
   useEffect(() => {
     // Block the webview's own native clipboard "copy" handling so it can
@@ -304,6 +327,26 @@ export default function AlbumTab() {
     }
   }
 
+  async function handleRandomizeOrder() {
+    if (images.length < 2) return;
+    // Fisher-Yates: uniform random permutation in one pass.
+    const shuffled = [...images];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    setImages(shuffled);
+    setIsDirty(true);
+    if (folderPath) {
+      await saveAlbum(folderPath, {
+        name: albumName,
+        order: shuffled.map((i) => i.name),
+        tags,
+        favorites,
+      });
+    }
+  }
+
   async function handleToggleTag(name: string) {
     const newTags = { ...tags, [name]: !tags[name] };
     setTags(newTags);
@@ -388,6 +431,15 @@ export default function AlbumTab() {
         );
       })();
     }
+  }
+
+  async function handleExportPdf() {
+    if (!albumName) return;
+    const dest = await save({
+      defaultPath: `${albumName}.pdf`,
+      filters: [{ name: "PDF", extensions: ["pdf"] }],
+    });
+    if (typeof dest === "string") setPdfExportTarget(dest);
   }
 
   async function doDeleteSelected() {
@@ -544,7 +596,9 @@ export default function AlbumTab() {
   }
 
   return (
-    <>
+    // Fills the scroll area's full height so the selection footer can sit
+    // at the bottom of the window even when the album is too short to scroll.
+    <div style={{ minHeight: "100%", display: "flex", flexDirection: "column" }}>
       {error && (
         <div
           style={{
@@ -582,7 +636,8 @@ export default function AlbumTab() {
           onChangeFolder={chooseFolder}
           onRefresh={() => void handleRefresh()}
           onRenameFiles={() => setShowRenamePreview(true)}
-          onExportPdf={() => setShowPdfExport(true)}
+          onExportPdf={() => void handleExportPdf()}
+          onRandomizeOrder={() => void handleRandomizeOrder()}
           onCommitName={handleCommitName}
           onReorder={handleReorder}
           onToggleTag={handleToggleTag}
@@ -601,6 +656,26 @@ export default function AlbumTab() {
           recentFolders={recentFolders}
           onOpenRecent={loadFolder}
         />
+      )}
+
+      {folderPath && (
+        <div
+          style={{
+            position: "sticky",
+            bottom: 0,
+            marginTop: "auto",
+            padding: "8px 24px",
+            borderTop: "1px solid var(--border)",
+            background: "var(--bg-page)",
+            fontSize: 12,
+            color: "var(--muted)",
+            fontFamily: "'IBM Plex Mono', monospace",
+          }}
+        >
+          {selectedNames.size === 0
+            ? "No photos selected"
+            : `${selectedNames.size} photo${selectedNames.size === 1 ? "" : "s"} selected · ${formatBytes(selectedBytes)}`}
+        </div>
       )}
 
       {folderPath && viewerIndex !== null && (
@@ -704,14 +779,14 @@ export default function AlbumTab() {
         />
       )}
 
-      {showPdfExport && folderPath && (
+      {pdfExportTarget && folderPath && (
         <PdfExportDialog
           folderPath={folderPath}
-          albumName={albumName}
+          outputPath={pdfExportTarget}
           images={images}
-          onClose={() => setShowPdfExport(false)}
+          onClose={() => setPdfExportTarget(null)}
         />
       )}
-    </>
+    </div>
   );
 }

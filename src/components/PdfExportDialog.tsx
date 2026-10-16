@@ -1,22 +1,10 @@
-import { useRef, useState } from "react";
-import { save } from "@tauri-apps/plugin-dialog";
+import { useEffect, useRef, useState } from "react";
 import { join } from "@tauri-apps/api/path";
 import { exportImagesToPdf, cancelPdfExport, type PdfExportProgress } from "../lib/pdfExport";
 import { revealFilesInExplorer } from "../lib/nativeOps";
 import type { ImageEntry } from "./ImageGrid";
 
-type Phase = "input" | "running" | "done";
-
-const inputStyle: React.CSSProperties = {
-  padding: "7px 10px",
-  borderRadius: 8,
-  border: "1px solid var(--border)",
-  background: "var(--bg-card)",
-  color: "var(--text)",
-  fontSize: 13,
-  fontFamily: "system-ui, sans-serif",
-  width: "100%",
-};
+type Phase = "running" | "done";
 
 const cancelButtonStyle: React.CSSProperties = {
   padding: "8px 16px",
@@ -44,53 +32,47 @@ const primaryButtonStyle: React.CSSProperties = {
 
 export default function PdfExportDialog({
   folderPath,
-  albumName,
+  outputPath,
   images,
   onClose,
 }: {
   folderPath: string;
-  albumName: string;
+  outputPath: string;
   images: ImageEntry[];
   onClose: () => void;
 }) {
-  const [borderPx, setBorderPx] = useState(20);
-  const [phase, setPhase] = useState<Phase>("input");
+  const [phase, setPhase] = useState<Phase>("running");
   const [progress, setProgress] = useState<PdfExportProgress | null>(null);
-  const [outputPath, setOutputPath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const runIdRef = useRef<string | null>(null);
+  const startedRef = useRef(false);
 
-  async function chooseDestAndExport() {
-    const dest = await save({
-      defaultPath: `${albumName}.pdf`,
-      filters: [{ name: "PDF", extensions: ["pdf"] }],
-    });
-    if (typeof dest !== "string") return;
+  useEffect(() => {
+    if (startedRef.current) return;
+    startedRef.current = true;
 
-    setError(null);
-    setProgress(null);
-    setPhase("running");
     const runId = crypto.randomUUID();
     runIdRef.current = runId;
-    try {
-      const paths = await Promise.all(images.map((img) => join(folderPath, img.name)));
-      const completed = await exportImagesToPdf(runId, paths, dest, borderPx, setProgress);
-      if (runIdRef.current !== runId) return;
-      if (completed) {
-        setOutputPath(dest);
-        setPhase("done");
-      } else {
-        onClose();
+    (async () => {
+      try {
+        const paths = await Promise.all(images.map((img) => join(folderPath, img.name)));
+        const completed = await exportImagesToPdf(runId, paths, outputPath, setProgress);
+        if (runIdRef.current !== runId) return;
+        if (completed) {
+          setPhase("done");
+        } else {
+          onClose();
+        }
+      } catch (err) {
+        if (runIdRef.current !== runId) return;
+        setError(`Couldn't export PDF: ${String(err)}`);
       }
-    } catch (err) {
-      if (runIdRef.current !== runId) return;
-      setError(`Couldn't export PDF: ${String(err)}`);
-      setPhase("input");
-    }
-  }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function cancel() {
-    if (phase === "running" && runIdRef.current) {
+    if (runIdRef.current) {
       void cancelPdfExport(runIdRef.current);
       runIdRef.current = null;
     }
@@ -99,7 +81,7 @@ export default function PdfExportDialog({
 
   return (
     <div
-      onClick={cancel}
+      onClick={phase === "running" && !error ? undefined : onClose}
       style={{
         position: "fixed",
         inset: 0,
@@ -124,89 +106,77 @@ export default function PdfExportDialog({
       >
         <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 14 }}>Export as PDF</div>
 
-        {error && (
-          <div
-            style={{
-              marginBottom: 12,
-              padding: "8px 10px",
-              borderRadius: 8,
-              background: "rgba(200,60,50,.12)",
-              border: "1px solid rgba(200,60,50,.35)",
-              fontSize: 12.5,
-            }}
-          >
-            {error}
-          </div>
-        )}
-
-        {phase !== "done" && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)" }}>
-              Border between photos (pixels)
-            </span>
-            <input
-              type="number"
-              min={0}
-              step={1}
-              value={borderPx}
-              disabled={phase === "running"}
-              onChange={(e) => setBorderPx(Number(e.target.value))}
-              autoFocus
-              style={inputStyle}
-            />
-          </div>
-        )}
-
-        {phase === "running" && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 14 }}>
-            <div style={{ fontSize: 12.5, color: "var(--muted)" }}>
-              {progress ? `Preparing ${progress.done} / ${progress.total}…` : "Starting…"}
-            </div>
+        {error ? (
+          <>
             <div
               style={{
-                height: 8,
-                borderRadius: 999,
-                background: "var(--bg-card)",
-                border: "1px solid var(--border)",
-                overflow: "hidden",
+                padding: "8px 10px",
+                borderRadius: 8,
+                background: "rgba(200,60,50,.12)",
+                border: "1px solid rgba(200,60,50,.35)",
+                fontSize: 12.5,
               }}
             >
+              {error}
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 18 }}>
+              <button onClick={onClose} style={primaryButtonStyle}>
+                Close
+              </button>
+            </div>
+          </>
+        ) : phase === "running" ? (
+          <>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <div style={{ fontSize: 12.5, color: "var(--muted)" }}>
+                {progress ? `Preparing ${progress.done} / ${progress.total}…` : "Starting…"}
+              </div>
               <div
                 style={{
-                  height: "100%",
-                  width: progress
-                    ? `${Math.min(100, (progress.done / Math.max(1, progress.total)) * 100)}%`
-                    : "0%",
-                  background: "var(--accent)",
-                  transition: "width .15s ease",
+                  height: 8,
+                  borderRadius: 999,
+                  background: "var(--bg-card)",
+                  border: "1px solid var(--border)",
+                  overflow: "hidden",
                 }}
-              />
+              >
+                <div
+                  style={{
+                    height: "100%",
+                    width: progress
+                      ? `${Math.min(100, (progress.done / Math.max(1, progress.total)) * 100)}%`
+                      : "0%",
+                    background: "var(--accent)",
+                    transition: "width .15s ease",
+                  }}
+                />
+              </div>
             </div>
-          </div>
-        )}
-
-        {phase === "done" && (
-          <div style={{ fontSize: 13.5 }}>
-            Saved {images.length} photo{images.length === 1 ? "" : "s"} to
-            <div
-              style={{
-                marginTop: 6,
-                fontFamily: "'IBM Plex Mono', monospace",
-                fontSize: 12,
-                color: "var(--muted)",
-                wordBreak: "break-all",
-              }}
-            >
-              {outputPath}
+            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 18 }}>
+              <button onClick={cancel} style={cancelButtonStyle}>
+                Cancel
+              </button>
             </div>
-          </div>
-        )}
-
-        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 18 }}>
-          {phase === "done" ? (
-            <>
+          </>
+        ) : (
+          <>
+            <div style={{ fontSize: 13.5 }}>
+              Saved {images.length} photo{images.length === 1 ? "" : "s"} to
+              <div
+                style={{
+                  marginTop: 6,
+                  fontFamily: "'IBM Plex Mono', monospace",
+                  fontSize: 12,
+                  color: "var(--muted)",
+                  wordBreak: "break-all",
+                }}
+              >
+                {outputPath}
+              </div>
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 18 }}>
               <button
-                onClick={() => outputPath && void revealFilesInExplorer([outputPath])}
+                onClick={() => void revealFilesInExplorer([outputPath])}
                 style={cancelButtonStyle}
               >
                 View in Explorer
@@ -214,26 +184,9 @@ export default function PdfExportDialog({
               <button onClick={onClose} style={primaryButtonStyle}>
                 Done
               </button>
-            </>
-          ) : (
-            <>
-              <button onClick={cancel} style={cancelButtonStyle}>
-                Cancel
-              </button>
-              <button
-                onClick={() => void chooseDestAndExport()}
-                disabled={phase === "running"}
-                style={{
-                  ...primaryButtonStyle,
-                  opacity: phase === "running" ? 0.6 : 1,
-                  cursor: phase === "running" ? "default" : "pointer",
-                }}
-              >
-                {phase === "running" ? "Exporting…" : "Choose Location…"}
-              </button>
-            </>
-          )}
-        </div>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
