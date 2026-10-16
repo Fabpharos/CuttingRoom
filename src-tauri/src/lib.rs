@@ -38,6 +38,14 @@ fn move_files_to_trash(paths: Vec<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn get_file_sizes(paths: Vec<String>) -> Vec<u64> {
+    paths
+        .iter()
+        .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .collect()
+}
+
+#[tauri::command]
 async fn find_image_matches(
     app: tauri::AppHandle,
     run_id: String,
@@ -178,26 +186,19 @@ async fn export_images_to_pdf(
     run_id: String,
     image_paths: Vec<String>,
     output_path: String,
-    border_px: f32,
 ) -> Result<bool, String> {
     let progress_run_id = run_id.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        pdf_export::export_images_to_pdf(
-            run_id,
-            image_paths,
-            output_path,
-            border_px,
-            |done, total| {
-                let _ = app.emit(
-                    "pdf-export-progress",
-                    PdfExportProgress {
-                        run_id: progress_run_id.clone(),
-                        done,
-                        total,
-                    },
-                );
-            },
-        )
+        pdf_export::export_images_to_pdf(run_id, image_paths, output_path, |done, total| {
+            let _ = app.emit(
+                "pdf-export-progress",
+                PdfExportProgress {
+                    run_id: progress_run_id.clone(),
+                    done,
+                    total,
+                },
+            );
+        })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -218,6 +219,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             copy_files_to_clipboard,
             move_files_to_trash,
+            get_file_sizes,
             find_image_matches,
             cancel_match,
             copy_files_to_folder,

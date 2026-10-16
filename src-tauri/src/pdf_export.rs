@@ -35,15 +35,10 @@ pub struct PdfExportProgress {
 // Fixed frame width, in points (1pt = 1/72in) — every photo is scaled to
 // this width. US Letter's width is a reasonable default "slideshow" frame.
 const PAGE_WIDTH_PT: f32 = 612.0;
-// PDF viewers commonly render their own visual divider between separate
-// pages. Pages are sized to fit their content exactly (see `plan_layout`),
-// so this is only a safety cap against the PDF spec's maximum page size —
-// it should essentially never be hit for a normal folder of photos, which
-// is what keeps everything on one page with no extra page-break dividers.
+// Safety cap against the PDF spec's maximum page size — only relevant for
+// a pathologically tall/narrow source image, since every photo otherwise
+// gets its own page sized to fit exactly.
 const MAX_PAGE_HEIGHT_PT: f32 = 14_000.0;
-// The border is specified in (96dpi) CSS-style pixels; PDF geometry is in
-// points, so it needs converting once, up front.
-const PX_TO_PT: f32 = 72.0 / 96.0;
 
 struct PreparedImage {
     filter: Filter,
@@ -100,20 +95,13 @@ struct Placement {
     image_index: usize,
 }
 
-// Lays out every image at full page width (preserving aspect ratio, and
-// additionally shrunk to fit if that alone would exceed the safety cap),
-// stacked top-to-bottom with `border_pt` of gap between them. Each page is
-// sized to fit exactly what's placed on it — no page is ever taller than
-// its content — so scrolling through the result shows only the requested
-// border between photos, never a stray gap of leftover blank space before
-// a page break. A new page starts only once the safety cap would
-// otherwise be exceeded, which for a normal folder of photos should never
-// happen at all.
-fn plan_layout(images: &[PreparedImage], border_pt: f32) -> (Vec<f32>, Vec<Placement>) {
+// One page per photo, each photo scaled to fill the page's fixed width
+// (preserving aspect ratio, and additionally shrunk to fit if that alone
+// would exceed the safety cap) with no margin — the page is sized to fit
+// the photo exactly.
+fn plan_layout(images: &[PreparedImage]) -> (Vec<f32>, Vec<Placement>) {
     let mut placements = Vec::with_capacity(images.len());
-    let mut page_heights: Vec<f32> = Vec::new();
-    let mut page_index = 0usize;
-    let mut cursor_from_top = 0.0f32;
+    let mut page_heights = Vec::with_capacity(images.len());
 
     for (i, img) in images.iter().enumerate() {
         let aspect = img.height as f32 / img.width.max(1) as f32;
@@ -124,27 +112,15 @@ fn plan_layout(images: &[PreparedImage], border_pt: f32) -> (Vec<f32>, Vec<Place
             w = h / aspect.max(0.0001);
         }
 
-        if page_heights.is_empty() {
-            page_heights.push(0.0);
-        } else if cursor_from_top > 0.0 && cursor_from_top + h > MAX_PAGE_HEIGHT_PT {
-            page_index += 1;
-            page_heights.push(0.0);
-            cursor_from_top = 0.0;
-        }
-
-        let x = (PAGE_WIDTH_PT - w) / 2.0;
         placements.push(Placement {
-            page_index,
-            x,
-            top: cursor_from_top,
+            page_index: i,
+            x: (PAGE_WIDTH_PT - w) / 2.0,
+            top: 0.0,
             w,
             h,
             image_index: i,
         });
-        cursor_from_top += h + border_pt;
-        // The page's height is just its tallest content so far, excluding
-        // any trailing border after the last image placed on it.
-        page_heights[page_index] = cursor_from_top - border_pt;
+        page_heights.push(h);
     }
 
     (page_heights, placements)
@@ -154,10 +130,8 @@ pub fn export_images_to_pdf(
     run_id: String,
     image_paths: Vec<String>,
     output_path: String,
-    border_px: f32,
     mut on_progress: impl FnMut(usize, usize),
 ) -> Result<bool, String> {
-    let border_pt = border_px * PX_TO_PT;
     let total = image_paths.len();
     let mut done = 0usize;
     on_progress(done, total);
@@ -177,7 +151,7 @@ pub fn export_images_to_pdf(
         return Err("no images to export".to_string());
     }
 
-    let (page_heights, placements) = plan_layout(&prepared, border_pt);
+    let (page_heights, placements) = plan_layout(&prepared);
     let page_count = page_heights.len();
 
     let mut next_id: i32 = 0;

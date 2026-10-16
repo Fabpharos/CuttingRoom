@@ -10,6 +10,7 @@ export default function AlbumHeader({
   onRefresh,
   onRenameFiles,
   onExportPdf,
+  onRandomizeOrder,
   revertToken,
 }: {
   albumName: string;
@@ -21,6 +22,7 @@ export default function AlbumHeader({
   onRefresh: () => void;
   onRenameFiles: () => void;
   onExportPdf: () => void;
+  onRandomizeOrder: () => void;
   // Bumped by the parent whenever a commit attempt fails, so the field
   // resyncs to `albumName` even though that string itself didn't change.
   revertToken?: number;
@@ -88,6 +90,7 @@ export default function AlbumHeader({
           style={{
             display: "flex",
             alignItems: "center",
+            flexWrap: "wrap",
             gap: 16,
             flexShrink: 0,
           }}
@@ -136,6 +139,17 @@ export default function AlbumHeader({
             style={{ fontSize: 13, fontWeight: 600, whiteSpace: "nowrap" }}
           >
             Export as PDF
+          </a>
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault();
+              onRandomizeOrder();
+            }}
+            title="Shuffle the album into a random order"
+            style={{ fontSize: 13, fontWeight: 600, whiteSpace: "nowrap" }}
+          >
+            Randomize Order
           </a>
           <a
             href="#"

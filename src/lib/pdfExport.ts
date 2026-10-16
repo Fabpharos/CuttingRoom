@@ -13,7 +13,6 @@ export async function exportImagesToPdf(
   runId: string,
   imagePaths: string[],
   outputPath: string,
-  borderPx: number,
   onProgress?: (progress: PdfExportProgress) => void,
 ): Promise<boolean> {
   const unlisten = onProgress
@@ -22,12 +21,7 @@ export async function exportImagesToPdf(
       })
     : undefined;
   try {
-    return await invoke("export_images_to_pdf", {
-      runId,
-      imagePaths,
-      outputPath,
-      borderPx,
-    });
+    return await invoke("export_images_to_pdf", { runId, imagePaths, outputPath });
   } finally {
     unlisten?.();
   }
