@@ -2261,6 +2261,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
+name = "novelai-core"
+version = "1.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "keyring-core",
+ "miniz_oxide 0.9.1",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "windows-native-keyring-store",
+]
+
+[[package]]
 name = "num-conv"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3716,13 +3730,11 @@ dependencies = [
 name = "tauri-app"
 version = "1.1.0"
 dependencies = [
- "base64 0.22.1",
  "clipboard-win",
  "image",
- "keyring-core",
  "miniz_oxide 0.9.1",
+ "novelai-core",
  "pdf-writer",
- "reqwest",
  "serde",
  "serde_json",
  "tauri",
@@ -3731,9 +3743,7 @@ dependencies = [
  "tauri-plugin-fs",
  "tauri-plugin-opener",
  "tauri-plugin-store",
- "tokio",
  "trash",
- "windows-native-keyring-store",
 ]
 
 [[package]]

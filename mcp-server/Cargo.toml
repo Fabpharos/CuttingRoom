@@ -1,0 +1,13 @@
+[package]
+name = "cutting-room-mcp"
+version = "1.1.0"
+description = "MCP server that lets an AI client generate images through Cutting Room's NovelAI integration, with a Windows approval dialog for every image"
+edition = "2021"
+
+[dependencies]
+novelai-core = { path = "../crates/novelai-core" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "time"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.22"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_SystemInformation"] }
