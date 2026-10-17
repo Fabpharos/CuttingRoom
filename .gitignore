@@ -34,3 +34,7 @@ CLAUDE.md
 # somewhere other than /bbox)
 /bbox/
 *.pt
+
+# Rust build output for the crates outside src-tauri
+/crates/*/target/
+/mcp-server/target/
