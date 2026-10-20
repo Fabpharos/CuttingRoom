@@ -9,6 +9,7 @@ A local desktop app for organizing, comparing, and bulk-editing photo albums. Bu
 - **Detection** — run a YOLO (Ultralytics) model over a folder of photos, review the detected regions (toggle individual boxes or whole classes on/off), then pixelate the confirmed regions into an output folder. Originals are never modified.
 - **Strip Metadata** — recursively remove EXIF and other metadata from every image in a folder and its subfolders.
 - **Generate** — text-to-image generation through your NovelAI account, limited to settings that are free on an Opus subscription. Supports batches, prompts loaded from a text file, importing settings from a NovelAI image, and Vibe Transfer with vibe files you've already encoded on NovelAI (`.naiv4vibe` / `.naiv4vibebundle`, V4 and V4.5 models, up to four at a time so it stays free).
+- **Upscale** — double an image's size with NovelAI's upscaler, for one file or every image in a folder. It costs 1 Anlas per image, so images over 1 megapixel (1024×1024) are skipped, and it asks for confirmation before every 10 images. Results are saved as new `name_upscaled.png` files.
 
 Each tab keeps its own state — switching between them doesn't lose an open folder or an in-progress operation.
 

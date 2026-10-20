@@ -1066,6 +1066,304 @@ fn resolve_vibes(
         .collect()
 }
 
+// ---- Upscaling ----
+//
+// NovelAI's upscaler doubles an image's width and height. Unlike generation
+// it's never free, even on Opus: NovelAI's web client prices it at 1 Anlas
+// for an image of up to 1,048,576 pixels and more above that (and won't
+// upscale bigger images at all). So only images at or under that size are
+// sent, at most ten per confirmation, and a batch stops the moment one
+// upscale costs more than 1 Anlas.
+
+pub const UPSCALE_MAX_PIXELS: u64 = 1_048_576;
+pub const UPSCALE_COST: i64 = 1;
+/// Images per confirmation; the frontend asks again before each batch.
+pub const MAX_UPSCALE_BATCH: usize = 10;
+// What NovelAI's web client sends with every upscale.
+const UPSCALE_MODEL: &str = "nai-diffusion-5-curated";
+const UPSCALE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "webp", "bmp", "gif"];
+
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpscaleCandidate {
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedFile {
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Serialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UpscaleScan {
+    /// In the order they'll be upscaled.
+    pub eligible: Vec<UpscaleCandidate>,
+    pub skipped: Vec<SkippedFile>,
+}
+
+fn has_upscale_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| UPSCALE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+fn check_upscale_size(width: u32, height: u32) -> Result<(), String> {
+    if width == 0 || height == 0 {
+        return Err("it has no pixels".into());
+    }
+    if width as u64 * height as u64 > UPSCALE_MAX_PIXELS {
+        return Err(format!(
+            "{width}×{height} is over 1 megapixel (1024×1024), so upscaling it would cost more than 1 Anlas"
+        ));
+    }
+    Ok(())
+}
+
+// Sorts file names the way Explorer and the Album tab do: "img2" before "img10".
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (a.peek().copied(), b.peek().copied()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let take = |it: &mut std::iter::Peekable<std::str::Chars>| {
+                    let mut n = String::new();
+                    while let Some(c) = it.peek().copied().filter(char::is_ascii_digit) {
+                        n.push(c);
+                        it.next();
+                    }
+                    n
+                };
+                let (na, nb) = (take(&mut a), take(&mut b));
+                let (ta, tb) = (na.trim_start_matches('0'), nb.trim_start_matches('0'));
+                let ord = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            (Some(x), Some(y)) => {
+                let ord = x.to_lowercase().cmp(y.to_lowercase());
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+                a.next();
+                b.next();
+            }
+        }
+    }
+}
+
+// Reads only each file's header, so scanning a big folder is quick.
+fn scan_paths(paths: &[PathBuf]) -> UpscaleScan {
+    let mut scan = UpscaleScan::default();
+    for p in paths {
+        let path = p.to_string_lossy().into_owned();
+        match image::image_dimensions(p) {
+            Ok((width, height)) => match check_upscale_size(width, height) {
+                Ok(()) => scan.eligible.push(UpscaleCandidate { path, width, height }),
+                Err(reason) => scan.skipped.push(SkippedFile { path, reason }),
+            },
+            Err(e) => scan.skipped.push(SkippedFile { path, reason: format!("couldn't read it as an image: {e}") }),
+        }
+    }
+    scan
+}
+
+/// Checks one file, or every image directly inside a folder (not subfolders).
+pub async fn scan_for_upscale(path: String, is_folder: bool) -> Result<UpscaleScan, String> {
+    tokio::task::spawn_blocking(move || {
+        if !is_folder {
+            return Ok(scan_paths(&[PathBuf::from(path)]));
+        }
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&path)
+            .map_err(|e| format!("couldn't read the folder: {e}"))?
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .map(|e| e.path())
+            .filter(|p| has_upscale_extension(p))
+            .collect();
+        files.sort_by(|a, b| {
+            natural_cmp(&a.file_name().unwrap_or_default().to_string_lossy(), &b.file_name().unwrap_or_default().to_string_lossy())
+        });
+        Ok(scan_paths(&files))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Re-reads and re-checks a file just before sending it, so nothing over the
+/// size limit gets through even if it changed since the scan. Re-encoding as
+/// PNG also keeps the original's metadata from being uploaded.
+fn prepare_upscale_image(path: &str) -> Result<String, String> {
+    let name = Path::new(path).file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let img = image::open(path).map_err(|e| format!("{name}: couldn't read it as an image: {e}"))?;
+    check_upscale_size(img.width(), img.height()).map_err(|e| format!("{name}: {e}."))?;
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| format!("{name}: couldn't prepare it for upload: {e}"))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(png))
+}
+
+fn upscale_body(image_base64: &str) -> serde_json::Value {
+    json!({ "image": image_base64, "model": UPSCALE_MODEL, "declared_blur_sigma": 0 })
+}
+
+/// `<name>_upscaled`, from the source file's name.
+fn upscaled_stem(source: &str) -> String {
+    let stem = Path::new(source).file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    format!("{}_upscaled", if stem.is_empty() { "image" } else { &stem })
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UpscaledImage {
+    pub source: String,
+    pub path: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UpscaleProgress {
+    pub run_id: String,
+    pub done: usize,
+    pub total: usize,
+    pub image: Option<UpscaledImage>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UpscaleSummary {
+    pub images: Vec<UpscaledImage>,
+    pub cancelled: bool,
+    /// Set when the batch stopped early for a reason other than cancelling.
+    pub stopped_reason: Option<String>,
+    /// What the balance dropped by over the batch, as measured.
+    pub anlas_spent: i64,
+}
+
+/// Upscales up to `MAX_UPSCALE_BATCH` files in order, at least `MIN_INTERVAL`
+/// apart (shared with generation), saving `<name>_upscaled.png` in
+/// `output_dir` without overwriting anything. The balance is checked before
+/// and after every image; the batch stops if one costs more than 1 Anlas.
+pub async fn upscale_batch(
+    run_id: String,
+    paths: Vec<String>,
+    output_dir: String,
+    mut on_progress: impl FnMut(UpscaleProgress),
+) -> Result<UpscaleSummary, String> {
+    if paths.is_empty() {
+        return Err("Nothing to upscale.".into());
+    }
+    if paths.len() > MAX_UPSCALE_BATCH {
+        return Err(format!("Upscale at most {MAX_UPSCALE_BATCH} images per confirmation."));
+    }
+    // Check every file before spending anything.
+    let images = {
+        let paths = paths.clone();
+        tokio::task::spawn_blocking(move || paths.iter().map(|p| prepare_upscale_image(p)).collect::<Result<Vec<_>, _>>())
+            .await
+            .map_err(|e| e.to_string())??
+    };
+    let token = tokio::task::spawn_blocking(read_token)
+        .await
+        .map_err(|e| e.to_string())??
+        .ok_or("Log in to NovelAI on the Generate tab first.")?;
+    let mut anlas = fetch_status(&token).await?.anlas;
+    if anlas < UPSCALE_COST {
+        return Err(format!("Upscaling costs {UPSCALE_COST} Anlas per image, and the account has {anlas}."));
+    }
+
+    let total = paths.len();
+    let dir = PathBuf::from(output_dir);
+    let mut done = Vec::new();
+    let mut cancelled = false;
+    let mut stopped_reason = None;
+    let mut anlas_spent = 0;
+    on_progress(UpscaleProgress { run_id: run_id.clone(), done: 0, total, image: None });
+
+    for (source, image) in paths.iter().zip(&images) {
+        if !wait_for_turn(&run_id).await {
+            cancelled = true;
+            break;
+        }
+        let result = upscale_one(&token, image).await;
+        *LAST_GENERATION.lock().unwrap() = Some(Instant::now());
+        let bytes = match result {
+            Ok(b) => b,
+            Err(e) => {
+                stopped_reason = Some(e);
+                break;
+            }
+        };
+        let (d, stem) = (dir.clone(), upscaled_stem(source));
+        let saved = tokio::task::spawn_blocking(move || save_png(&d, &stem, &bytes))
+            .await
+            .map_err(|e| e.to_string())?;
+        // Measure the charge even if saving failed: the Anlas are spent.
+        let after = fetch_status(&token).await;
+        match saved {
+            Ok(path) => {
+                let image = UpscaledImage { source: source.clone(), path: path.to_string_lossy().into_owned() };
+                done.push(image.clone());
+                on_progress(UpscaleProgress { run_id: run_id.clone(), done: done.len(), total, image: Some(image) });
+            }
+            Err(e) => {
+                stopped_reason = Some(e);
+            }
+        }
+        match after {
+            Ok(s) => {
+                let charged = anlas - s.anlas;
+                anlas_spent += charged.max(0);
+                anlas = s.anlas;
+                if charged > UPSCALE_COST {
+                    stopped_reason = Some(format!(
+                        "NovelAI charged {charged} Anlas for one upscale, more than the expected {UPSCALE_COST}, so the batch stopped."
+                    ));
+                }
+            }
+            Err(e) => {
+                stopped_reason.get_or_insert(format!("Couldn't confirm the Anlas balance, so the batch stopped: {e}"));
+            }
+        }
+        if stopped_reason.is_some() {
+            break;
+        }
+    }
+
+    cancelled_set().lock().unwrap().remove(&run_id);
+    Ok(UpscaleSummary { images: done, cancelled, stopped_reason, anlas_spent })
+}
+
+async fn upscale_one(token: &str, image_base64: &str) -> Result<Vec<u8>, String> {
+    let resp = http()
+        .post(format!("{API_BASE}/ai/upscale"))
+        .bearer_auth(token)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&upscale_body(image_base64))
+        .send()
+        .await
+        .map_err(|e| format!("couldn't reach NovelAI: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let message = resp.json::<ApiError>().await.ok().and_then(|e| e.message).unwrap_or_default();
+        return Err(error_for_status(status, &message));
+    }
+    let parsed: ImageGenerationJsonResponse =
+        resp.json().await.map_err(|e| format!("unexpected response from NovelAI: {e}"))?;
+    let first = parsed.images.into_iter().next().ok_or("NovelAI returned no image.")?;
+    base64::engine::general_purpose::STANDARD
+        .decode(first.image)
+        .map_err(|e| format!("couldn't decode the returned image: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1473,5 +1771,99 @@ mod tests {
         let mut req = request("nai-diffusion-4-5-full", 1024, 1024, &[]);
         req.vibes = vec![vibe_ref("Z:/definitely/not/here.naiv4vibe", 0, None, 0.6)];
         assert!(validate_batch(&[req]).is_err());
+    }
+
+    // ---- upscaling ----
+
+    fn write_image(name: &str, width: u32, height: u32, format: image::ImageFormat) -> String {
+        let img = image::RgbImage::from_pixel(width, height, image::Rgb([200, 40, 40]));
+        let dir = std::env::temp_dir().join(format!("novelai-core-upscale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        img.save_with_format(&path, format).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn only_images_up_to_one_megapixel_qualify() {
+        assert!(check_upscale_size(1024, 1024).is_ok());
+        assert!(check_upscale_size(832, 1216).is_ok());
+        assert!(check_upscale_size(1216, 832).is_ok());
+        assert!(check_upscale_size(1025, 1024).is_err());
+        assert!(check_upscale_size(1664, 2432).is_err());
+        assert!(check_upscale_size(0, 10).is_err());
+    }
+
+    #[test]
+    fn scanning_sorts_naturally_and_explains_skips() {
+        let dir = std::env::temp_dir().join(format!("novelai-core-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let save = |name: &str, w, h| {
+            image::RgbImage::new(w, h).save_with_format(dir.join(name), image::ImageFormat::Png).unwrap()
+        };
+        save("img10.png", 64, 64);
+        save("img2.png", 64, 64);
+        save("big.png", 1100, 1000);
+        save("sub/inner.png", 64, 64); // subfolders aren't included
+        std::fs::write(dir.join("broken.png"), b"not an image").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"hello").unwrap();
+
+        let scan = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(scan_for_upscale(dir.to_string_lossy().into_owned(), true))
+            .unwrap();
+        let names: Vec<_> = scan
+            .eligible
+            .iter()
+            .map(|c| Path::new(&c.path).file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["img2.png", "img10.png"]);
+        assert_eq!((scan.eligible[0].width, scan.eligible[0].height), (64, 64));
+        let skipped: Vec<_> = scan.skipped.iter().map(|s| (Path::new(&s.path).file_name().unwrap().to_string_lossy().into_owned(), s.reason.clone())).collect();
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped.iter().any(|(n, r)| n == "big.png" && r.contains("over 1 megapixel")));
+        assert!(skipped.iter().any(|(n, r)| n == "broken.png" && r.contains("couldn't read")));
+    }
+
+    #[test]
+    fn sends_a_png_and_refuses_an_oversized_file() {
+        let jpg = write_image("photo.jpg", 100, 80, image::ImageFormat::Jpeg);
+        let b64 = prepare_upscale_image(&jpg).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap();
+        assert!(bytes.starts_with(&PNG_SIGNATURE), "re-encoded as PNG");
+        let body = upscale_body(&b64);
+        assert_eq!(body["model"], UPSCALE_MODEL);
+        assert_eq!(body["declared_blur_sigma"], 0);
+
+        let big = write_image("big.png", 1100, 1000, image::ImageFormat::Png);
+        assert!(prepare_upscale_image(&big).unwrap_err().contains("over 1 megapixel"));
+    }
+
+    #[test]
+    fn upscale_batches_are_capped_before_anything_is_read() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        assert!(rt.block_on(upscale_batch("r1".into(), vec![], "C:\\out".into(), |_| {})).is_err());
+        let eleven = vec!["a.png".to_string(); MAX_UPSCALE_BATCH + 1];
+        let err = rt.block_on(upscale_batch("r2".into(), eleven, "C:\\out".into(), |_| {})).unwrap_err();
+        assert!(err.contains("at most"), "{err}");
+        // A file over the limit fails the batch before any request.
+        let big = write_image("big2.png", 1100, 1000, image::ImageFormat::Png);
+        let err = rt.block_on(upscale_batch("r3".into(), vec![big], "C:\\out".into(), |_| {})).unwrap_err();
+        assert!(err.contains("over 1 megapixel"), "{err}");
+    }
+
+    #[test]
+    fn names_outputs_after_their_source() {
+        assert_eq!(upscaled_stem(r"C:\pics\2026-10-16_17-01-40_135940740.png"), "2026-10-16_17-01-40_135940740_upscaled");
+        assert_eq!(upscaled_stem("photo.final.jpg"), "photo.final_upscaled");
+    }
+
+    #[test]
+    fn natural_sort_puts_numbers_in_order() {
+        let mut names = vec!["img10.png", "IMG2.png", "img1.png", "img01b.png", "a.png"];
+        names.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(names, vec!["a.png", "img1.png", "img01b.png", "IMG2.png", "img10.png"]);
     }
 }

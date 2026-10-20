@@ -2265,6 +2265,7 @@ name = "novelai-core"
 version = "1.1.0"
 dependencies = [
  "base64 0.22.1",
+ "image",
  "keyring-core",
  "miniz_oxide 0.9.1",
  "reqwest",
