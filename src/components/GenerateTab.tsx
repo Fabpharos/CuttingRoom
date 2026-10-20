@@ -9,6 +9,8 @@ import {
   generateBatch,
   cancelBatch,
   readImageMetadata,
+  readVibeFile,
+  vibeEncodingFor,
   buildImportPlan,
   randomSeed,
   fileStemFor,
@@ -20,9 +22,13 @@ import {
   DEFAULT_SCALE,
   MAX_SCALE,
   MAX_BATCH,
+  MAX_VIBES,
+  DEFAULT_VIBE_STRENGTH,
   type AccountStatus,
   type GenerateRequest,
   type ImportPlan,
+  type VibeInfo,
+  type VibeRef,
 } from "../lib/novelai";
 import ConfirmModal from "./ConfirmModal";
 import {
@@ -34,12 +40,42 @@ import {
   type PromptFileMode,
   type PromptFileTarget,
 } from "../lib/promptFile";
-import { loadGenerateSettings, saveGenerateSettings } from "../lib/generateSettings";
+import {
+  loadGenerateSettings,
+  saveGenerateSettings,
+  type SavedVibe,
+} from "../lib/generateSettings";
 import { revealFilesInExplorer } from "../lib/nativeOps";
 
 type AccountPhase = "unchecked" | "checking" | "loggedOut" | "loggedIn";
 
 type LastResult = { path: string; seed: number; src: string };
+
+/** A vibe in the list: what's saved, plus what was read from its file. */
+type VibeEntry = SavedVibe & { key: string; info: VibeInfo | null; error: string | null };
+
+const VIBE_EXTENSIONS = ["naiv4vibe", "naiv4vibebundle"];
+const isVibeFile = (path: string) =>
+  VIBE_EXTENSIONS.some((ext) => path.toLowerCase().endsWith(`.${ext}`));
+const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
+
+// Reads each saved vibe's file again (once per file), so the list shows
+// what's on disk now. A vibe whose file is gone stays listed with the error.
+async function loadVibeEntries(saved: SavedVibe[]): Promise<VibeEntry[]> {
+  const files = new Map<string, Promise<VibeInfo[]>>();
+  return Promise.all(
+    saved.map(async (v) => {
+      if (!files.has(v.path)) files.set(v.path, readVibeFile(v.path));
+      const key = crypto.randomUUID();
+      try {
+        const info = (await files.get(v.path)!)[v.index] ?? null;
+        return { ...v, key, info, error: info ? null : "This vibe is no longer in its file." };
+      } catch (err) {
+        return { ...v, key, info: null, error: String(err) };
+      }
+    }),
+  );
+}
 
 // Shows exactly what an import will change and what it has to skip, before
 // anything in the form is overwritten.
@@ -231,6 +267,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
   const [fileBefore, setFileBefore] = useState("");
   const [fileAfter, setFileAfter] = useState("");
   const [filePosition, setFilePosition] = useState(0);
+  const [vibes, setVibes] = useState<VibeEntry[]>([]);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
 
   // Restores the form from the last session. It's a local file, so unlike
@@ -257,6 +294,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
             : s.characters;
         setCharacters(characters);
         setFileTarget(s.fileTarget);
+        if (s.vibes.length > 0) setVibes(await loadVibeEntries(s.vibes));
         if (s.promptFilePath) {
           try {
             const lines = await readPromptFile(s.promptFilePath);
@@ -294,6 +332,13 @@ export default function GenerateTab({ active }: { active: boolean }) {
         fileMode,
         fileBefore,
         fileAfter,
+        vibes: vibes.map(({ path, index, strength, informationExtracted, enabled }) => ({
+          path,
+          index,
+          strength,
+          informationExtracted,
+          enabled,
+        })),
       }).catch(() => {});
     }, 400);
     return () => clearTimeout(timer);
@@ -313,12 +358,31 @@ export default function GenerateTab({ active }: { active: boolean }) {
     fileMode,
     fileBefore,
     fileAfter,
+    vibes,
   ]);
   const [importPlan, setImportPlan] = useState<ImportPlan | null>(null);
   const [dragging, setDragging] = useState(false);
 
   const modelInfo = MODELS.find((m) => m.id === model) ?? MODELS[0];
   const effectiveSteps = modelInfo.fixedSteps ?? steps;
+  const vibesOn = vibes.filter((v) => v.enabled).length;
+  // Only vibes already encoded for this model are sent; anything else would
+  // need a paid encode. Rust checks this again against the files.
+  const vibeRefs: VibeRef[] = modelInfo.vibes
+    ? vibes.flatMap((v) => {
+        const encoding = v.enabled && v.info && vibeEncodingFor(v.info, model, v.informationExtracted);
+        return encoding
+          ? [
+              {
+                path: v.path,
+                index: v.index,
+                informationExtracted: encoding.informationExtracted,
+                strength: v.strength,
+              },
+            ]
+          : [];
+      })
+    : [];
   // A file aimed at the main prompt supplies it, so the box can be empty.
   const fileFillsPrompt = promptFile !== null && fileTarget === "main";
   const canGenerate =
@@ -370,9 +434,13 @@ export default function GenerateTab({ active }: { active: boolean }) {
         else if (p.type === "leave") setDragging(false);
         else if (p.type === "drop") {
           setDragging(false);
+          const vibeFiles = p.paths.filter(isVibeFile);
           const png = p.paths.find((path) => path.toLowerCase().endsWith(".png"));
-          if (png) void startImport(png);
-          else if (p.paths.length > 0) setError("Drop a PNG image generated by NovelAI.");
+          if (vibeFiles.length > 0) void addVibeFiles(vibeFiles);
+          else if (png) void startImport(png);
+          else if (p.paths.length > 0) {
+            setError("Drop a PNG image generated by NovelAI, or a .naiv4vibe file.");
+          }
         }
       })
       .then((fn) => {
@@ -417,6 +485,60 @@ export default function GenerateTab({ active }: { active: boolean }) {
     setImportPlan(null);
   }
 
+  async function chooseVibeFiles() {
+    const files = await open({
+      directory: false,
+      multiple: true,
+      filters: [
+        { name: "NovelAI vibe", extensions: VIBE_EXTENSIONS },
+        { name: "PNG with embedded vibes", extensions: ["png"] },
+      ],
+    });
+    if (Array.isArray(files) && files.length > 0) void addVibeFiles(files);
+  }
+
+  // Adds every vibe in the files, switched on while there's room under the
+  // free limit. Uses functional updates: drops call this from a listener
+  // that was set up once.
+  async function addVibeFiles(paths: string[]) {
+    setError(null);
+    const added: VibeEntry[] = [];
+    const failures: string[] = [];
+    for (const path of paths) {
+      try {
+        for (const info of await readVibeFile(path)) {
+          added.push({
+            key: crypto.randomUUID(),
+            path,
+            index: info.index,
+            strength: info.strength ?? DEFAULT_VIBE_STRENGTH,
+            informationExtracted: info.informationExtracted,
+            enabled: false,
+            info,
+            error: null,
+          });
+        }
+      } catch (err) {
+        failures.push(`${fileName(path)}: ${String(err)}`);
+      }
+    }
+    if (failures.length > 0) setError(failures.join(" "));
+    setVibes((prev) => {
+      const fresh = added.filter((a) => !prev.some((v) => v.path === a.path && v.index === a.index));
+      let on = prev.filter((v) => v.enabled).length;
+      const switched = fresh.map((v) => {
+        const enabled = on < MAX_VIBES;
+        if (enabled) on++;
+        return { ...v, enabled };
+      });
+      return [...prev, ...switched];
+    });
+  }
+
+  function updateVibe(key: string, change: Partial<SavedVibe>) {
+    setVibes((prev) => prev.map((v) => (v.key === key ? { ...v, ...change } : v)));
+  }
+
   async function chooseOutputDir() {
     const dir = await open({ directory: true, multiple: false });
     if (typeof dir === "string") setOutputDir(dir);
@@ -456,6 +578,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
         scale,
         seed,
         fileStem: fileStemFor(seed, i, batchStart),
+        vibes: vibeRefs,
       };
     });
 
@@ -953,6 +1076,185 @@ export default function GenerateTab({ active }: { active: boolean }) {
           >
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", flex: 1 }}>
+                VIBE TRANSFER
+                {vibes.length > 0 && modelInfo.vibes && (
+                  <span style={{ fontWeight: 500 }}>
+                    {" "}
+                    · {vibeRefs.length} of {MAX_VIBES} in use
+                  </span>
+                )}
+              </span>
+              <button
+                onClick={() => void chooseVibeFiles()}
+                disabled={generating}
+                style={{ ...secondaryButtonStyle, padding: "6px 14px" }}
+              >
+                Add vibe file…
+              </button>
+            </div>
+
+            {vibes.length === 0 && (
+              <div style={{ fontSize: 12.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif" }}>
+                Use .naiv4vibe or .naiv4vibebundle files exported from NovelAI, or a NovelAI PNG
+                with vibes embedded. Only vibes already encoded for the selected model are used,
+                so they stay free — up to {MAX_VIBES} at a time.
+              </div>
+            )}
+
+            {vibes.length > 0 && !modelInfo.vibes && (
+              <div style={{ ...warningBoxStyle, marginTop: 0 }}>
+                V5 models don't support Vibe Transfer yet, so these vibes are ignored. Switch to a
+                V4 or V4.5 model to use them.
+              </div>
+            )}
+
+            {vibes.map((v) => {
+              const options = v.info ? v.info.encodings.filter((e) => e.model === model) : [];
+              const encoding = v.info && vibeEncodingFor(v.info, model, v.informationExtracted);
+              const status = v.error
+                ? v.error
+                : !modelInfo.vibes
+                  ? null
+                  : encoding
+                    ? null
+                    : `Not encoded for ${modelInfo.label}, so it isn't used. Encoding it would cost Anlas.`;
+              return (
+                <div key={v.key} style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                  <input
+                    type="checkbox"
+                    checked={v.enabled}
+                    onChange={(e) => updateVibe(v.key, { enabled: e.target.checked })}
+                    disabled={generating || (!v.enabled && vibesOn >= MAX_VIBES)}
+                    title={
+                      !v.enabled && vibesOn >= MAX_VIBES
+                        ? `Up to ${MAX_VIBES} vibes at once; more would cost Anlas`
+                        : "Use this vibe"
+                    }
+                    style={{ accentColor: "var(--accent)" }}
+                  />
+                  {v.info?.thumbnail ? (
+                    <img
+                      src={v.info.thumbnail}
+                      alt=""
+                      style={{ width: 44, height: 44, objectFit: "cover", borderRadius: 6, flexShrink: 0 }}
+                    />
+                  ) : (
+                    <div
+                      style={{
+                        width: 44,
+                        height: 44,
+                        borderRadius: 6,
+                        flexShrink: 0,
+                        background: "var(--bg-page)",
+                        border: "1px solid var(--border)",
+                      }}
+                    />
+                  )}
+                  <div
+                    style={{
+                      flex: 1,
+                      minWidth: 0,
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 4,
+                      opacity: v.enabled ? 1 : 0.6,
+                    }}
+                  >
+                    <div
+                      title={v.path}
+                      style={{
+                        fontSize: 13,
+                        fontWeight: 600,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {v.info?.name ?? fileName(v.path)}
+                    </div>
+                    {status ? (
+                      <div style={{ fontSize: 12, color: "rgb(200,140,40)", fontFamily: "system-ui, sans-serif" }}>
+                        {status}
+                      </div>
+                    ) : (
+                      v.info && (
+                        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                          <label
+                            style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, flex: "1 1 180px" }}
+                          >
+                            <span style={{ whiteSpace: "nowrap", minWidth: 86 }}>
+                              Strength {v.strength.toFixed(2)}
+                            </span>
+                            <input
+                              type="range"
+                              min={0}
+                              max={1}
+                              step={0.01}
+                              value={v.strength}
+                              onChange={(e) => updateVibe(v.key, { strength: Number(e.target.value) })}
+                              disabled={generating}
+                              style={{ flex: 1, minWidth: 80, accentColor: "var(--accent)" }}
+                            />
+                          </label>
+                          {encoding && options.length > 1 ? (
+                            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+                              Info extracted
+                              <select
+                                value={options.indexOf(encoding)}
+                                onChange={(e) =>
+                                  updateVibe(v.key, {
+                                    informationExtracted:
+                                      options[Number(e.target.value)].informationExtracted,
+                                  })
+                                }
+                                disabled={generating}
+                                style={{ ...inputStyle, padding: "3px 6px", background: "var(--bg-page)" }}
+                              >
+                                {options.map((o, i) => (
+                                  <option key={i} value={i}>
+                                    {o.informationExtracted ?? "unknown"}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                          ) : (
+                            encoding?.informationExtracted != null && (
+                              <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                                Info extracted {encoding.informationExtracted}
+                              </span>
+                            )
+                          )}
+                        </div>
+                      )
+                    )}
+                  </div>
+                  <a
+                    href="#"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      if (!generating) setVibes((prev) => prev.filter((x) => x.key !== v.key));
+                    }}
+                    style={{ fontSize: 13, fontWeight: 600 }}
+                  >
+                    Remove
+                  </a>
+                </div>
+              );
+            })}
+          </div>
+
+          <div
+            style={{
+              border: "1px solid var(--border)",
+              borderRadius: 8,
+              padding: "12px 14px",
+              display: "flex",
+              flexDirection: "column",
+              gap: 12,
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", flex: 1 }}>
                 PROMPT FROM FILE
               </span>
               {promptFile && (
@@ -1303,7 +1605,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
               fontWeight: 600,
             }}
           >
-            Drop a NovelAI image to import its settings
+            Drop a NovelAI image to import its settings, or a vibe file to add it
           </div>
         </div>
       )}

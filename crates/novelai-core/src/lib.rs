@@ -2,7 +2,7 @@ use base64::Engine;
 use keyring_core::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -228,6 +228,8 @@ pub struct GenerateRequest {
     pub scale: f64,
     pub seed: u32,
     pub file_stem: String,
+    #[serde(default)]
+    pub vibes: Vec<VibeRef>,
 }
 
 #[derive(Serialize, Clone)]
@@ -247,7 +249,7 @@ struct ImageGenerationJsonResponse {
     images: Vec<ImageJson>,
 }
 
-fn build_body(req: &GenerateRequest) -> Result<serde_json::Value, String> {
+fn build_body(req: &GenerateRequest, vibes: &[ResolvedVibe]) -> Result<serde_json::Value, String> {
     if !ALLOWED_SIZES.contains(&(req.width, req.height)) {
         return Err(format!(
             "{}x{} isn't one of the allowed sizes (832x1216, 1216x832, 1024x1024).",
@@ -288,7 +290,7 @@ fn build_body(req: &GenerateRequest) -> Result<serde_json::Value, String> {
         .map(|_| json!({ "char_caption": "", "centers": center }))
         .collect();
 
-    let parameters = json!({
+    let mut parameters = json!({
         "params_version": 4,
         "width": req.width,
         "height": req.height,
@@ -312,6 +314,14 @@ fn build_body(req: &GenerateRequest) -> Result<serde_json::Value, String> {
             "legacy_uc": false,
         },
     });
+    // Pre-encoded vibes go in as-is, the way NovelAI's web client sends
+    // them; there's nothing for NovelAI to encode (or charge for).
+    if !vibes.is_empty() {
+        parameters["reference_image_multiple"] =
+            json!(vibes.iter().map(|v| v.encoding.as_str()).collect::<Vec<_>>());
+        parameters["reference_strength_multiple"] =
+            json!(vibes.iter().map(|v| v.strength).collect::<Vec<_>>());
+    }
 
     Ok(json!({
         "input": req.prompt,
@@ -419,6 +429,7 @@ fn validate_file_stem(stem: &str) -> Result<(), String> {
 
 /// Checks the whole batch before anything is sent, so a bad request at
 /// position 7 can't fail the batch after six images were already made.
+/// Reads any vibe files the requests use, so call it off the async runtime.
 fn validate_batch(requests: &[GenerateRequest]) -> Result<Vec<serde_json::Value>, String> {
     if requests.is_empty() {
         return Err("Nothing to generate.".into());
@@ -426,9 +437,14 @@ fn validate_batch(requests: &[GenerateRequest]) -> Result<Vec<serde_json::Value>
     if requests.len() > MAX_BATCH {
         return Err(format!("A batch can be at most {MAX_BATCH} images."));
     }
+    let mut files = VibeFiles::new();
     requests
         .iter()
-        .map(|r| validate_file_stem(&r.file_stem).and_then(|_| build_body(r)))
+        .map(|r| {
+            validate_file_stem(&r.file_stem)?;
+            let vibes = resolve_vibes(&r.model, &r.vibes, &mut files)?;
+            build_body(r, &vibes)
+        })
         .collect()
 }
 
@@ -445,7 +461,13 @@ pub async fn generate_batch(
     guard_anlas: bool,
     mut on_progress: impl FnMut(BatchProgress),
 ) -> Result<BatchSummary, String> {
-    let bodies = validate_batch(&requests)?;
+    let requests = std::sync::Arc::new(requests);
+    let bodies = {
+        let requests = requests.clone();
+        tokio::task::spawn_blocking(move || validate_batch(&requests))
+            .await
+            .map_err(|e| e.to_string())??
+    };
     let token = tokio::task::spawn_blocking(read_token)
         .await
         .map_err(|e| e.to_string())??
@@ -754,6 +776,296 @@ pub async fn read_prompt_file(path: String) -> Result<Vec<String>, String> {
     .map_err(|e| e.to_string())?
 }
 
+// ---- Vibe Transfer ----
+//
+// Only vibes that are already encoded are used: `.naiv4vibe` and
+// `.naiv4vibebundle` files exported from NovelAI, or a PNG with vibes
+// embedded in it. NovelAI's web client prices encoding an image at 2 Anlas
+// and every vibe past the fourth at 2 more, so this never asks NovelAI to
+// encode anything and never sends more than four vibes.
+
+pub const MAX_FREE_VIBES: usize = 4;
+/// NovelAI's own default for a vibe with no strength recorded.
+pub const DEFAULT_VIBE_STRENGTH: f64 = 0.6;
+
+/// The key a vibe file keeps a model's encodings under, as NovelAI's web
+/// client names them. V5 doesn't support Vibe Transfer yet, so it has none.
+pub fn vibe_encoding_key(model: &str) -> Option<&'static str> {
+    match model {
+        "nai-diffusion-4-5-full" => Some("v4-5full"),
+        "nai-diffusion-4-5-curated" => Some("v4-5curated"),
+        "nai-diffusion-4-full" => Some("v4full"),
+        "nai-diffusion-4-curated-preview" => Some("v4curated"),
+        _ => None,
+    }
+}
+
+fn model_for_encoding_key(key: &str) -> Option<&'static str> {
+    MODELS.iter().copied().find(|m| vibe_encoding_key(m) == Some(key))
+}
+
+/// A vibe the user picked: which file, which vibe in it, and how to use it.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeRef {
+    pub path: String,
+    /// Position in the file; a bundle holds several vibes.
+    pub index: usize,
+    /// Picks between encodings when the file has several for the model.
+    pub information_extracted: Option<f64>,
+    pub strength: f64,
+}
+
+// The JSON NovelAI's web client writes, trimmed to the fields used here.
+#[derive(Deserialize)]
+struct VibeParamsJson {
+    information_extracted: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct VibeEncodingJson {
+    encoding: String,
+    params: Option<VibeParamsJson>,
+}
+
+#[derive(Deserialize)]
+struct VibeImportInfoJson {
+    model: Option<String>,
+    information_extracted: Option<f64>,
+    strength: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VibeJson {
+    name: Option<String>,
+    thumbnail: Option<String>,
+    /// Encoding key ("v4-5full") -> one entry per set of encode settings.
+    #[serde(default)]
+    encodings: BTreeMap<String, BTreeMap<String, VibeEncodingJson>>,
+    import_info: Option<VibeImportInfoJson>,
+}
+
+#[derive(Deserialize)]
+struct VibeBundleJson {
+    vibes: Vec<VibeJson>,
+}
+
+impl VibeJson {
+    fn display_name(&self, index: usize) -> String {
+        match self.name.as_deref().map(str::trim) {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => format!("Vibe {}", index + 1),
+        }
+    }
+
+    // An encoding made from an image records its settings; one exported as
+    // a bare encoding doesn't, but the file's import info says what it was.
+    fn information_extracted(&self, key: &str, entry: &VibeEncodingJson) -> Option<f64> {
+        entry.params.as_ref().and_then(|p| p.information_extracted).or_else(|| {
+            let info = self.import_info.as_ref()?;
+            let model = info.model.as_deref()?;
+            (vibe_encoding_key(model) == Some(key)).then_some(info.information_extracted)?
+        })
+    }
+}
+
+const NOT_A_VIBE_FILE: &str = "That isn't a NovelAI vibe file (.naiv4vibe or .naiv4vibebundle).";
+
+fn parse_vibes(text: &str) -> Result<Vec<VibeJson>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|_| NOT_A_VIBE_FILE)?;
+    let damaged = |e: serde_json::Error| format!("That vibe file is damaged: {e}");
+    let vibes = match value.get("identifier").and_then(|v| v.as_str()) {
+        Some("novelai-vibe-transfer") => vec![serde_json::from_value(value).map_err(damaged)?],
+        Some("novelai-vibe-transfer-bundle") => {
+            serde_json::from_value::<VibeBundleJson>(value).map_err(damaged)?.vibes
+        }
+        _ => return Err(NOT_A_VIBE_FILE.into()),
+    };
+    if vibes.is_empty() {
+        return Err("That vibe bundle is empty.".into());
+    }
+    Ok(vibes)
+}
+
+fn load_vibe_file(path: &str) -> Result<Vec<VibeJson>, String> {
+    let data = std::fs::read(path).map_err(|e| format!("couldn't read the vibe file: {e}"))?;
+    if data.starts_with(&PNG_SIGNATURE) {
+        // NovelAI can embed the vibes an image used in its metadata.
+        let naidata = png_text_chunks(&data)?
+            .into_iter()
+            .find(|(k, _)| k == "naidata")
+            .ok_or("This image doesn't have any vibes embedded in it.")?;
+        let json = base64::engine::general_purpose::STANDARD
+            .decode(naidata.1.trim())
+            .map_err(|_| "This image's embedded vibes are damaged.")?;
+        return parse_vibes(&String::from_utf8_lossy(&json));
+    }
+    parse_vibes(&String::from_utf8_lossy(&data))
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeEncodingInfo {
+    /// Our model ID.
+    pub model: String,
+    pub information_extracted: Option<f64>,
+}
+
+/// What the frontend shows for one vibe. The encodings themselves stay in
+/// Rust: generation reads them from the file again, so nothing but a file's
+/// own encodings can ever be sent.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeInfo {
+    pub index: usize,
+    pub name: String,
+    /// A data: URL, when the file has a reasonably small one.
+    pub thumbnail: Option<String>,
+    /// Usable encodings, in the order generation picks from them.
+    pub encodings: Vec<VibeEncodingInfo>,
+    /// The settings the vibe was exported with, if recorded.
+    pub strength: Option<f64>,
+    pub information_extracted: Option<f64>,
+}
+
+const MAX_THUMBNAIL_LEN: usize = 512 * 1024;
+
+fn vibe_info(index: usize, vibe: &VibeJson) -> VibeInfo {
+    let encodings = vibe
+        .encodings
+        .iter()
+        .filter_map(|(key, entries)| model_for_encoding_key(key).map(|model| (key, model, entries)))
+        .flat_map(|(key, model, entries)| {
+            entries.values().map(move |e| VibeEncodingInfo {
+                model: model.to_string(),
+                information_extracted: vibe.information_extracted(key, e),
+            })
+        })
+        .collect();
+    let thumbnail = vibe
+        .thumbnail
+        .clone()
+        .filter(|t| t.starts_with("data:image/") && t.contains(";base64,") && t.len() <= MAX_THUMBNAIL_LEN);
+    let info = vibe.import_info.as_ref();
+    VibeInfo {
+        index,
+        name: vibe.display_name(index),
+        thumbnail,
+        encodings,
+        strength: info.and_then(|i| i.strength).filter(|s| (0.0..=1.0).contains(s)),
+        information_extracted: info.and_then(|i| i.information_extracted),
+    }
+}
+
+/// The encoding a vibe would use with `model`: the one with the requested
+/// information extracted, else the first. None when it has no encoding for
+/// the model, since using it would mean a paid encode. Picks the same way as
+/// `resolve_vibes` and the app's `vibeEncodingFor`.
+pub fn vibe_encoding_for<'a>(
+    info: &'a VibeInfo,
+    model: &str,
+    information_extracted: Option<f64>,
+) -> Option<&'a VibeEncodingInfo> {
+    let mut options = info.encodings.iter().filter(|e| e.model == model);
+    let first = options.clone().next();
+    options
+        .find(|e| match (e.information_extracted, information_extracted) {
+            (Some(a), Some(b)) => (a - b).abs() < 1e-6,
+            (None, None) => true,
+            _ => false,
+        })
+        .or(first)
+}
+
+pub async fn read_vibe_file(path: String) -> Result<Vec<VibeInfo>, String> {
+    tokio::task::spawn_blocking(move || {
+        Ok(load_vibe_file(&path)?.iter().enumerate().map(|(i, v)| vibe_info(i, v)).collect())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+struct ResolvedVibe {
+    encoding: String,
+    strength: f64,
+}
+
+/// Vibe files read so far in a batch, by path.
+type VibeFiles = HashMap<String, Vec<VibeJson>>;
+
+// An encoding is opaque model data. If a file's "encoding" were really an
+// image, NovelAI would encode it and charge for that, so refuse it.
+fn check_encoding(encoding: &str, name: &str) -> Result<(), String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoding.trim())
+        .map_err(|_| format!("The vibe \"{name}\" has a damaged encoding."))?;
+    let is_image = bytes.starts_with(&PNG_SIGNATURE)
+        || bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+        || bytes.starts_with(b"GIF8")
+        || (bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP");
+    if bytes.is_empty() || is_image {
+        return Err(format!(
+            "The vibe \"{name}\" holds an image rather than an encoding. Encoding it would cost Anlas."
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_vibes(
+    model: &str,
+    refs: &[VibeRef],
+    files: &mut VibeFiles,
+) -> Result<Vec<ResolvedVibe>, String> {
+    if refs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let key = vibe_encoding_key(model)
+        .ok_or_else(|| format!("{model} doesn't support Vibe Transfer."))?;
+    if refs.len() > MAX_FREE_VIBES {
+        return Err(format!(
+            "At most {MAX_FREE_VIBES} vibes can be used at once; each one past the fourth costs Anlas."
+        ));
+    }
+    refs.iter()
+        .map(|r| {
+            if !(0.0..=1.0).contains(&r.strength) {
+                return Err("Vibe strength must be between 0 and 1.".to_string());
+            }
+            if !files.contains_key(&r.path) {
+                files.insert(r.path.clone(), load_vibe_file(&r.path)?);
+            }
+            let vibe = files[&r.path]
+                .get(r.index)
+                .ok_or_else(|| format!("{} doesn't have a vibe #{}.", r.path, r.index + 1))?;
+            let name = vibe.display_name(r.index);
+            let entries = vibe.encodings.get(key).filter(|e| !e.is_empty()).ok_or_else(|| {
+                format!(
+                    "The vibe \"{name}\" isn't encoded for {model}. Encoding it would cost Anlas, \
+                     so it can't be used with this model."
+                )
+            })?;
+            // Mirrors vibeEncodingFor on the frontend, so the encoding sent is
+            // the one shown.
+            let entry = match r.information_extracted {
+                None => entries
+                    .values()
+                    .find(|e| vibe.information_extracted(key, e).is_none())
+                    .or_else(|| entries.values().next()),
+                Some(ie) => entries.values().find(|e| {
+                    vibe.information_extracted(key, e).is_some_and(|x| (x - ie).abs() < 1e-6)
+                }),
+            }
+            .ok_or_else(|| {
+                format!("The vibe \"{name}\" has no {model} encoding with that information extracted.")
+            })?;
+            check_encoding(&entry.encoding, &name)?;
+            Ok(ResolvedVibe { encoding: entry.encoding.trim().to_string(), strength: r.strength })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,7 +1082,12 @@ mod tests {
             scale: 5.0,
             seed: 42,
             file_stem: "out".into(),
+            vibes: vec![],
         }
+    }
+
+    fn body_of(req: &GenerateRequest) -> Result<serde_json::Value, String> {
+        build_body(req, &[])
     }
 
     #[test]
@@ -778,7 +1095,7 @@ mod tests {
         let mut req = request("nai-diffusion-5-full", 1216, 832, &[]);
         req.steps = 20;
         req.scale = 6.5;
-        let body = build_body(&req).unwrap();
+        let body = body_of(&req).unwrap();
         let p = &body["parameters"];
         assert_eq!(p["steps"], 20);
         assert_eq!(p["scale"], 6.5);
@@ -791,42 +1108,42 @@ mod tests {
     fn rejects_steps_above_the_free_limit() {
         let mut req = request("nai-diffusion-4-5-full", 1024, 1024, &[]);
         req.steps = 29;
-        assert!(build_body(&req).is_err());
+        assert!(body_of(&req).is_err());
         req.steps = 0;
-        assert!(build_body(&req).is_err());
+        assert!(body_of(&req).is_err());
     }
 
     #[test]
     fn rejects_guidance_out_of_range() {
         let mut req = request("nai-diffusion-4-5-full", 1024, 1024, &[]);
         req.scale = 10.5;
-        assert!(build_body(&req).is_err());
+        assert!(body_of(&req).is_err());
         req.scale = -1.0;
-        assert!(build_body(&req).is_err());
+        assert!(body_of(&req).is_err());
     }
 
     #[test]
     fn medium_effort_always_runs_at_its_fixed_steps() {
-        let body = build_body(&request("nai-diffusion-5-full-medium", 1024, 1024, &[])).unwrap();
+        let body = body_of(&request("nai-diffusion-5-full-medium", 1024, 1024, &[])).unwrap();
         assert_eq!(body["parameters"]["steps"], 14);
     }
 
     #[test]
     fn rejects_sizes_outside_the_allowed_three() {
-        assert!(build_body(&request("nai-diffusion-4-5-full", 1024, 1536, &[])).is_err());
-        assert!(build_body(&request("nai-diffusion-4-5-full", 2048, 2048, &[])).is_err());
+        assert!(body_of(&request("nai-diffusion-4-5-full", 1024, 1536, &[])).is_err());
+        assert!(body_of(&request("nai-diffusion-4-5-full", 2048, 2048, &[])).is_err());
     }
 
     #[test]
     fn rejects_unknown_and_removed_models() {
-        assert!(build_body(&request("some-other-model", 1024, 1024, &[])).is_err());
-        assert!(build_body(&request("nai-diffusion-3", 1024, 1024, &[])).is_err());
+        assert!(body_of(&request("some-other-model", 1024, 1024, &[])).is_err());
+        assert!(body_of(&request("nai-diffusion-3", 1024, 1024, &[])).is_err());
     }
 
     #[test]
     fn characters_go_in_v4_prompt_with_blank_ones_dropped() {
         let body =
-            build_body(&request("nai-diffusion-5-full", 832, 1216, &["girl, red hair", "  "]))
+            body_of(&request("nai-diffusion-5-full", 832, 1216, &["girl, red hair", "  "]))
                 .unwrap();
         let chars = body["parameters"]["v4_prompt"]["caption"]["char_captions"]
             .as_array()
@@ -842,7 +1159,7 @@ mod tests {
     #[test]
     fn caps_characters_at_four() {
         let five = ["a", "b", "c", "d", "e"];
-        assert!(build_body(&request("nai-diffusion-4-5-full", 1024, 1024, &five)).is_err());
+        assert!(body_of(&request("nai-diffusion-4-5-full", 1024, 1024, &five)).is_err());
     }
 
     // ---- batches ----
@@ -973,5 +1290,188 @@ mod tests {
         let png = png_with(&[text_chunk("Software", "Photoshop")]);
         assert!(parse_settings(&png_text_chunks(&png).unwrap()).is_err());
         assert!(png_text_chunks(b"not a png at all").is_err());
+    }
+
+    // ---- vibe transfer ----
+
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    // Shapes follow what NovelAI's web client exports: an image-type vibe
+    // keeps one entry per encode setting, an encoding-type vibe a single
+    // "unknown" entry described by its import info.
+    fn image_vibe(name: &str) -> String {
+        json!({
+            "identifier": "novelai-vibe-transfer",
+            "version": 1,
+            "type": "image",
+            "id": "ab",
+            "name": name,
+            "thumbnail": "data:image/png;base64,AAAA",
+            "createdAt": "2026-01-01T00:00:00.000Z",
+            "encodings": {
+                "v4-5full": {
+                    "h1": { "encoding": b64(b"enc-45-ie07"), "params": { "information_extracted": 0.7 } },
+                    "h2": { "encoding": b64(b"enc-45-ie10"), "params": { "information_extracted": 1.0 } }
+                },
+                "v5full": { "h3": { "encoding": b64(b"enc-v5"), "params": { "information_extracted": 1.0 } } }
+            },
+            "importInfo": { "model": "nai-diffusion-4-5-full", "information_extracted": 0.7, "strength": 0.45 }
+        })
+        .to_string()
+    }
+
+    fn encoding_vibe() -> serde_json::Value {
+        json!({
+            "identifier": "novelai-vibe-transfer",
+            "version": 1,
+            "type": "encoding",
+            "id": "cd",
+            "encodings": { "v4full": { "unknown": { "encoding": b64(b"enc-v4") } } },
+            "importInfo": { "model": "nai-diffusion-4-full", "information_extracted": 0.5, "strength": 0.6 }
+        })
+    }
+
+    fn temp_file(name: &str, contents: &[u8]) -> String {
+        let dir = std::env::temp_dir().join(format!("novelai-core-tests-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn vibe_ref(path: &str, index: usize, ie: Option<f64>, strength: f64) -> VibeRef {
+        VibeRef { path: path.into(), index, information_extracted: ie, strength }
+    }
+
+    #[test]
+    fn maps_models_to_vibe_encoding_keys() {
+        assert_eq!(vibe_encoding_key("nai-diffusion-4-5-full"), Some("v4-5full"));
+        assert_eq!(vibe_encoding_key("nai-diffusion-4-curated-preview"), Some("v4curated"));
+        assert_eq!(vibe_encoding_key("nai-diffusion-5-full"), None);
+        assert_eq!(model_for_encoding_key("v4-5curated"), Some("nai-diffusion-4-5-curated"));
+        assert_eq!(model_for_encoding_key("v5full"), None);
+    }
+
+    #[test]
+    fn describes_a_vibe_file_without_its_encodings() {
+        let vibes = parse_vibes(&image_vibe("Watercolor")).unwrap();
+        let info = vibe_info(0, &vibes[0]);
+        assert_eq!(info.name, "Watercolor");
+        assert_eq!(info.thumbnail.as_deref(), Some("data:image/png;base64,AAAA"));
+        assert_eq!((info.strength, info.information_extracted), (Some(0.45), Some(0.7)));
+        // V5's encoding is left out: this tab can't use it.
+        assert_eq!(
+            info.encodings,
+            vec![
+                VibeEncodingInfo { model: "nai-diffusion-4-5-full".into(), information_extracted: Some(0.7) },
+                VibeEncodingInfo { model: "nai-diffusion-4-5-full".into(), information_extracted: Some(1.0) },
+            ]
+        );
+    }
+
+    #[test]
+    fn picks_encodings_like_generation_does() {
+        let info = vibe_info(0, &parse_vibes(&image_vibe("A")).unwrap()[0]);
+        let pick = |ie| vibe_encoding_for(&info, "nai-diffusion-4-5-full", ie).map(|e| e.information_extracted);
+        assert_eq!(pick(Some(1.0)), Some(Some(1.0)));
+        assert_eq!(pick(None), Some(Some(0.7)));
+        // An unavailable choice falls back to the first, as the app shows it.
+        assert_eq!(pick(Some(0.3)), Some(Some(0.7)));
+        assert!(vibe_encoding_for(&info, "nai-diffusion-4-full", None).is_none());
+    }
+
+    #[test]
+    fn reads_bundles_and_vibes_embedded_in_pngs() {
+        let bundle = json!({
+            "identifier": "novelai-vibe-transfer-bundle",
+            "version": 1,
+            "vibes": [serde_json::from_str::<serde_json::Value>(&image_vibe("A")).unwrap(), encoding_vibe()]
+        })
+        .to_string();
+        let vibes = parse_vibes(&bundle).unwrap();
+        assert_eq!(vibes.len(), 2);
+        // A bare encoding's information extracted comes from its import info.
+        let second = vibe_info(1, &vibes[1]);
+        assert_eq!(second.name, "Vibe 2");
+        assert_eq!(second.encodings[0].information_extracted, Some(0.5));
+
+        let png = png_with(&[text_chunk("naidata", &b64(bundle.as_bytes()))]);
+        assert_eq!(load_vibe_file(&temp_file("embedded.png", &png)).unwrap().len(), 2);
+        let plain = png_with(&[text_chunk("Software", "NovelAI")]);
+        assert!(load_vibe_file(&temp_file("plain.png", &plain)).is_err());
+    }
+
+    #[test]
+    fn rejects_files_that_are_not_vibes() {
+        assert!(parse_vibes("not json").is_err());
+        assert!(parse_vibes(r#"{"identifier": "something-else"}"#).is_err());
+        assert!(parse_vibes(r#"{"identifier": "novelai-vibe-transfer-bundle", "vibes": []}"#).is_err());
+    }
+
+    #[test]
+    fn sends_the_chosen_encodings_with_their_strengths() {
+        let a = temp_file("a.naiv4vibe", image_vibe("A").as_bytes());
+        let b = temp_file("b.naiv4vibe", encoding_vibe().to_string().as_bytes());
+        let mut files = VibeFiles::new();
+
+        let refs = [vibe_ref(&a, 0, Some(1.0), 0.6), vibe_ref(&a, 0, None, 0.3)];
+        let vibes = resolve_vibes("nai-diffusion-4-5-full", &refs, &mut files).unwrap();
+        let mut req = request("nai-diffusion-4-5-full", 832, 1216, &[]);
+        req.vibes = refs.to_vec();
+        let body = build_body(&req, &vibes).unwrap();
+        let p = &body["parameters"];
+        // An explicit choice picks that encoding; none picks the first.
+        assert_eq!(p["reference_image_multiple"], json!([b64(b"enc-45-ie10"), b64(b"enc-45-ie07")]));
+        assert_eq!(p["reference_strength_multiple"], json!([0.6, 0.3]));
+
+        let vibes = resolve_vibes("nai-diffusion-4-full", &[vibe_ref(&b, 0, Some(0.5), 0.6)], &mut files);
+        assert_eq!(vibes.unwrap()[0].encoding, b64(b"enc-v4"));
+
+        // No vibes, no reference fields.
+        let body = body_of(&request("nai-diffusion-4-5-full", 832, 1216, &[])).unwrap();
+        assert!(body["parameters"].get("reference_image_multiple").is_none());
+    }
+
+    #[test]
+    fn refuses_vibes_that_would_cost_anlas_or_cant_apply() {
+        let a = temp_file("c.naiv4vibe", image_vibe("A").as_bytes());
+        let mut files = VibeFiles::new();
+        let one = |ie, strength| [vibe_ref(&a, 0, ie, strength)];
+        // Not encoded for this model: using it would mean a paid encode.
+        assert!(resolve_vibes("nai-diffusion-4-full", &one(None, 0.6), &mut files).is_err());
+        // V5 has no Vibe Transfer.
+        assert!(resolve_vibes("nai-diffusion-5-full", &one(None, 0.6), &mut files).is_err());
+        // No encoding at that information extracted.
+        assert!(resolve_vibes("nai-diffusion-4-5-full", &one(Some(0.3), 0.6), &mut files).is_err());
+        // Strength out of range.
+        assert!(resolve_vibes("nai-diffusion-4-5-full", &one(None, 1.5), &mut files).is_err());
+        assert!(resolve_vibes("nai-diffusion-4-5-full", &one(None, f64::NAN), &mut files).is_err());
+        // No such vibe in the file.
+        assert!(resolve_vibes("nai-diffusion-4-5-full", &[vibe_ref(&a, 3, None, 0.6)], &mut files).is_err());
+        // A fifth vibe costs Anlas.
+        let five: Vec<_> = (0..5).map(|_| vibe_ref(&a, 0, None, 0.5)).collect();
+        assert!(resolve_vibes("nai-diffusion-4-5-full", &five[..4], &mut files).is_ok());
+        assert!(resolve_vibes("nai-diffusion-4-5-full", &five, &mut files).is_err());
+    }
+
+    #[test]
+    fn refuses_an_image_posing_as_an_encoding() {
+        let png = png_with(&[]);
+        let mut vibe: serde_json::Value = serde_json::from_str(&image_vibe("Sneaky")).unwrap();
+        vibe["encodings"]["v4-5full"]["h1"]["encoding"] = json!(b64(&png));
+        let path = temp_file("sneaky.naiv4vibe", vibe.to_string().as_bytes());
+        let refs = [vibe_ref(&path, 0, Some(0.7), 0.6)];
+        assert!(resolve_vibes("nai-diffusion-4-5-full", &refs, &mut VibeFiles::new()).is_err());
+        assert!(check_encoding("not base64!!", "x").is_err());
+        assert!(check_encoding(&b64(b"\xFF\xD8\xFF\xE0jpeg"), "x").is_err());
+    }
+
+    #[test]
+    fn a_missing_vibe_file_fails_the_batch_before_anything_is_sent() {
+        let mut req = request("nai-diffusion-4-5-full", 1024, 1024, &[]);
+        req.vibes = vec![vibe_ref("Z:/definitely/not/here.naiv4vibe", 0, None, 0.6)];
+        assert!(validate_batch(&[req]).is_err());
     }
 }
