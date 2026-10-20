@@ -254,6 +254,11 @@ async fn nai_read_prompt_file(path: String) -> Result<Vec<String>, String> {
     novelai::read_prompt_file(path).await
 }
 
+#[tauri::command]
+async fn nai_read_vibe_file(path: String) -> Result<Vec<novelai::VibeInfo>, String> {
+    novelai::read_vibe_file(path).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -281,7 +286,8 @@ pub fn run() {
             nai_generate_batch,
             nai_cancel_batch,
             nai_read_image_metadata,
-            nai_read_prompt_file
+            nai_read_prompt_file,
+            nai_read_vibe_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

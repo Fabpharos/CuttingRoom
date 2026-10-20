@@ -19,7 +19,9 @@ const INFO: ServerInfo = ServerInfo {
     version: env!("CARGO_PKG_VERSION"),
     instructions: "Generates images through the user's NovelAI account using Cutting Room's saved login. \
         Every generation needs the user's approval in a Windows dialog and may be declined. \
-        Use a fixed seed when comparing prompt variations.",
+        Use a fixed seed when comparing prompt variations. \
+        Vibe Transfer works with vibe files the user already encoded (V4/V4.5 models, up to 4); \
+        check a file with novelai_list_vibes first.",
 };
 
 fn output_dir() -> Result<String, String> {

@@ -8,18 +8,19 @@ A local desktop app for organizing, comparing, and bulk-editing photo albums. Bu
 - **Matching** — compare every photo in one folder against a second folder and find each one's closest visual match by perceptual hash, resolution-independent (useful for tracking down an original, un-upscaled file). Review the matches, then copy the ones you want into a destination folder.
 - **Detection** — run a YOLO (Ultralytics) model over a folder of photos, review the detected regions (toggle individual boxes or whole classes on/off), then pixelate the confirmed regions into an output folder. Originals are never modified.
 - **Strip Metadata** — recursively remove EXIF and other metadata from every image in a folder and its subfolders.
-- **Generate** — text-to-image generation through your NovelAI account, limited to settings that are free on an Opus subscription. Supports batches, prompts loaded from a text file, and importing settings from a NovelAI image.
+- **Generate** — text-to-image generation through your NovelAI account, limited to settings that are free on an Opus subscription. Supports batches, prompts loaded from a text file, importing settings from a NovelAI image, and Vibe Transfer with vibe files you've already encoded on NovelAI (`.naiv4vibe` / `.naiv4vibebundle`, V4 and V4.5 models, up to four at a time so it stays free).
 
 Each tab keeps its own state — switching between them doesn't lose an open folder or an in-progress operation.
 
 ## MCP server (let an AI assistant generate images)
 
-`mcp-server/` builds `cutting-room-mcp.exe`, a local [MCP](https://modelcontextprotocol.io) server that lets an MCP client — Claude Code, Claude Desktop, or any other MCP-capable app on this PC — generate images through your NovelAI account and look at the results. It offers two tools:
+`mcp-server/` builds `cutting-room-mcp.exe`, a local [MCP](https://modelcontextprotocol.io) server that lets an MCP client — Claude Code, Claude Desktop, or any other MCP-capable app on this PC — generate images through your NovelAI account and look at the results. It offers three tools:
 
 - `novelai_account_status` — tier, Anlas, and Opus V5 quota (read-only).
-- `novelai_generate_image` — generates one image and returns a preview; the full PNG is saved to the output folder.
+- `novelai_generate_image` — generates one image and returns a preview; the full PNG is saved to the output folder, or to a folder the assistant names (`output_dir`, a full local path shown in the approval dialog). Optionally applies up to four vibes from vibe files you've already encoded (V4 and V4.5 models); a vibe that would need a paid encode is refused.
+- `novelai_list_vibes` — lists the vibes in a vibe file and which models they're encoded for (read-only, nothing sent to NovelAI).
 
-**Every image needs your approval** in a Windows dialog showing the full request and whether it costs Anlas ("No" is the default button). The server uses the same limits as the Generate tab — free sizes and step counts only, at least 2 seconds between requests, and a stop if NovelAI unexpectedly charges Anlas. It reads the token Cutting Room saved in Windows Credential Manager, so log in once in the Generate tab first; the token is never passed to the AI client.
+**Every image needs your approval** in a Windows dialog showing the full request (including any vibe files) and whether it costs Anlas ("No" is the default button). The server uses the same limits as the Generate tab — free sizes and step counts only, at least 2 seconds between requests, and a stop if NovelAI unexpectedly charges Anlas. It reads the token Cutting Room saved in Windows Credential Manager, so log in once in the Generate tab first; the token is never passed to the AI client.
 
 Build it:
 

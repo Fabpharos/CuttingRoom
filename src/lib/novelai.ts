@@ -41,22 +41,25 @@ export type ModelInfo = {
   usageLimited: boolean;
   /** Models that only run at one step count. */
   fixedSteps?: number;
+  /** Supports Vibe Transfer (V5 doesn't yet). */
+  vibes: boolean;
 };
 
 // Mirrors the Rust-side allowlist; the backend validates these again.
 export const MODELS: ModelInfo[] = [
-  { id: "nai-diffusion-5-full", label: "NAI Diffusion V5 Full", usageLimited: true },
+  { id: "nai-diffusion-5-full", label: "NAI Diffusion V5 Full", usageLimited: true, vibes: false },
   {
     id: "nai-diffusion-5-full-medium",
     label: "NAI Diffusion V5 Full (Medium Effort)",
     usageLimited: true,
     fixedSteps: 14,
+    vibes: false,
   },
-  { id: "nai-diffusion-5-curated", label: "NAI Diffusion V5 Curated", usageLimited: true },
-  { id: "nai-diffusion-4-5-full", label: "NAI Diffusion V4.5 Full", usageLimited: false },
-  { id: "nai-diffusion-4-5-curated", label: "NAI Diffusion V4.5 Curated", usageLimited: false },
-  { id: "nai-diffusion-4-full", label: "NAI Diffusion V4 Full", usageLimited: false },
-  { id: "nai-diffusion-4-curated-preview", label: "NAI Diffusion V4 Curated", usageLimited: false },
+  { id: "nai-diffusion-5-curated", label: "NAI Diffusion V5 Curated", usageLimited: true, vibes: false },
+  { id: "nai-diffusion-4-5-full", label: "NAI Diffusion V4.5 Full", usageLimited: false, vibes: true },
+  { id: "nai-diffusion-4-5-curated", label: "NAI Diffusion V4.5 Curated", usageLimited: false, vibes: true },
+  { id: "nai-diffusion-4-full", label: "NAI Diffusion V4 Full", usageLimited: false, vibes: true },
+  { id: "nai-diffusion-4-curated-preview", label: "NAI Diffusion V4 Curated", usageLimited: false, vibes: true },
 ];
 
 export const DEFAULT_STEPS = 28;
@@ -73,6 +76,53 @@ export const SIZES: { width: number; height: number; label: string }[] = [
 
 export const MAX_CHARACTERS = 4;
 
+// Each vibe past the fourth costs Anlas, so the Rust side refuses a fifth.
+export const MAX_VIBES = 4;
+export const DEFAULT_VIBE_STRENGTH = 0.6;
+
+/** A vibe to send: which file, which vibe in it, and how strongly. */
+export type VibeRef = {
+  path: string;
+  index: number;
+  /** Picks between encodings when the file has several for the model. */
+  informationExtracted: number | null;
+  strength: number;
+};
+
+export type VibeEncodingInfo = { model: string; informationExtracted: number | null };
+
+/** One vibe in a file. The encodings themselves never leave Rust. */
+export type VibeInfo = {
+  index: number;
+  name: string;
+  /** A data: URL, when the file has one. */
+  thumbnail: string | null;
+  /** In the order generation picks from them. */
+  encodings: VibeEncodingInfo[];
+  /** The settings it was exported with, if recorded. */
+  strength: number | null;
+  informationExtracted: number | null;
+};
+
+/** Reads a .naiv4vibe / .naiv4vibebundle file, or a PNG with vibes embedded. */
+export async function readVibeFile(path: string): Promise<VibeInfo[]> {
+  return invoke("nai_read_vibe_file", { path });
+}
+
+/**
+ * The encoding a vibe would use with `model`, or null when it has none —
+ * using it would mean a paid encode, so it's left out. Rust picks the same
+ * way (resolve_vibes).
+ */
+export function vibeEncodingFor(
+  info: VibeInfo,
+  model: string,
+  informationExtracted: number | null,
+): VibeEncodingInfo | null {
+  const options = info.encodings.filter((e) => e.model === model);
+  return options.find((e) => e.informationExtracted === informationExtracted) ?? options[0] ?? null;
+}
+
 export type GenerateRequest = {
   model: string;
   prompt: string;
@@ -84,6 +134,7 @@ export type GenerateRequest = {
   scale: number;
   seed: number;
   fileStem: string;
+  vibes: VibeRef[];
 };
 
 /** Settings read from a NovelAI image's metadata, before deciding what applies. */
