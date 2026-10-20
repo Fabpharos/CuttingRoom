@@ -1,6 +1,6 @@
 import ThemeSwitch from "./ThemeSwitch";
 
-export type TabId = "album" | "matching" | "detection" | "stripMetadata" | "generate";
+export type TabId = "album" | "matching" | "detection" | "stripMetadata" | "generate" | "upscale";
 
 type Theme = "light" | "dark";
 
@@ -75,6 +75,25 @@ function GenerateTabIcon({ color }: { color: string }) {
     >
       <path d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3Z" />
       <path d="M18.5 15l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2Z" />
+    </svg>
+  );
+}
+
+function UpscaleTabIcon({ color }: { color: string }) {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      style={{ stroke: color }}
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <rect x="3" y="13" width="8" height="8" rx="1.5" />
+      <path d="M14 3h7v7" />
+      <path d="M21 3l-8 8" />
     </svg>
   );
 }
@@ -278,6 +297,13 @@ export default function Sidebar({
           active={activeTab === "generate"}
           collapsed={collapsed}
           onClick={() => onSelectTab("generate")}
+        />
+        <NavItem
+          icon={<UpscaleTabIcon color={iconColorFor("upscale")} />}
+          label="Upscale"
+          active={activeTab === "upscale"}
+          collapsed={collapsed}
+          onClick={() => onSelectTab("upscale")}
         />
       </nav>
 

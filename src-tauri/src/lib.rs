@@ -259,6 +259,24 @@ async fn nai_read_vibe_file(path: String) -> Result<Vec<novelai::VibeInfo>, Stri
     novelai::read_vibe_file(path).await
 }
 
+#[tauri::command]
+async fn nai_scan_upscale(path: String, is_folder: bool) -> Result<novelai::UpscaleScan, String> {
+    novelai::scan_for_upscale(path, is_folder).await
+}
+
+#[tauri::command]
+async fn nai_upscale_batch(
+    app: tauri::AppHandle,
+    run_id: String,
+    paths: Vec<String>,
+    output_dir: String,
+) -> Result<novelai::UpscaleSummary, String> {
+    novelai::upscale_batch(run_id, paths, output_dir, |progress| {
+        let _ = app.emit("nai-upscale-progress", progress);
+    })
+    .await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -287,7 +305,9 @@ pub fn run() {
             nai_cancel_batch,
             nai_read_image_metadata,
             nai_read_prompt_file,
-            nai_read_vibe_file
+            nai_read_vibe_file,
+            nai_scan_upscale,
+            nai_upscale_batch
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

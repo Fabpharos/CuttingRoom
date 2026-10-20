@@ -6,6 +6,7 @@ import MatchingTab from "./components/MatchingTab";
 import DetectionTab from "./components/DetectionTab";
 import StripMetadataTab from "./components/StripMetadataTab";
 import GenerateTab from "./components/GenerateTab";
+import UpscaleTab from "./components/UpscaleTab";
 
 type Theme = "light" | "dark";
 
@@ -65,6 +66,9 @@ export default function App() {
         </TabPanel>
         <TabPanel active={activeTab === "generate"}>
           <GenerateTab active={activeTab === "generate"} />
+        </TabPanel>
+        <TabPanel active={activeTab === "upscale"}>
+          <UpscaleTab active={activeTab === "upscale"} />
         </TabPanel>
       </div>
     </div>
