@@ -1,6 +1,6 @@
 [package]
 name = "novelai-core"
-version = "1.1.0"
+version = "1.2.0"
 description = "NovelAI client shared by Cutting Room and its MCP server: token storage, free-generation limits, rate limiting, metadata import, upscaling"
 edition = "2021"
 
