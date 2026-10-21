@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+mod inpaint;
+pub use inpaint::*;
+
 const API_BASE: &str = "https://image.novelai.net";
 const KEYRING_SERVICE: &str = "CuttingRoom.NovelAI";
 const KEYRING_USER: &str = "api-token";
@@ -256,6 +259,12 @@ fn build_body(req: &GenerateRequest, vibes: &[ResolvedVibe]) -> Result<serde_jso
             req.width, req.height
         ));
     }
+    request_body(req, vibes)
+}
+
+/// Everything `build_body` checks except the size, which inpainting checks
+/// its own way (any multiple of 64 within the free pixel count).
+fn request_body(req: &GenerateRequest, vibes: &[ResolvedVibe]) -> Result<serde_json::Value, String> {
     if !MODELS.contains(&req.model.as_str()) {
         return Err(format!("Unknown model: {}", req.model));
     }
@@ -534,14 +543,12 @@ pub async fn generate_batch(
     Ok(BatchSummary { images, cancelled, stopped_reason })
 }
 
-async fn generate_one(
-    token: &str,
-    body: &serde_json::Value,
-    req: &GenerateRequest,
-    dir: &Path,
-) -> Result<GeneratedImage, String> {
+/// Sends `body` to an image endpoint (generate-image, upscale) and returns
+/// the first image's bytes. Asks for JSON so the image comes back as base64
+/// rather than in a zip.
+async fn post_for_image(token: &str, endpoint: &str, body: &serde_json::Value) -> Result<Vec<u8>, String> {
     let resp = http()
-        .post(format!("{API_BASE}/ai/generate-image"))
+        .post(format!("{API_BASE}{endpoint}"))
         .bearer_auth(token)
         .header(reqwest::header::ACCEPT, "application/json")
         .json(body)
@@ -569,10 +576,18 @@ async fn generate_one(
         .into_iter()
         .next()
         .ok_or("NovelAI returned no image.")?;
-    let bytes = base64::engine::general_purpose::STANDARD
+    base64::engine::general_purpose::STANDARD
         .decode(first.image)
-        .map_err(|e| format!("couldn't decode the returned image: {e}"))?;
+        .map_err(|e| format!("couldn't decode the returned image: {e}"))
+}
 
+async fn generate_one(
+    token: &str,
+    body: &serde_json::Value,
+    req: &GenerateRequest,
+    dir: &Path,
+) -> Result<GeneratedImage, String> {
+    let bytes = post_for_image(token, "/ai/generate-image", body).await?;
     let dir = dir.to_path_buf();
     let stem = req.file_stem.clone();
     let path = tokio::task::spawn_blocking(move || save_png(&dir, &stem, &bytes))
@@ -1216,7 +1231,7 @@ fn upscale_body(image_base64: &str) -> serde_json::Value {
 }
 
 /// `<name>_upscaled`, from the source file's name.
-fn upscaled_stem(source: &str) -> String {
+pub fn upscaled_stem(source: &str) -> String {
     let stem = Path::new(source).file_stem().unwrap_or_default().to_string_lossy().into_owned();
     format!("{}_upscaled", if stem.is_empty() { "image" } else { &stem })
 }
@@ -1343,25 +1358,7 @@ pub async fn upscale_batch(
 }
 
 async fn upscale_one(token: &str, image_base64: &str) -> Result<Vec<u8>, String> {
-    let resp = http()
-        .post(format!("{API_BASE}/ai/upscale"))
-        .bearer_auth(token)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .json(&upscale_body(image_base64))
-        .send()
-        .await
-        .map_err(|e| format!("couldn't reach NovelAI: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let message = resp.json::<ApiError>().await.ok().and_then(|e| e.message).unwrap_or_default();
-        return Err(error_for_status(status, &message));
-    }
-    let parsed: ImageGenerationJsonResponse =
-        resp.json().await.map_err(|e| format!("unexpected response from NovelAI: {e}"))?;
-    let first = parsed.images.into_iter().next().ok_or("NovelAI returned no image.")?;
-    base64::engine::general_purpose::STANDARD
-        .decode(first.image)
-        .map_err(|e| format!("couldn't decode the returned image: {e}"))
+    post_for_image(token, "/ai/upscale", &upscale_body(image_base64)).await
 }
 
 #[cfg(test)]

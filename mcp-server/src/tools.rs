@@ -5,6 +5,13 @@
 use crate::protocol::{ToolResult, Tools};
 use base64::Engine;
 use novelai_core::{
+    scan_for_upscale, upscale_batch, upscaled_stem, UpscaleCandidate, UPSCALE_COST,
+};
+use novelai_core::{
+    inpainted_stem, inpainting_model, plan_inpaint, preview_plan, run_inpaint, side_by_side, CropSpec, InpaintPlan,
+    InpaintSettings, MaskSpec,
+};
+use novelai_core::{
     account_status, generate_batch, is_usage_limited, read_vibe_file, vibe_encoding_for,
     vibe_encoding_key, AccountStatus, GenerateRequest, VibeInfo, VibeRef, DEFAULT_VIBE_STRENGTH,
     MAX_CHARACTERS, MAX_FREE_VIBES, MAX_GUIDANCE, MAX_STEPS, MEDIUM_MODEL, MEDIUM_STEPS, MODELS,
@@ -388,8 +395,13 @@ pub fn approval_text(a: &GenerateArgs, vibes: &[PreparedVibe], save_to: &str, co
 
 fn jpeg_preview(png_path: &str) -> Result<Vec<u8>, String> {
     let img = image::open(png_path).map_err(|e| format!("couldn't read the saved image: {e}"))?;
-    let img = if img.width().max(img.height()) > PREVIEW_MAX_EDGE {
-        img.resize(PREVIEW_MAX_EDGE, PREVIEW_MAX_EDGE, image::imageops::FilterType::Triangle)
+    jpeg_of(img, PREVIEW_MAX_EDGE)
+}
+
+/// A JPEG of `img`, downscaled to at most `max_edge` on its long side.
+fn jpeg_of(img: image::DynamicImage, max_edge: u32) -> Result<Vec<u8>, String> {
+    let img = if img.width().max(img.height()) > max_edge {
+        img.resize(max_edge, max_edge, image::imageops::FilterType::Triangle)
     } else {
         img
     };
@@ -398,6 +410,179 @@ fn jpeg_preview(png_path: &str) -> Result<Vec<u8>, String> {
         .encode_image(&img.to_rgb8())
         .map_err(|e| format!("couldn't encode the preview: {e}"))?;
     Ok(out)
+}
+
+fn image_content(jpeg: Result<Vec<u8>, String>) -> Value {
+    match jpeg {
+        Ok(bytes) => json!({
+            "type": "image",
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "mimeType": "image/jpeg",
+        }),
+        Err(e) => json!({ "type": "text", "text": format!("(No preview: {e})") }),
+    }
+}
+
+// ---- Inpainting ----
+
+/// Where to inpaint: shared by the preview and the inpaint itself.
+#[derive(Debug, PartialEq)]
+pub struct InpaintArea {
+    pub image_path: String,
+    pub crop: Option<CropSpec>,
+    pub mask: MaskSpec,
+    pub enlarge: bool,
+}
+
+pub fn parse_inpaint_area(args: &Value) -> Result<InpaintArea, String> {
+    let image_path = args.get("image_path").and_then(Value::as_str).map(str::trim).unwrap_or("");
+    if image_path.is_empty() {
+        return Err("`image_path` is required: the full path of the image to inpaint.".into());
+    }
+    let crop = match args.get("crop") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(serde_json::from_value::<CropSpec>(v.clone()).map_err(|e| {
+            format!("`crop` must be {{\"x\", \"y\", \"width\", \"height\"}} in whole pixels: {e}")
+        })?),
+    };
+    let mask = match args.get("mask") {
+        None | Some(Value::Null) => return Err("`mask` is required: what to inpaint.".into()),
+        Some(v) => serde_json::from_value::<MaskSpec>(v.clone()).map_err(|e| format!("`mask` isn't valid: {e}"))?,
+    };
+    let enlarge = match args.get("enlarge") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err("`enlarge` must be true or false.".into()),
+    };
+    Ok(InpaintArea { image_path: image_path.to_string(), crop, mask, enlarge })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct InpaintArgs {
+    pub area: InpaintArea,
+    pub settings: GenerateArgs,
+    pub strength: f64,
+    pub keep_raw: bool,
+}
+
+pub fn parse_inpaint_args(args: &Value) -> Result<InpaintArgs, String> {
+    if args.get("size").is_some() {
+        return Err("`size` isn't used for inpainting; the crop sets the size.".into());
+    }
+    if args.get("vibes").is_some() {
+        return Err("Vibes can't be used for inpainting (NovelAI's site doesn't allow it either).".into());
+    }
+    let area = parse_inpaint_area(args)?;
+    let settings = parse_generate_args(args)?;
+    let strength = match args.get("strength") {
+        None | Some(Value::Null) => 1.0,
+        Some(v) => match v.as_f64() {
+            Some(x) if (0.01..=1.0).contains(&x) => x,
+            _ => return Err("`strength` must be a number from 0.01 to 1.".into()),
+        },
+    };
+    let keep_raw = match args.get("keep_raw") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err("`keep_raw` must be true or false.".into()),
+    };
+    Ok(InpaintArgs { area, settings, strength, keep_raw })
+}
+
+// ---- Upscaling ----
+
+#[derive(Debug, PartialEq)]
+pub struct UpscaleArgs {
+    pub image_path: String,
+    pub output_dir: Option<String>,
+}
+
+pub fn parse_upscale_args(args: &Value) -> Result<UpscaleArgs, String> {
+    let image_path = args.get("image_path").and_then(Value::as_str).map(str::trim).unwrap_or("");
+    if image_path.is_empty() {
+        return Err("`image_path` is required: the full path of the image to upscale.".into());
+    }
+    let output_dir = match args.get("output_dir") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(d)) if d.trim().is_empty() => None,
+        Some(Value::String(d)) => Some(validate_output_dir(d)?),
+        Some(_) => return Err("`output_dir` must be a string.".into()),
+    };
+    Ok(UpscaleArgs { image_path: image_path.to_string(), output_dir })
+}
+
+/// Upscaling always costs Anlas, so the dialog leads with the price.
+pub fn upscale_approval_text(image: &UpscaleCandidate, anlas: i64, save_to: &str) -> String {
+    let mut t = format!(
+        "COSTS {UPSCALE_COST} ANLAS: an AI assistant is asking to upscale an image with your NovelAI account. \
+         Upscaling is never free, even on Opus. You have {anlas} Anlas.\n\n"
+    );
+    t += &format!("Image: {}\n", clip(&image.path));
+    t += &format!("Size: {}x{} -> {}x{} (2x)\n\n", image.width, image.height, image.width * 2, image.height * 2);
+    t += &format!(
+        "Save to: {} (as {}.png; the original isn't changed)\n\n",
+        clip(save_to),
+        upscaled_stem(&image.path)
+    );
+    t += &format!("Spend {UPSCALE_COST} Anlas to upscale this image?");
+    t
+}
+
+/// One paragraph describing a plan, for the preview and the dialog.
+pub fn describe_plan(plan: &InpaintPlan) -> String {
+    let c = plan.crop;
+    let mut t = format!(
+        "Image: {} ({}x{}).\nCrop: x {}, y {}, {}x{} ({}), sent to NovelAI at {}x{}.\nMask: {:.1}% of the crop ({} of {} cells of 8x8 px).",
+        plan.source_path,
+        plan.image_width,
+        plan.image_height,
+        c.x,
+        c.y,
+        c.width,
+        c.height,
+        if plan.crop_was_auto { "chosen around the mask" } else { "as given" },
+        plan.send_width,
+        plan.send_height,
+        plan.coverage_percent(),
+        plan.masked_cells,
+        plan.total_cells,
+    );
+    for w in &plan.warnings {
+        t += &format!("\nNote: {w}");
+    }
+    t
+}
+
+pub fn inpaint_approval_text(a: &InpaintArgs, plan: &InpaintPlan, inpaint_model: &str, save_to: &str, cost: &str) -> String {
+    let g = &a.settings;
+    let mut t = String::from("An AI assistant is asking to inpaint part of an image with your NovelAI account.\n\n");
+    t += &describe_plan(plan);
+    t += &format!(
+        "\n\nModel: {inpaint_model} · {} steps · guidance {} · strength {}\n",
+        g.steps, g.guidance, a.strength
+    );
+    t += &format!("Seed: {}\n\n", g.seed.map_or("random".to_string(), |s| s.to_string()));
+    t += &format!("Prompt:\n{}\n\n", clip(&g.prompt));
+    if !g.negative_prompt.is_empty() {
+        t += &format!("Undesired content:\n{}\n\n", clip(&g.negative_prompt));
+    }
+    for (i, c) in g.characters.iter().enumerate() {
+        t += &format!("Character {}:\n{}\n\n", i + 1, clip(c));
+    }
+    t += &format!(
+        "Save to: {} (as {}.png; the original isn't changed)\n\n",
+        clip(save_to),
+        inpainted_stem(&plan.source_path)
+    );
+    t += cost;
+    t += "\n\nInpaint this area?";
+    t
+}
+
+fn random_seed() -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    // RandomState is seeded from OS randomness; good enough for a seed.
+    std::collections::hash_map::RandomState::new().build_hasher().finish() as u32
 }
 
 pub struct NovelAiTools {
@@ -435,6 +620,174 @@ impl NovelAiTools {
                 ))
             }
             Err(e) => ToolResult::error(e),
+        }
+    }
+
+    fn upscale_tool(&mut self, arguments: &Value) -> ToolResult {
+        if let Some(reason) = &self.paused {
+            return ToolResult::error(format!(
+                "Generation is paused for this session: {reason} Restart the MCP server to resume."
+            ));
+        }
+        let a = match parse_upscale_args(arguments) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(e),
+        };
+        // Size check before the user is asked: over 1 megapixel would cost more.
+        let scan = match self.runtime.block_on(scan_for_upscale(a.image_path.clone(), false)) {
+            Ok(s) => s,
+            Err(e) => return ToolResult::error(e),
+        };
+        let Some(image) = scan.eligible.into_iter().next() else {
+            let reason = scan.skipped.first().map_or("it couldn't be read".to_string(), |s| s.reason.clone());
+            return ToolResult::error(format!("Can't upscale {}: {reason}.", a.image_path));
+        };
+        let status = match self.status() {
+            Ok(s) => s,
+            Err(e) => return ToolResult::error(e),
+        };
+        if status.anlas < UPSCALE_COST {
+            return ToolResult::error(format!(
+                "Upscaling costs {UPSCALE_COST} Anlas and the account has {}.",
+                status.anlas
+            ));
+        }
+        let save_to = a.output_dir.clone().unwrap_or_else(|| self.output_dir.clone());
+        let dialog = upscale_approval_text(&image, status.anlas, &save_to);
+        if !(self.approve)("NovelAI upscale request (costs Anlas)", &dialog) {
+            return ToolResult::error("The user declined this upscale. Don't retry it unless they ask you to.");
+        }
+
+        let run_id = format!("mcp-upscale-{}", random_seed());
+        let summary = match self.runtime.block_on(upscale_batch(run_id, vec![image.path.clone()], save_to, |_| {})) {
+            Ok(s) => s,
+            Err(e) => return ToolResult::error(e),
+        };
+        // A charge above the expected price stops upscaling for the session.
+        if let Some(reason) = &summary.stopped_reason {
+            if summary.anlas_spent > UPSCALE_COST {
+                self.paused = Some(reason.clone());
+            }
+        }
+        let Some(done) = summary.images.first() else {
+            return ToolResult::error(summary.stopped_reason.unwrap_or_else(|| "NovelAI returned no image.".to_string()));
+        };
+        let mut text = format!(
+            "Upscaled {} ({}x{}) to {}x{}. Saved to {}. NovelAI charged {} Anlas. \
+             The image below is a downscaled JPEG preview.",
+            image.path,
+            image.width,
+            image.height,
+            image.width * 2,
+            image.height * 2,
+            done.path,
+            summary.anlas_spent
+        );
+        if let Some(reason) = summary.stopped_reason {
+            text += &format!("\n\nWARNING: {reason}");
+            if self.paused.is_some() {
+                text += " Further generations are paused for this session.";
+            }
+        }
+        ToolResult {
+            content: vec![json!({ "type": "text", "text": text }), image_content(jpeg_preview(&done.path))],
+            is_error: false,
+        }
+    }
+
+    fn preview_inpaint_tool(&self, arguments: &Value) -> ToolResult {
+        let area = match parse_inpaint_area(arguments) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(e),
+        };
+        let plan = match plan_inpaint(&area.image_path, area.crop, &area.mask, area.enlarge) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(e),
+        };
+        let (full, crop) = preview_plan(&plan, PREVIEW_MAX_EDGE);
+        let text = format!(
+            "{}\n\nFirst image: the whole image (downscaled), crop outlined in orange, mask in red. \
+             Second: the crop, mask in red on NovelAI's 8-pixel grid. Nothing was sent to NovelAI.",
+            describe_plan(&plan)
+        );
+        ToolResult {
+            content: vec![
+                json!({ "type": "text", "text": text }),
+                image_content(jpeg_of(image::DynamicImage::ImageRgba8(full), PREVIEW_MAX_EDGE)),
+                image_content(jpeg_of(image::DynamicImage::ImageRgba8(crop), PREVIEW_MAX_EDGE)),
+            ],
+            is_error: false,
+        }
+    }
+
+    fn inpaint_tool(&mut self, arguments: &Value) -> ToolResult {
+        if let Some(reason) = &self.paused {
+            return ToolResult::error(format!(
+                "Generation is paused for this session: {reason} Restart the MCP server to resume."
+            ));
+        }
+        let a = match parse_inpaint_args(arguments) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(e),
+        };
+        // Checked before the user is asked, so a bad area never reaches the dialog.
+        let plan = match plan_inpaint(&a.area.image_path, a.area.crop, &a.area.mask, a.area.enlarge) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(e),
+        };
+        let status = match self.status() {
+            Ok(s) => s,
+            Err(e) => return ToolResult::error(e),
+        };
+        let g = &a.settings;
+        let inpaint_model = inpainting_model(&g.model).unwrap_or_default();
+        let (costs, cost) = cost_line(&status, inpaint_model);
+        let save_to = g.output_dir.clone().unwrap_or_else(|| self.output_dir.clone());
+
+        let dialog = inpaint_approval_text(&a, &plan, inpaint_model, &save_to, &cost);
+        if !(self.approve)("NovelAI inpaint request", &dialog) {
+            return ToolResult::error("The user declined this inpaint. Don't retry it unless they ask you to.");
+        }
+
+        let seed = g.seed.unwrap_or_else(random_seed);
+        let summary = describe_plan(&plan);
+        let settings = InpaintSettings {
+            model: g.model.clone(),
+            prompt: g.prompt.clone(),
+            negative_prompt: g.negative_prompt.clone(),
+            characters: g.characters.clone(),
+            steps: g.steps,
+            scale: g.guidance,
+            seed,
+            strength: a.strength,
+        };
+        // Guard whenever the inpaint should be free; a paid one was just
+        // approved with its cost shown.
+        let outcome = match self.runtime.block_on(run_inpaint(format!("mcp-inpaint-{seed}"), plan, settings, save_to, !costs, a.keep_raw)) {
+            Ok(o) => o,
+            Err(e) => return ToolResult::error(e),
+        };
+
+        let mut text = format!(
+            "Inpainted with {} ({} steps, guidance {}, strength {}, seed {}).\n{summary}\nSaved to {}.\n\n\
+             First image: the crop before (left) and after (right). Second: the whole result, downscaled.",
+            outcome.inpaint_model, g.steps, g.guidance, a.strength, outcome.seed, outcome.path
+        );
+        if let Some(raw) = &outcome.raw_path {
+            text += &format!("\nNovelAI's unblended crop was saved to {raw}.");
+        }
+        if let Some(reason) = outcome.anlas_warning {
+            text += &format!("\n\nWARNING: {reason} Further generations are paused for this session.");
+            self.paused = Some(reason);
+        }
+        let compare = side_by_side(&outcome.crop_before, &outcome.crop_after, 768);
+        ToolResult {
+            content: vec![
+                json!({ "type": "text", "text": text }),
+                image_content(jpeg_of(image::DynamicImage::ImageRgba8(compare), 2 * 768 + 12)),
+                image_content(jpeg_of(image::DynamicImage::ImageRgba8(outcome.result), PREVIEW_MAX_EDGE)),
+            ],
+            is_error: false,
         }
     }
 
@@ -478,11 +831,7 @@ impl NovelAiTools {
             );
         }
 
-        let seed = a.seed.unwrap_or_else(|| {
-            use std::hash::{BuildHasher, Hasher};
-            // RandomState is seeded from OS randomness; good enough for a seed.
-            std::collections::hash_map::RandomState::new().build_hasher().finish() as u32
-        });
+        let seed = a.seed.unwrap_or_else(random_seed);
         let request = GenerateRequest {
             model: a.model.clone(),
             prompt: a.prompt.clone(),
@@ -612,6 +961,140 @@ impl Tools for NovelAiTools {
                 },
             }),
             json!({
+                "name": "novelai_preview_inpaint",
+                "description": "Check an inpaint area before requesting it: returns the whole image with the crop outlined and the mask \
+                    tinted, plus the crop up close, and the crop and send size. Read-only; nothing is sent to NovelAI and no approval \
+                    is needed. Use it to get the crop and mask right before calling novelai_inpaint.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "image_path": { "type": "string", "description": "Full path of the image to inpaint (PNG, JPEG, WebP, BMP or GIF; any size up to 100 megapixels)." },
+                        "crop": {
+                            "type": "object",
+                            "description": "The region sent to NovelAI, in source-image pixels (origin top-left). width and height: multiples of 64 from 64 to 1024. Must lie inside the image and should contain the mask plus surrounding context. Omit to have one chosen around the mask (at least 512x512 when the image allows).",
+                            "properties": {
+                                "x": { "type": "integer", "minimum": 0 },
+                                "y": { "type": "integer", "minimum": 0 },
+                                "width": { "type": "integer", "minimum": 64, "maximum": 1024, "multipleOf": 64 },
+                                "height": { "type": "integer", "minimum": 64, "maximum": 1024, "multipleOf": 64 }
+                            },
+                            "required": ["x", "y", "width", "height"],
+                            "additionalProperties": false
+                        },
+                        "mask": {
+                            "type": "object",
+                            "description": "The area to repaint, in source-image pixels. Shapes are combined, then snapped to NovelAI's 8x8-pixel grid like its brush. Only the part inside the crop is used. Give at least one shape or image_path.",
+                            "properties": {
+                                "rects": { "type": "array", "items": { "type": "object", "properties": {
+                                    "x": { "type": "number" }, "y": { "type": "number" }, "width": { "type": "number" }, "height": { "type": "number" } },
+                                    "required": ["x", "y", "width", "height"], "additionalProperties": false } },
+                                "ellipses": { "type": "array", "items": { "type": "object", "properties": {
+                                    "cx": { "type": "number" }, "cy": { "type": "number" }, "rx": { "type": "number" }, "ry": { "type": "number" } },
+                                    "required": ["cx", "cy", "rx", "ry"], "additionalProperties": false } },
+                                "strokes": { "type": "array", "description": "Brush strokes: a line through the points, radius pixels thick on each side.",
+                                    "items": { "type": "object", "properties": {
+                                        "points": { "type": "array", "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 }, "minItems": 1 },
+                                        "radius": { "type": "number" } },
+                                    "required": ["points", "radius"], "additionalProperties": false } },
+                                "image_path": { "type": "string", "description": "A mask image the same size as the source: white (opaque) areas are inpainted." }
+                            },
+                            "additionalProperties": false
+                        },
+                        "enlarge": { "type": "boolean", "default": true,
+                                     "description": "Enlarge the crop to about 1 megapixel before inpainting (as NovelAI's site does) for more detail. Still free." }
+                    },
+                    "required": ["image_path", "mask"],
+                    "additionalProperties": false
+                },
+            }),
+            json!({
+                "name": "novelai_inpaint",
+                "description": "Inpaint part of an image of any size (\"crop and stitch\", like NovelAI's Focused Inpainting): the crop \
+                    is cut out, enlarged to about 1 megapixel, the masked part is repainted by NovelAI, and that part is blended back \
+                    into the full image with a soft edge. Pixels outside the softened mask are untouched. The result is saved as a new \
+                    <name>_inpainted.png; the original isn't changed. Every call shows the user a Windows approval dialog and may be \
+                    declined. Free on Opus (V4/V4.5 unlimited, V5 from the quota). Returns the crop before/after and the whole result. \
+                    Preview the area with novelai_preview_inpaint first. Vibes aren't supported for inpainting.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "image_path": { "type": "string", "description": "Full path of the image to inpaint (PNG, JPEG, WebP, BMP or GIF; any size up to 100 megapixels)." },
+                        "crop": {
+                            "type": "object",
+                            "description": "The region sent to NovelAI, in source-image pixels (origin top-left). width and height: multiples of 64 from 64 to 1024. Must lie inside the image and should contain the mask plus surrounding context. Omit to have one chosen around the mask (at least 512x512 when the image allows).",
+                            "properties": {
+                                "x": { "type": "integer", "minimum": 0 },
+                                "y": { "type": "integer", "minimum": 0 },
+                                "width": { "type": "integer", "minimum": 64, "maximum": 1024, "multipleOf": 64 },
+                                "height": { "type": "integer", "minimum": 64, "maximum": 1024, "multipleOf": 64 }
+                            },
+                            "required": ["x", "y", "width", "height"],
+                            "additionalProperties": false
+                        },
+                        "mask": {
+                            "type": "object",
+                            "description": "The area to repaint, in source-image pixels. Shapes are combined, then snapped to NovelAI's 8x8-pixel grid like its brush. Only the part inside the crop is used. Give at least one shape or image_path.",
+                            "properties": {
+                                "rects": { "type": "array", "items": { "type": "object", "properties": {
+                                    "x": { "type": "number" }, "y": { "type": "number" }, "width": { "type": "number" }, "height": { "type": "number" } },
+                                    "required": ["x", "y", "width", "height"], "additionalProperties": false } },
+                                "ellipses": { "type": "array", "items": { "type": "object", "properties": {
+                                    "cx": { "type": "number" }, "cy": { "type": "number" }, "rx": { "type": "number" }, "ry": { "type": "number" } },
+                                    "required": ["cx", "cy", "rx", "ry"], "additionalProperties": false } },
+                                "strokes": { "type": "array", "description": "Brush strokes: a line through the points, radius pixels thick on each side.",
+                                    "items": { "type": "object", "properties": {
+                                        "points": { "type": "array", "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 }, "minItems": 1 },
+                                        "radius": { "type": "number" } },
+                                    "required": ["points", "radius"], "additionalProperties": false } },
+                                "image_path": { "type": "string", "description": "A mask image the same size as the source: white (opaque) areas are inpainted." }
+                            },
+                            "additionalProperties": false
+                        },
+                        "enlarge": { "type": "boolean", "default": true,
+                                     "description": "Enlarge the crop to about 1 megapixel before inpainting (as NovelAI's site does) for more detail. Still free." },
+                        "prompt": { "type": "string", "description": "Describe the whole crop as it should look, not only the masked part." },
+                        "negative_prompt": { "type": "string", "description": "Undesired content." },
+                        "characters": {
+                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS,
+                            "description": "Up to 4 character prompts."
+                        },
+                        "model": { "type": "string", "enum": MODELS, "default": DEFAULT_MODEL,
+                                   "description": "Its inpainting version is used (V5 Curated uses V4.5 Curated's, as on NovelAI's site)." },
+                        "strength": { "type": "number", "minimum": 0.01, "maximum": 1, "default": 1,
+                                      "description": "1 repaints the masked area fully; lower keeps more of the original." },
+                        "steps": { "type": "integer", "minimum": 1, "maximum": MAX_STEPS, "default": DEFAULT_STEPS,
+                                   "description": "Ignored for nai-diffusion-5-full-medium, which always uses 14." },
+                        "guidance": { "type": "number", "minimum": 0, "maximum": MAX_GUIDANCE, "default": DEFAULT_GUIDANCE },
+                        "seed": { "type": "integer", "minimum": 0, "maximum": 4294967295u64,
+                                  "description": "Fix the seed to compare variations fairly; random if omitted." },
+                        "output_dir": { "type": "string",
+                                        "description": "Folder to save the result in (full local path); created if missing. Defaults to the server's output folder." },
+                        "keep_raw": { "type": "boolean", "default": false,
+                                      "description": "Also save the crop exactly as NovelAI returned it, before blending, as <name>_inpainted_raw.png. For troubleshooting." }
+                    },
+                    "required": ["image_path", "mask", "prompt"],
+                    "additionalProperties": false
+                },
+            }),
+            json!({
+                "name": "novelai_upscale",
+                "description": "Upscale ONE image to twice its width and height with NovelAI's upscaler. COSTS 1 ANLAS every time, \
+                    on every subscription (never free), so only use it when the user wants an upscale. Only images up to \
+                    1 megapixel (e.g. 1024x1024, 832x1216) are accepted; larger ones would cost more and are refused. Every call \
+                    shows the user a Windows approval dialog with the cost and their balance; they may decline, in which case \
+                    don't retry unless asked. Saved as a new <name>_upscaled.png; the original isn't changed. Returns a preview.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "image_path": { "type": "string", "description": "Full path of the image to upscale (PNG, JPEG, WebP, BMP or GIF)." },
+                        "output_dir": { "type": "string",
+                                        "description": "Folder to save the result in (full local path); created if missing. Defaults to the server's output folder." }
+                    },
+                    "required": ["image_path"],
+                    "additionalProperties": false
+                },
+            }),
+            json!({
                 "name": "novelai_list_vibes",
                 "description": "List the vibes in a NovelAI vibe file (.naiv4vibe, .naiv4vibebundle, or a NovelAI PNG \
                     with vibes embedded): each vibe's index, name, saved settings, and which models it's encoded for. \
@@ -631,6 +1114,9 @@ impl Tools for NovelAiTools {
             "novelai_account_status" => Some(self.account_status_tool()),
             "novelai_generate_image" => Some(self.generate_tool(arguments)),
             "novelai_list_vibes" => Some(self.list_vibes_tool(arguments)),
+            "novelai_preview_inpaint" => Some(self.preview_inpaint_tool(arguments)),
+            "novelai_inpaint" => Some(self.inpaint_tool(arguments)),
+            "novelai_upscale" => Some(self.upscale_tool(arguments)),
             _ => None,
         }
     }
@@ -857,5 +1343,161 @@ mod tests {
             assert!(validate_output_dir(bad).is_err(), "accepted {bad:?}");
         }
         assert!(parse_generate_args(&json!({ "prompt": "x", "output_dir": 5 })).is_err());
+    }
+
+    // ---- inpainting ----
+
+    fn temp_image(name: &str, w: u32, h: u32) -> String {
+        let dir = std::env::temp_dir().join(format!("cutting-room-mcp-tests-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        image::RgbaImage::from_fn(w, h, |x, y| image::Rgba([(x % 256) as u8, (y % 256) as u8, 90, 255]))
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn parses_inpaint_areas_and_settings() {
+        let a = parse_inpaint_args(&json!({
+            "image_path": "C:\\art\\big.png",
+            "crop": { "x": 64, "y": 128, "width": 512, "height": 512 },
+            "mask": { "ellipses": [{ "cx": 300, "cy": 300, "rx": 40, "ry": 60 }], "strokes": [{ "points": [[1, 2]], "radius": 5 }] },
+            "prompt": "1girl, smiling",
+            "strength": 0.6,
+            "enlarge": false,
+            "keep_raw": true
+        }))
+        .unwrap();
+        assert!(a.keep_raw);
+        assert_eq!(a.area.crop, Some(CropSpec { x: 64, y: 128, width: 512, height: 512 }));
+        assert_eq!((a.area.mask.ellipses.len(), a.area.mask.strokes.len()), (1, 1));
+        assert_eq!((a.strength, a.area.enlarge), (0.6, false));
+        assert_eq!(a.settings.model, DEFAULT_MODEL);
+
+        let ok = parse_inpaint_args(&json!({ "image_path": "a.png", "mask": { "rects": [{ "x": 0, "y": 0, "width": 8, "height": 8 }] }, "prompt": "x" })).unwrap();
+        assert_eq!((ok.strength, ok.area.enlarge, ok.area.crop), (1.0, true, None));
+
+        let mask = json!({ "rects": [{ "x": 0, "y": 0, "width": 8, "height": 8 }] });
+        for bad in [
+            json!({ "mask": mask, "prompt": "x" }),
+            json!({ "image_path": "a.png", "prompt": "x" }),
+            json!({ "image_path": "a.png", "mask": mask }),
+            json!({ "image_path": "a.png", "mask": mask, "prompt": "x", "strength": 0 }),
+            json!({ "image_path": "a.png", "mask": mask, "prompt": "x", "size": "square" }),
+            json!({ "image_path": "a.png", "mask": mask, "prompt": "x", "vibes": [] }),
+            json!({ "image_path": "a.png", "mask": mask, "prompt": "x", "crop": { "x": 0, "y": 0, "width": 512 } }),
+            json!({ "image_path": "a.png", "mask": { "circles": [] }, "prompt": "x" }),
+            json!({ "image_path": "a.png", "mask": mask, "prompt": "x", "enlarge": "yes" }),
+            json!({ "image_path": "a.png", "mask": mask, "prompt": "x", "keep_raw": 1 }),
+            json!({ "image_path": "a.png", "mask": mask, "prompt": "x", "steps": 40 }),
+        ] {
+            assert!(parse_inpaint_args(&bad).is_err(), "accepted {bad}");
+        }
+    }
+
+    fn tools() -> NovelAiTools {
+        fn never(_: &str, _: &str) -> bool {
+            panic!("the preview must not ask for approval")
+        }
+        NovelAiTools {
+            output_dir: "C:\\out".into(),
+            runtime: tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap(),
+            paused: None,
+            approve: never,
+            timestamp: || "now".into(),
+        }
+    }
+
+    #[test]
+    fn previews_an_area_without_contacting_novelai() {
+        let path = temp_image("preview-src.png", 3000, 2000);
+        let result = tools().preview_inpaint_tool(&json!({
+            "image_path": path,
+            "mask": { "rects": [{ "x": 1500, "y": 1000, "width": 120, "height": 80 }] }
+        }));
+        assert!(!result.is_error, "{:?}", result.content);
+        let text = result.content[0]["text"].as_str().unwrap();
+        assert!(text.contains("3000x2000") && text.contains("chosen around the mask") && text.contains("1024x1024"), "{text}");
+        assert_eq!(result.content.len(), 3);
+        assert!(result.content[1..].iter().all(|c| c["type"] == "image"));
+
+        let bad = tools().preview_inpaint_tool(&json!({
+            "image_path": path,
+            "crop": { "x": 2800, "y": 0, "width": 512, "height": 512 },
+            "mask": { "rects": [{ "x": 2900, "y": 10, "width": 20, "height": 20 }] }
+        }));
+        assert!(bad.is_error);
+        assert!(bad.content[0]["text"].as_str().unwrap().contains("past the image's edge"));
+    }
+
+    #[test]
+    fn inpaint_dialog_shows_area_settings_and_destination() {
+        let path = temp_image("dialog-src.png", 1600, 1200);
+        let a = parse_inpaint_args(&json!({
+            "image_path": path,
+            "crop": { "x": 128, "y": 64, "width": 768, "height": 512 },
+            "mask": { "rects": [{ "x": 400, "y": 300, "width": 64, "height": 64 }] },
+            "prompt": "1girl, red scarf",
+            "negative_prompt": "lowres",
+            "strength": 0.8,
+            "seed": 42
+        }))
+        .unwrap();
+        let plan = plan_inpaint(&a.area.image_path, a.area.crop, &a.area.mask, a.area.enlarge).unwrap();
+        let t = inpaint_approval_text(&a, &plan, "nai-diffusion-4-5-full-inpainting", "D:\\Art", "Free: included with your Opus subscription.");
+        for part in [
+            "inpaint part of an image",
+            "1600x1200",
+            "x 128, y 64, 768x512 (as given)",
+            "sent to NovelAI at 1216x832",
+            "nai-diffusion-4-5-full-inpainting",
+            "strength 0.8",
+            "Seed: 42",
+            "1girl, red scarf",
+            "lowres",
+            "Save to: D:\\Art (as dialog-src_inpainted.png",
+            "Free:",
+        ] {
+            assert!(t.contains(part), "missing {part:?} in:\n{t}");
+        }
+    }
+
+    // ---- upscaling ----
+
+    #[test]
+    fn parses_upscale_args() {
+        let a = parse_upscale_args(&json!({ "image_path": " C:\\art\\a.png ", "output_dir": "D:\\Up" })).unwrap();
+        assert_eq!(a, UpscaleArgs { image_path: "C:\\art\\a.png".into(), output_dir: Some("D:\\Up".into()) });
+        assert_eq!(parse_upscale_args(&json!({ "image_path": "a.png" })).unwrap().output_dir, None);
+        for bad in [
+            json!({}),
+            json!({ "image_path": " " }),
+            json!({ "image_path": "a.png", "output_dir": "relative\\dir" }),
+            json!({ "image_path": "a.png", "output_dir": 3 }),
+        ] {
+            assert!(parse_upscale_args(&bad).is_err(), "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn upscale_dialog_leads_with_the_cost() {
+        let image = UpscaleCandidate { path: "C:\\art\\scene.png".into(), width: 832, height: 1216 };
+        let t = upscale_approval_text(&image, 480, "D:\\Up");
+        assert!(t.starts_with("COSTS 1 ANLAS"), "{t}");
+        for part in ["You have 480 Anlas", "C:\\art\\scene.png", "832x1216 -> 1664x2432", "D:\\Up (as scene_upscaled.png", "Spend 1 Anlas"] {
+            assert!(t.contains(part), "missing {part:?} in:\n{t}");
+        }
+    }
+
+    #[test]
+    fn refuses_an_oversized_upscale_before_asking() {
+        // tools() panics if the dialog is shown; the size check comes first.
+        let big = temp_image("too-big.png", 1100, 1000);
+        let result = tools().upscale_tool(&json!({ "image_path": big }));
+        assert!(result.is_error);
+        assert!(result.content[0]["text"].as_str().unwrap().contains("over 1 megapixel"));
+        let missing = tools().upscale_tool(&json!({ "image_path": "Z:\\not\\there.png" }));
+        assert!(missing.is_error);
     }
 }
