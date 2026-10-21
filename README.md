@@ -15,11 +15,14 @@ Each tab keeps its own state — switching between them doesn't lose an open fol
 
 ## MCP server (let an AI assistant generate images)
 
-`mcp-server/` builds `cutting-room-mcp.exe`, a local [MCP](https://modelcontextprotocol.io) server that lets an MCP client — Claude Code, Claude Desktop, or any other MCP-capable app on this PC — generate images through your NovelAI account and look at the results. It offers three tools:
+`mcp-server/` builds `cutting-room-mcp.exe`, a local [MCP](https://modelcontextprotocol.io) server that lets an MCP client — Claude Code, Claude Desktop, or any other MCP-capable app on this PC — generate images through your NovelAI account and look at the results. It offers six tools:
 
 - `novelai_account_status` — tier, Anlas, and Opus V5 quota (read-only).
 - `novelai_generate_image` — generates one image and returns a preview; the full PNG is saved to the output folder, or to a folder the assistant names (`output_dir`, a full local path shown in the approval dialog). Optionally applies up to four vibes from vibe files you've already encoded (V4 and V4.5 models); a vibe that would need a paid encode is refused.
 - `novelai_list_vibes` — lists the vibes in a vibe file and which models they're encoded for (read-only, nothing sent to NovelAI).
+- `novelai_inpaint` — repaints part of an image of any size, the way NovelAI's Focused Inpainting does ("crop and stitch"): a crop of up to 1024×1024 (multiples of 64) is cut out, enlarged to about 1 megapixel, the masked part is inpainted, and that part is blended back into the full image with a soft edge. The mask is given as rectangles, ellipses, brush strokes or a mask image, snapped to NovelAI's 8-pixel grid. Only the crop is sent, so it's free on Opus at any image size. Saved as a new `name_inpainted.png`.
+- `novelai_preview_inpaint` — shows the crop and mask on the image before inpainting (read-only, nothing sent to NovelAI).
+- `novelai_upscale` — doubles one image's size with NovelAI's upscaler. It costs 1 Anlas every time, so the approval dialog leads with the cost and your balance; images over 1 megapixel are refused. Saved as a new `name_upscaled.png`.
 
 **Every image needs your approval** in a Windows dialog showing the full request (including any vibe files) and whether it costs Anlas ("No" is the default button). The server uses the same limits as the Generate tab — free sizes and step counts only, at least 2 seconds between requests, and a stop if NovelAI unexpectedly charges Anlas. It reads the token Cutting Room saved in Windows Credential Manager, so log in once in the Generate tab first; the token is never passed to the AI client.
 

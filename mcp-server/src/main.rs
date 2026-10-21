@@ -21,7 +21,10 @@ const INFO: ServerInfo = ServerInfo {
         Every generation needs the user's approval in a Windows dialog and may be declined. \
         Use a fixed seed when comparing prompt variations. \
         Vibe Transfer works with vibe files the user already encoded (V4/V4.5 models, up to 4); \
-        check a file with novelai_list_vibes first.",
+        check a file with novelai_list_vibes first. \
+        To repaint part of an image of any size, check the area with novelai_preview_inpaint, \
+        then call novelai_inpaint. \
+        novelai_upscale costs 1 Anlas per image, so only use it when the user asks for an upscale.",
 };
 
 fn output_dir() -> Result<String, String> {
