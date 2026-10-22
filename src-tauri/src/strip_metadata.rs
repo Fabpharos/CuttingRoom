@@ -1,5 +1,5 @@
 use image::codecs::jpeg::JpegEncoder;
-use image::{ExtendedColorType, ImageEncoder, ImageFormat};
+use image::{DynamicImage, ExtendedColorType, ImageEncoder, ImageFormat};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -67,14 +67,48 @@ fn collect_images(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-// Decoding and re-encoding a photo naturally drops whatever metadata it
-// carried — the `image` crate's encoders only include EXIF/ICC data when a
-// caller explicitly attaches it, which nothing here does. JPEGs are routed
+// Alpha at or above this counts as opaque: hidden data only ever nudges
+// opaque pixels a step or two below 255.
+const OPAQUE_ALPHA: u8 = 250;
+
+// NovelAI hides a second copy of an image's prompt and settings in the
+// lowest bit of every pixel's alpha value ("stealth" metadata), which a
+// lossless re-save would carry over untouched. An image that's opaque apart
+// from that loses its alpha channel entirely; a genuinely transparent one
+// keeps it with the lowest bit cleared, a change too small to see.
+fn scrub_alpha(img: DynamicImage) -> DynamicImage {
+    match img {
+        DynamicImage::ImageRgba8(mut buf) => {
+            if buf.pixels().all(|p| p[3] >= OPAQUE_ALPHA) {
+                DynamicImage::ImageRgba8(buf).to_rgb8().into()
+            } else {
+                buf.pixels_mut().for_each(|p| p[3] &= !1);
+                DynamicImage::ImageRgba8(buf)
+            }
+        }
+        DynamicImage::ImageLumaA8(mut buf) => {
+            if buf.pixels().all(|p| p[1] >= OPAQUE_ALPHA) {
+                DynamicImage::ImageLumaA8(buf).to_luma8().into()
+            } else {
+                buf.pixels_mut().for_each(|p| p[1] &= !1);
+                DynamicImage::ImageLumaA8(buf)
+            }
+        }
+        // 16-bit and float images aren't what generators hide data in.
+        other => other,
+    }
+}
+
+// Decoding and re-encoding a photo drops whatever metadata it carried in
+// its file structure (EXIF, PNG text chunks such as NovelAI's prompt and
+// settings) — the `image` crate's encoders only include EXIF/ICC data when a
+// caller explicitly attaches it, which nothing here does. Data hidden in the
+// pixels themselves is handled by `scrub_alpha`. JPEGs are routed
 // through the encoder directly at a high quality instead of the plain
 // `save()` default (75), since this operation is meant to remove metadata,
 // not visibly recompress people's photos.
 fn strip_one(path: &Path) -> Result<(), String> {
-    let img = image::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let img = scrub_alpha(image::open(path).map_err(|e| format!("{}: {e}", path.display()))?);
     let format = ImageFormat::from_path(path).map_err(|e| format!("{}: {e}", path.display()))?;
 
     if format == ImageFormat::Jpeg {
@@ -127,5 +161,109 @@ pub fn strip_metadata_recursive(
         stripped,
         failed,
         cancelled: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{GenericImageView, Rgba, RgbaImage};
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in bytes {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            }
+        }
+        !crc
+    }
+
+    fn chunk(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut c = (body.len() as u32).to_be_bytes().to_vec();
+        c.extend_from_slice(kind);
+        c.extend_from_slice(body);
+        let crc = crc32(&[kind.as_slice(), body].concat());
+        c.extend_from_slice(&crc.to_be_bytes());
+        c
+    }
+
+    // Chunk types in a PNG file, in order.
+    fn chunk_types(png: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut pos = 8;
+        while pos + 8 <= png.len() {
+            let len = u32::from_be_bytes(png[pos..pos + 4].try_into().unwrap()) as usize;
+            out.push(String::from_utf8_lossy(&png[pos + 4..pos + 8]).into_owned());
+            pos += 12 + len;
+        }
+        out
+    }
+
+    // A PNG shaped like a NovelAI image: prompt and settings in text chunks
+    // after IHDR, plus a pattern in the alpha channel's lowest bits.
+    fn novelai_like_png(img: &RgbaImage) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut encoded), ImageFormat::Png).unwrap();
+        let ihdr_end = 8 + 12 + 13;
+        let mut png = encoded[..ihdr_end].to_vec();
+        png.extend(chunk(b"tEXt", b"Software\0NovelAI"));
+        png.extend(chunk(b"tEXt", b"Comment\0{\"prompt\": \"1girl, secret prompt\", \"seed\": 42}"));
+        png.extend_from_slice(&encoded[ihdr_end..]);
+        png
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cutting-room-strip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    #[test]
+    fn removes_novelai_text_chunks_and_hidden_alpha_data() {
+        let img = RgbaImage::from_fn(32, 32, |x, y| Rgba([x as u8 * 8, y as u8 * 8, 77, 254 | ((x ^ y) & 1) as u8]));
+        let path = temp_path("novelai.png");
+        std::fs::write(&path, novelai_like_png(&img)).unwrap();
+        assert!(chunk_types(&std::fs::read(&path).unwrap()).contains(&"tEXt".to_string()));
+
+        strip_one(&path).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let types = chunk_types(&bytes);
+        assert!(!types.iter().any(|t| matches!(t.as_str(), "tEXt" | "zTXt" | "iTXt")), "{types:?}");
+        let out = image::load_from_memory(&bytes).unwrap();
+        // The alpha channel, and the data hidden in it, is gone; the picture isn't.
+        assert!(!out.color().has_alpha(), "{:?}", out.color());
+        assert_eq!(out.dimensions(), (32, 32));
+        for (x, y, p) in out.to_rgba8().enumerate_pixels() {
+            assert_eq!(p.0[..3], img.get_pixel(x, y).0[..3]);
+        }
+    }
+
+    #[test]
+    fn keeps_real_transparency_but_clears_its_lowest_bit() {
+        let img = RgbaImage::from_fn(16, 16, |x, y| Rgba([200, 100, 50, (x * 16 + y) as u8]));
+        let path = temp_path("transparent.png");
+        img.save(&path).unwrap();
+
+        strip_one(&path).unwrap();
+
+        let out = image::open(&path).unwrap();
+        assert!(out.color().has_alpha());
+        for (x, y, p) in out.to_rgba8().enumerate_pixels() {
+            let before = img.get_pixel(x, y)[3];
+            assert_eq!(p[3] & 1, 0, "lowest bit cleared");
+            assert!(before - p[3] <= 1, "{before} -> {}", p[3]);
+            assert_eq!(p.0[..3], [200, 100, 50]);
+        }
+    }
+
+    #[test]
+    fn scrubs_grey_alpha_images_too() {
+        let opaque = image::GrayAlphaImage::from_pixel(4, 4, image::LumaA([90, 255]));
+        assert!(!scrub_alpha(opaque.into()).color().has_alpha());
+        let clear = image::GrayAlphaImage::from_pixel(4, 4, image::LumaA([90, 131]));
+        assert_eq!(scrub_alpha(clear.into()).to_luma_alpha8().get_pixel(0, 0)[1], 130);
     }
 }
