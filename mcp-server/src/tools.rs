@@ -43,6 +43,8 @@ pub struct GenerateArgs {
     pub prompt: String,
     pub negative_prompt: String,
     pub characters: Vec<String>,
+    /// Lined up with `characters`; empty where none was given.
+    pub character_negatives: Vec<String>,
     pub model: String,
     pub size: &'static str,
     pub width: u32,
@@ -154,22 +156,28 @@ pub fn parse_generate_args(args: &Value) -> Result<GenerateArgs, String> {
         },
     };
 
-    let characters: Vec<String> = match args.get("characters") {
-        None => vec![],
-        Some(Value::Array(items)) => {
-            let mut out = vec![];
-            for item in items {
-                let Some(s) = item.as_str() else {
-                    return Err("`characters` must be a list of strings.".into());
-                };
-                if !s.trim().is_empty() {
-                    out.push(s.trim().to_string());
-                }
-            }
-            out
+    let strings = |key: &str| -> Result<Vec<String>, String> {
+        match args.get(key) {
+            None | Some(Value::Null) => Ok(vec![]),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|i| i.as_str().map(|s| s.trim().to_string()).ok_or(format!("`{key}` must be a list of strings.")))
+                .collect(),
+            Some(_) => Err(format!("`{key}` must be a list of strings.")),
         }
-        Some(_) => return Err("`characters` must be a list of strings.".into()),
     };
+    let raw_characters = strings("characters")?;
+    let raw_negatives = strings("character_negatives")?;
+    if raw_negatives.len() > raw_characters.len() {
+        return Err("`character_negatives` has more entries than `characters`; give one per character, in the same order.".into());
+    }
+    // Blank characters are dropped together with their undesired content.
+    let (characters, character_negatives): (Vec<String>, Vec<String>) = raw_characters
+        .into_iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_empty())
+        .map(|(i, c)| (c, raw_negatives.get(i).cloned().unwrap_or_default()))
+        .unzip();
     if characters.len() > MAX_CHARACTERS {
         return Err(format!("At most {MAX_CHARACTERS} character prompts are allowed."));
     }
@@ -207,6 +215,7 @@ pub fn parse_generate_args(args: &Value) -> Result<GenerateArgs, String> {
         prompt,
         negative_prompt: text("negative_prompt"),
         characters,
+        character_negatives,
         model,
         size,
         width,
@@ -359,6 +368,18 @@ fn clip(s: &str) -> String {
     }
 }
 
+fn characters_text(characters: &[String], negatives: &[String]) -> String {
+    let mut t = String::new();
+    for (i, c) in characters.iter().enumerate() {
+        t += &format!("Character {}:\n{}\n", i + 1, clip(c));
+        if let Some(uc) = negatives.get(i).filter(|n| !n.is_empty()) {
+            t += &format!("Character {} undesired:\n{}\n", i + 1, clip(uc));
+        }
+        t += "\n";
+    }
+    t
+}
+
 pub fn approval_text(a: &GenerateArgs, vibes: &[PreparedVibe], save_to: &str, cost: &str) -> String {
     let mut t = String::from("An AI assistant is asking to generate this image with your NovelAI account.\n\n");
     t += &format!("Model: {}\n", a.model);
@@ -371,9 +392,7 @@ pub fn approval_text(a: &GenerateArgs, vibes: &[PreparedVibe], save_to: &str, co
     if !a.negative_prompt.is_empty() {
         t += &format!("Undesired content:\n{}\n\n", clip(&a.negative_prompt));
     }
-    for (i, c) in a.characters.iter().enumerate() {
-        t += &format!("Character {}:\n{}\n\n", i + 1, clip(c));
-    }
+    t += &characters_text(&a.characters, &a.character_negatives);
     if !vibes.is_empty() {
         t += "Vibes (already encoded, no Anlas):\n";
         for v in vibes {
@@ -566,9 +585,7 @@ pub fn inpaint_approval_text(a: &InpaintArgs, plan: &InpaintPlan, inpaint_model:
     if !g.negative_prompt.is_empty() {
         t += &format!("Undesired content:\n{}\n\n", clip(&g.negative_prompt));
     }
-    for (i, c) in g.characters.iter().enumerate() {
-        t += &format!("Character {}:\n{}\n\n", i + 1, clip(c));
-    }
+    t += &characters_text(&g.characters, &g.character_negatives);
     t += &format!(
         "Save to: {} (as {}.png; the original isn't changed)\n\n",
         clip(save_to),
@@ -756,6 +773,7 @@ impl NovelAiTools {
             prompt: g.prompt.clone(),
             negative_prompt: g.negative_prompt.clone(),
             characters: g.characters.clone(),
+            character_negatives: g.character_negatives.clone(),
             steps: g.steps,
             scale: g.guidance,
             seed,
@@ -837,6 +855,7 @@ impl NovelAiTools {
             prompt: a.prompt.clone(),
             negative_prompt: a.negative_prompt.clone(),
             characters: a.characters.clone(),
+            character_negatives: a.character_negatives.clone(),
             width: a.width,
             height: a.height,
             steps: a.steps,
@@ -922,6 +941,10 @@ impl Tools for NovelAiTools {
                         "characters": {
                             "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS,
                             "description": "Up to 4 character prompts."
+                        },
+                        "character_negatives": {
+                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS,
+                            "description": "Undesired content for each character, in the same order as `characters` (use \"\" to skip one)."
                         },
                         "model": { "type": "string", "enum": MODELS, "default": DEFAULT_MODEL },
                         "size": { "type": "string", "enum": ["portrait", "landscape", "square"], "default": "portrait",
@@ -1058,6 +1081,10 @@ impl Tools for NovelAiTools {
                             "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS,
                             "description": "Up to 4 character prompts."
                         },
+                        "character_negatives": {
+                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS,
+                            "description": "Undesired content for each character, in the same order as `characters` (use \"\" to skip one)."
+                        },
                         "model": { "type": "string", "enum": MODELS, "default": DEFAULT_MODEL,
                                    "description": "Its inpainting version is used (V5 Curated uses V4.5 Curated's, as on NovelAI's site)." },
                         "strength": { "type": "number", "minimum": 0.01, "maximum": 1, "default": 1,
@@ -1158,6 +1185,23 @@ mod tests {
     fn medium_effort_ignores_requested_steps() {
         let a = parse_generate_args(&json!({ "prompt": "x", "model": MEDIUM_MODEL, "steps": 28 })).unwrap();
         assert_eq!(a.steps, MEDIUM_STEPS);
+    }
+
+    #[test]
+    fn keeps_each_characters_undesired_content_with_it() {
+        let a = parse_generate_args(&json!({
+            "prompt": "x",
+            "characters": ["girl, red hair", " ", "boy"],
+            "character_negatives": ["blue hair", "dropped with its blank character"]
+        }))
+        .unwrap();
+        assert_eq!(a.characters, vec!["girl, red hair", "boy"]);
+        assert_eq!(a.character_negatives, vec!["blue hair", ""]);
+        let t = approval_text(&a, &[], "C:\\out", "Free.");
+        assert!(t.contains("Character 1 undesired:\nblue hair"), "{t}");
+        assert!(!t.contains("Character 2 undesired"), "{t}");
+        assert!(parse_generate_args(&json!({ "prompt": "x", "characters": ["a"], "character_negatives": ["b", "c"] })).is_err());
+        assert!(parse_generate_args(&json!({ "prompt": "x", "character_negatives": "b" })).is_err());
     }
 
     #[test]

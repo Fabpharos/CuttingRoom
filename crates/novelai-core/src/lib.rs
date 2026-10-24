@@ -225,6 +225,9 @@ pub struct GenerateRequest {
     pub prompt: String,
     pub negative_prompt: String,
     pub characters: Vec<String>,
+    /// Each character's undesired content, by position; missing ones are empty.
+    #[serde(default)]
+    pub character_negatives: Vec<String>,
     pub width: u32,
     pub height: u32,
     pub steps: u32,
@@ -277,11 +280,14 @@ fn request_body(req: &GenerateRequest, vibes: &[ResolvedVibe]) -> Result<serde_j
     if !(0.0..=MAX_GUIDANCE).contains(&req.scale) || req.scale.is_nan() {
         return Err(format!("Guidance must be between 0 and {MAX_GUIDANCE}."));
     }
-    let characters: Vec<&str> = req
+    // A character left blank is dropped together with its undesired content,
+    // so the two lists stay lined up.
+    let characters: Vec<(&str, &str)> = req
         .characters
         .iter()
-        .map(|c| c.trim())
-        .filter(|c| !c.is_empty())
+        .enumerate()
+        .map(|(i, c)| (c.trim(), req.character_negatives.get(i).map_or("", |n| n.trim())))
+        .filter(|(c, _)| !c.is_empty())
         .collect();
     if characters.len() > MAX_CHARACTERS {
         return Err(format!("At most {MAX_CHARACTERS} character prompts are allowed."));
@@ -292,11 +298,11 @@ fn request_body(req: &GenerateRequest, vibes: &[ResolvedVibe]) -> Result<serde_j
     let center = json!([{ "x": 0.5, "y": 0.5 }]);
     let char_captions: Vec<_> = characters
         .iter()
-        .map(|c| json!({ "char_caption": c, "centers": center }))
+        .map(|(c, _)| json!({ "char_caption": c, "centers": center }))
         .collect();
     let neg_char_captions: Vec<_> = characters
         .iter()
-        .map(|_| json!({ "char_caption": "", "centers": center }))
+        .map(|(_, uc)| json!({ "char_caption": uc, "centers": center }))
         .collect();
 
     let mut parameters = json!({
@@ -614,6 +620,8 @@ pub struct ImportedSettings {
     pub prompt: String,
     pub negative_prompt: String,
     pub characters: Vec<String>,
+    /// Lined up with `characters`; empty where the image had none.
+    pub character_negatives: Vec<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub steps: Option<u32>,
@@ -729,16 +737,21 @@ fn parse_settings(chunks: &[(String, String)]) -> Result<ImportedSettings, Strin
     let negative_prompt = str_at(caption("v4_negative_prompt").and_then(|cap| cap.get("base_caption")))
         .or_else(|| str_at(c.get("uc")))
         .unwrap_or_default();
-    let characters = caption("v4_prompt")
-        .and_then(|cap| cap.get("char_captions"))
-        .and_then(|cc| cc.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|ch| ch.get("char_caption").and_then(|s| s.as_str()))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    let char_captions = |key: &str| {
+        caption(key)
+            .and_then(|cap| cap.get("char_captions"))
+            .and_then(|cc| cc.as_array())
+            .map(|arr| arr.iter().map(|ch| ch.get("char_caption").and_then(|s| s.as_str())).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    // Each character's undesired content sits at the same position in
+    // v4_negative_prompt.
+    let negatives = char_captions("v4_negative_prompt");
+    let (characters, character_negatives): (Vec<String>, Vec<String>) = char_captions("v4_prompt")
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, c)| Some((c?.to_string(), negatives.get(i).copied().flatten().unwrap_or("").to_string())))
+        .unzip();
 
     let num = |key: &str| c.get(key).and_then(|v| v.as_f64());
     let source = get("Source").map(str::to_string);
@@ -746,6 +759,7 @@ fn parse_settings(chunks: &[(String, String)]) -> Result<ImportedSettings, Strin
         prompt,
         negative_prompt,
         characters,
+        character_negatives,
         width: num("width").map(|v| v as u32),
         height: num("height").map(|v| v as u32),
         steps: num("steps").map(|v| v as u32),
@@ -1371,6 +1385,7 @@ mod tests {
             prompt: "1girl".into(),
             negative_prompt: "lowres".into(),
             characters: characters.iter().map(|c| c.to_string()).collect(),
+            character_negatives: vec![],
             width,
             height,
             steps: 28,
@@ -1449,6 +1464,24 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(neg.len(), 1);
+    }
+
+    #[test]
+    fn sends_each_characters_undesired_content_lined_up_with_it() {
+        let mut req = request("nai-diffusion-4-5-full", 832, 1216, &["girl, red hair", " ", "boy, glasses"]);
+        req.character_negatives = vec!["blue hair".into(), "dropped with its blank character".into()];
+        let body = body_of(&req).unwrap();
+        let caps = |key: &str| -> Vec<String> {
+            body["parameters"][key]["caption"]["char_captions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["char_caption"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(caps("v4_prompt"), vec!["girl, red hair", "boy, glasses"]);
+        // The third character had none: sent empty.
+        assert_eq!(caps("v4_negative_prompt"), vec!["blue hair", ""]);
     }
 
     #[test]
@@ -1554,9 +1587,22 @@ mod tests {
         assert_eq!(s.prompt, "1girl, bed, candles");
         assert_eq!(s.negative_prompt, "lowres, bad quality");
         assert_eq!(s.characters, vec!["girl, red hair"]);
+        assert_eq!(s.character_negatives, vec![""]);
         assert_eq!((s.width, s.height), (Some(832), Some(1216)));
         assert_eq!((s.steps, s.scale, s.seed), (Some(23), Some(7.0), Some(3216798432)));
         assert_eq!(s.model.as_deref(), Some("nai-diffusion-5-curated"));
+    }
+
+    #[test]
+    fn reads_each_characters_undesired_content() {
+        let comment = V5_COMMENT.replace(
+            r#""base_caption": "lowres, bad quality", "char_captions": [{"char_caption": """#,
+            r#""base_caption": "lowres, bad quality", "char_captions": [{"char_caption": "blue hair""#,
+        );
+        let png = png_with(&[text_chunk("Software", "NovelAI"), text_chunk("Comment", &comment)]);
+        let s = parse_settings(&png_text_chunks(&png).unwrap()).unwrap();
+        assert_eq!(s.characters, vec!["girl, red hair"]);
+        assert_eq!(s.character_negatives, vec!["blue hair"]);
     }
 
     #[test]

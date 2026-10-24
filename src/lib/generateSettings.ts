@@ -41,6 +41,8 @@ export type GenerateSettings = {
   prompt: string;
   negativePrompt: string;
   characters: string[];
+  /** Each character's undesired content, the same length as `characters`. */
+  characterNegatives: string[];
   steps: number;
   scale: number;
   count: number;
@@ -55,6 +57,7 @@ export const DEFAULT_SETTINGS: GenerateSettings = {
   prompt: "",
   negativePrompt: "",
   characters: [],
+  characterNegatives: [],
   steps: DEFAULT_STEPS,
   scale: DEFAULT_SCALE,
   count: 1,
@@ -159,6 +162,12 @@ function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy
     prompt,
     negativePrompt: str(raw.negativePrompt, d.negativePrompt),
     characters,
+    // Older settings had none; keep one per character either way.
+    characterNegatives: characters.map((_, i) =>
+      Array.isArray(raw.characterNegatives) && typeof raw.characterNegatives[i] === "string"
+        ? (raw.characterNegatives[i] as string)
+        : "",
+    ),
     steps: Math.round(clamp(raw.steps, 1, MAX_STEPS, d.steps)),
     scale: clamp(raw.scale, 0, MAX_SCALE, d.scale),
     count: Math.round(clamp(raw.count, 1, MAX_BATCH, d.count)),
