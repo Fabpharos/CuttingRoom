@@ -96,7 +96,8 @@ export default function StripMetadataTab() {
           }}
         >
           Removes EXIF, location, camera, and other metadata from every photo in a folder
-          and all of its subfolders. Photos are rewritten in place — there's no undo, so
+          and all of its subfolders, including AI generation data such as NovelAI's prompt and
+          settings (also the copy NovelAI hides in the image's transparency channel). Photos are rewritten in place — there's no undo, so
           review the folder before you start.
         </div>
       </div>
