@@ -123,7 +123,7 @@ function ImportConfirmModal({
             marginBottom: 12,
           }}
         >
-          This replaces the current prompt, undesired content and characters.
+          This replaces the current prompt, undesired content and characters (with their undesired content).
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
           {plan.applied.map((a) => (
@@ -268,6 +268,8 @@ export default function GenerateTab({ active }: { active: boolean }) {
   const [prompt, setPrompt] = useState("");
   const [negativePrompt, setNegativePrompt] = useState("");
   const [characters, setCharacters] = useState<string[]>([]);
+  // Each character's undesired content, kept the same length as `characters`.
+  const [characterNegatives, setCharacterNegatives] = useState<string[]>([]);
   const [steps, setSteps] = useState(DEFAULT_STEPS);
   const [scale, setScale] = useState(DEFAULT_SCALE);
   const [outputDir, setOutputDir] = useState<string | null>(null);
@@ -282,7 +284,8 @@ export default function GenerateTab({ active }: { active: boolean }) {
 
   const [promptFiles, setPromptFiles] = useState<PromptFile[]>([]);
   // The prompt field last typed in, so clicking a file's token inserts it there.
-  const lastFieldRef = useRef<{ field: "prompt" | "negative" | number; el: HTMLTextAreaElement } | null>(null);
+  type PromptField = "prompt" | "negative" | { character: number; negative: boolean };
+  const lastFieldRef = useRef<{ field: PromptField; el: HTMLTextAreaElement } | null>(null);
   const [vibes, setVibes] = useState<VibeEntry[]>([]);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
 
@@ -301,6 +304,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
         setCount(s.count);
         setOutputDir(s.outputDir);
         setCharacters(s.characters);
+        setCharacterNegatives(s.characterNegatives);
         if (s.vibes.length > 0) setVibes(await loadVibeEntries(s.vibes));
         // A file that can't be read now stays listed with its error.
         setPromptFiles(await Promise.all(s.promptFiles.map((f) => openPromptFile(f.path, f.name, f.mode))));
@@ -323,6 +327,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
         prompt,
         negativePrompt,
         characters,
+        characterNegatives,
         steps,
         scale,
         count,
@@ -345,6 +350,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
     prompt,
     negativePrompt,
     characters,
+    characterNegatives,
     steps,
     scale,
     count,
@@ -376,7 +382,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
       })
     : [];
   // Prompt file tokens used anywhere in the form, and any that can't be filled.
-  const usedTokens = new Set([prompt, negativePrompt, ...characters].flatMap(tokensIn));
+  const usedTokens = new Set([prompt, negativePrompt, ...characters, ...characterNegatives].flatMap(tokensIn));
   const usedFiles = promptFiles.filter((f) => usedTokens.has(f.name));
   const unknownTokens = [...usedTokens].filter((name) => !promptFiles.some((f) => f.name === name));
   const unreadable = usedFiles.filter((f) => f.lines.length === 0);
@@ -480,6 +486,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
     setPrompt(v.prompt);
     setNegativePrompt(v.negativePrompt);
     setCharacters(v.characters);
+    setCharacterNegatives(v.characterNegatives);
     setImportPlan(null);
   }
 
@@ -564,6 +571,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
         prompt: fillTokens(prompt, values),
         negativePrompt: fillTokens(negativePrompt, values),
         characters: characters.map((c) => fillTokens(c, values)),
+        characterNegatives: characterNegatives.map((c) => fillTokens(c, values)),
         width: size.width,
         height: size.height,
         steps: effectiveSteps,
@@ -669,8 +677,13 @@ export default function GenerateTab({ active }: { active: boolean }) {
   function insertToken(name: string) {
     const token = tokenFor(name);
     const last = lastFieldRef.current;
+    const field = last?.field ?? "prompt";
     const current =
-      !last || last.field === "prompt" ? prompt : last.field === "negative" ? negativePrompt : characters[last.field] ?? "";
+      field === "prompt"
+        ? prompt
+        : field === "negative"
+          ? negativePrompt
+          : ((field.negative ? characterNegatives : characters)[field.character] ?? "");
     const el = last?.el.isConnected ? last.el : null;
     let next: string;
     let caret: number;
@@ -683,11 +696,11 @@ export default function GenerateTab({ active }: { active: boolean }) {
       next = base ? `${base}, ${token}` : token;
       caret = next.length;
     }
-    if (!last || last.field === "prompt") setPrompt(next);
-    else if (last.field === "negative") setNegativePrompt(next);
+    if (field === "prompt") setPrompt(next);
+    else if (field === "negative") setNegativePrompt(next);
     else {
-      const index = last.field;
-      setCharacters((prev) => prev.map((c, j) => (j === index ? next : c)));
+      const set = field.negative ? setCharacterNegatives : setCharacters;
+      set((prev) => prev.map((c, j) => (j === field.character ? next : c)));
     }
     if (el) {
       requestAnimationFrame(() => {
@@ -697,9 +710,15 @@ export default function GenerateTab({ active }: { active: boolean }) {
     }
   }
 
+  function addCharacter() {
+    setCharacters((prev) => [...prev, ""]);
+    setCharacterNegatives((prev) => [...prev, ""]);
+  }
+
   function removeCharacter(index: number) {
     setCharacters((prev) => prev.filter((_, j) => j !== index));
-    if (typeof lastFieldRef.current?.field === "number") lastFieldRef.current = null;
+    setCharacterNegatives((prev) => prev.filter((_, j) => j !== index));
+    if (typeof lastFieldRef.current?.field === "object") lastFieldRef.current = null;
   }
 
   function cancelGenerate() {
@@ -1062,11 +1081,27 @@ export default function GenerateTab({ active }: { active: boolean }) {
                     onChange={(e) =>
                       setCharacters((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))
                     }
-                    onFocus={(e) => (lastFieldRef.current = { field: i, el: e.currentTarget })}
+                    onFocus={(e) =>
+                      (lastFieldRef.current = { field: { character: i, negative: false }, el: e.currentTarget })
+                    }
                     disabled={generating}
                     style={textareaStyle}
                   />
                   {preview(c)}
+                  <textarea
+                    rows={1}
+                    value={characterNegatives[i] ?? ""}
+                    placeholder={`Undesired for character ${i + 1}`}
+                    onChange={(e) =>
+                      setCharacterNegatives((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))
+                    }
+                    onFocus={(e) =>
+                      (lastFieldRef.current = { field: { character: i, negative: true }, el: e.currentTarget })
+                    }
+                    disabled={generating}
+                    style={{ ...textareaStyle, fontSize: 12.5, padding: "6px 10px" }}
+                  />
+                  {preview(characterNegatives[i] ?? "")}
                 </div>
                 <button
                   onClick={() => removeCharacter(i)}
@@ -1083,7 +1118,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
                 href="#"
                 onClick={(e) => {
                   e.preventDefault();
-                  if (!generating) setCharacters((prev) => [...prev, ""]);
+                  if (!generating) addCharacter();
                 }}
                 style={{ fontSize: 13, fontWeight: 600, alignSelf: "flex-start" }}
               >

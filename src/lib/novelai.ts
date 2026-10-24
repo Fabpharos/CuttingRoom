@@ -128,6 +128,8 @@ export type GenerateRequest = {
   prompt: string;
   negativePrompt: string;
   characters: string[];
+  /** Each character's undesired content, by position. */
+  characterNegatives: string[];
   width: number;
   height: number;
   steps: number;
@@ -142,6 +144,8 @@ export type ImportedSettings = {
   prompt: string;
   negativePrompt: string;
   characters: string[];
+  /** Lined up with `characters`; empty where the image had none. */
+  characterNegatives: string[];
   width: number | null;
   height: number | null;
   steps: number | null;
@@ -163,6 +167,7 @@ export type FormValues = {
   prompt: string;
   negativePrompt: string;
   characters: string[];
+  characterNegatives: string[];
   steps?: number;
   scale?: number;
 };
@@ -184,6 +189,7 @@ export function buildImportPlan(s: ImportedSettings): ImportPlan {
     prompt: s.prompt,
     negativePrompt: s.negativePrompt,
     characters: s.characters.slice(0, MAX_CHARACTERS),
+    characterNegatives: s.characters.slice(0, MAX_CHARACTERS).map((_, i) => s.characterNegatives[i] ?? ""),
   };
   const shorten = (t: string) => (t.length > 90 ? t.slice(0, 90) + "…" : t || "(empty)");
 
@@ -202,7 +208,12 @@ export function buildImportPlan(s: ImportedSettings): ImportPlan {
   if (s.characters.length > 0) {
     applied.push({
       label: "Characters",
-      value: values.characters.map((c, i) => `${i + 1}. ${shorten(c)}`).join("  "),
+      value: values.characters
+        .map((c, i) => {
+          const uc = values.characterNegatives[i];
+          return `${i + 1}. ${shorten(c)}${uc ? ` (undesired: ${shorten(uc)})` : ""}`;
+        })
+        .join("  "),
     });
   }
   if (s.characters.length > MAX_CHARACTERS) {
