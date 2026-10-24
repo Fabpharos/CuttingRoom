@@ -32,14 +32,13 @@ import {
 } from "../lib/novelai";
 import ConfirmModal from "./ConfirmModal";
 import {
-  readPromptFile,
+  openPromptFile,
   pickLineIndices,
-  composeSegment,
-  loadPosition,
   savePosition,
+  type PromptFile,
   type PromptFileMode,
-  type PromptFileTarget,
 } from "../lib/promptFile";
+import { fileTokenName, fillTokens, tokenFor, tokensIn } from "../lib/promptTokens";
 import {
   loadGenerateSettings,
   saveGenerateSettings,
@@ -163,6 +162,26 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
+// The field as the next image would get it, shown under fields that use
+// prompt file tokens.
+function TokenPreview({ text }: { text: string }) {
+  return (
+    <div
+      title={text}
+      style={{
+        fontSize: 11.5,
+        fontFamily: "'IBM Plex Mono', monospace",
+        color: "var(--muted)",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+      }}
+    >
+      → {text}
+    </div>
+  );
+}
+
 const textareaStyle: React.CSSProperties = {
   padding: "8px 10px",
   borderRadius: 8,
@@ -261,12 +280,9 @@ export default function GenerateTab({ active }: { active: boolean }) {
   const [batchNotice, setBatchNotice] = useState<string | null>(null);
   const runIdRef = useRef<string | null>(null);
 
-  const [promptFile, setPromptFile] = useState<{ path: string; lines: string[] } | null>(null);
-  const [fileTarget, setFileTarget] = useState<PromptFileTarget>("main");
-  const [fileMode, setFileMode] = useState<PromptFileMode>("random");
-  const [fileBefore, setFileBefore] = useState("");
-  const [fileAfter, setFileAfter] = useState("");
-  const [filePosition, setFilePosition] = useState(0);
+  const [promptFiles, setPromptFiles] = useState<PromptFile[]>([]);
+  // The prompt field last typed in, so clicking a file's token inserts it there.
+  const lastFieldRef = useRef<{ field: "prompt" | "negative" | number; el: HTMLTextAreaElement } | null>(null);
   const [vibes, setVibes] = useState<VibeEntry[]>([]);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
 
@@ -284,26 +300,10 @@ export default function GenerateTab({ active }: { active: boolean }) {
         setScale(s.scale);
         setCount(s.count);
         setOutputDir(s.outputDir);
-        setFileMode(s.fileMode);
-        setFileBefore(s.fileBefore);
-        setFileAfter(s.fileAfter);
-        // A saved target character needs its slot to exist.
-        const characters =
-          s.fileTarget !== "main" && s.characters.length <= s.fileTarget
-            ? [...s.characters, ...Array(s.fileTarget + 1 - s.characters.length).fill("")]
-            : s.characters;
-        setCharacters(characters);
-        setFileTarget(s.fileTarget);
+        setCharacters(s.characters);
         if (s.vibes.length > 0) setVibes(await loadVibeEntries(s.vibes));
-        if (s.promptFilePath) {
-          try {
-            const lines = await readPromptFile(s.promptFilePath);
-            setPromptFile({ path: s.promptFilePath, lines });
-            setFilePosition((await loadPosition(s.promptFilePath)) % lines.length);
-          } catch (err) {
-            setError(`Couldn't reopen the prompt file from last time: ${String(err)}`);
-          }
-        }
+        // A file that can't be read now stays listed with its error.
+        setPromptFiles(await Promise.all(s.promptFiles.map((f) => openPromptFile(f.path, f.name, f.mode))));
       } catch {
         // Unreadable settings just mean starting from the defaults.
       } finally {
@@ -327,11 +327,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
         scale,
         count,
         outputDir,
-        promptFilePath: promptFile?.path ?? null,
-        fileTarget,
-        fileMode,
-        fileBefore,
-        fileAfter,
+        promptFiles: promptFiles.map(({ path, name, mode }) => ({ path, name, mode })),
         vibes: vibes.map(({ path, index, strength, informationExtracted, enabled }) => ({
           path,
           index,
@@ -353,11 +349,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
     scale,
     count,
     outputDir,
-    promptFile,
-    fileTarget,
-    fileMode,
-    fileBefore,
-    fileAfter,
+    promptFiles,
     vibes,
   ]);
   const [importPlan, setImportPlan] = useState<ImportPlan | null>(null);
@@ -383,25 +375,31 @@ export default function GenerateTab({ active }: { active: boolean }) {
           : [];
       })
     : [];
-  // A file aimed at the main prompt supplies it, so the box can be empty.
-  const fileFillsPrompt = promptFile !== null && fileTarget === "main";
+  // Prompt file tokens used anywhere in the form, and any that can't be filled.
+  const usedTokens = new Set([prompt, negativePrompt, ...characters].flatMap(tokensIn));
+  const usedFiles = promptFiles.filter((f) => usedTokens.has(f.name));
+  const unknownTokens = [...usedTokens].filter((name) => !promptFiles.some((f) => f.name === name));
+  const unreadable = usedFiles.filter((f) => f.lines.length === 0);
+  const tokenProblem =
+    unknownTokens.length > 0
+      ? `No prompt file is named ${unknownTokens.map(tokenFor).join(", ")}. Add the file or fix the token.`
+      : unreadable.length > 0
+        ? `${unreadable.map((f) => tokenFor(f.name)).join(", ")} couldn't be read, so it can't be used.`
+        : null;
+  // What each token becomes for the next image: the actual next line in
+  // sequential mode, a placeholder in random mode.
+  const nextValues = Object.fromEntries(
+    promptFiles
+      .filter((f) => f.lines.length > 0)
+      .map((f) => [f.name, f.mode === "sequential" ? f.lines[f.position % f.lines.length] : `‹random ${f.name}›`]),
+  );
+  const preview = (text: string) => (tokensIn(text).length > 0 ? <TokenPreview text={fillTokens(text, nextValues)} /> : null);
   const canGenerate =
     phase === "loggedIn" &&
     !generating &&
-    (prompt.trim() !== "" || fileFillsPrompt) &&
+    prompt.trim() !== "" &&
+    tokenProblem === null &&
     outputDir !== null;
-
-  // What the file will put in its target field next: the actual next line in
-  // sequential mode, a placeholder in random mode.
-  const filePreview = promptFile
-    ? composeSegment(
-        fileBefore,
-        fileMode === "sequential"
-          ? promptFile.lines[filePosition % promptFile.lines.length]
-          : "‹random line from file›",
-        fileAfter,
-      )
-    : "";
   // V5 is free on Opus only while its refilling quota lasts.
   const quotaExhausted =
     !!status?.isOpus && modelInfo.usageLimited && !!status.usage?.isNegative;
@@ -554,24 +552,18 @@ export default function GenerateTab({ active }: { active: boolean }) {
     if (!outputDir) return;
     const size = SIZES[sizeIndex];
     const batchStart = new Date();
-    const file = promptFile;
-    const lineIndices = file
-      ? pickLineIndices(file.lines.length, fileMode, filePosition, count)
-      : [];
+    // One line per file per image: a token used in several fields gets the
+    // same line in each, so they stay consistent within an image.
+    const files = usedFiles;
+    const picks = files.map((f) => pickLineIndices(f.lines.length, f.mode, f.position, count));
     const requests: GenerateRequest[] = Array.from({ length: count }, (_, i) => {
       const seed = randomSeed();
-      let imagePrompt = prompt;
-      let imageCharacters = characters;
-      if (file) {
-        const segment = composeSegment(fileBefore, file.lines[lineIndices[i]], fileAfter);
-        if (fileTarget === "main") imagePrompt = segment;
-        else imageCharacters = characters.map((c, j) => (j === fileTarget ? segment : c));
-      }
+      const values = Object.fromEntries(files.map((f, k) => [f.name, f.lines[picks[k][i]]]));
       return {
         model,
-        prompt: imagePrompt,
-        negativePrompt,
-        characters: imageCharacters,
+        prompt: fillTokens(prompt, values),
+        negativePrompt: fillTokens(negativePrompt, values),
+        characters: characters.map((c) => fillTokens(c, values)),
         width: size.width,
         height: size.height,
         steps: effectiveSteps,
@@ -610,10 +602,12 @@ export default function GenerateTab({ active }: { active: boolean }) {
       const made = summary.images.length;
       // Advance only past lines that actually produced an image, so a
       // cancelled or stopped batch doesn't skip the rest of its lines.
-      if (file && fileMode === "sequential" && made > 0) {
-        const next = (filePosition + made) % file.lines.length;
-        setFilePosition(next);
-        void savePosition(file.path, next);
+      if (made > 0) {
+        const advanced = new Map(
+          files.filter((f) => f.mode === "sequential").map((f) => [f.path, (f.position + made) % f.lines.length]),
+        );
+        advanced.forEach((next, path) => void savePosition(path, next));
+        setPromptFiles((prev) => prev.map((f) => (advanced.has(f.path) ? { ...f, position: advanced.get(f.path)! } : f)));
       }
       if (summary.stoppedReason) {
         setBatchNotice(
@@ -637,48 +631,75 @@ export default function GenerateTab({ active }: { active: boolean }) {
     }
   }
 
-  async function choosePromptFile() {
-    const path = await open({
+  async function addPromptFiles() {
+    const picked = await open({
       directory: false,
-      multiple: false,
+      multiple: true,
       filters: [{ name: "Text file", extensions: ["txt"] }],
     });
-    if (typeof path !== "string") return;
+    if (!Array.isArray(picked) || picked.length === 0) return;
     setError(null);
-    try {
-      const lines = await readPromptFile(path);
-      const saved = await loadPosition(path);
-      setPromptFile({ path, lines });
-      // The file may have been edited since; keep the saved position in range.
-      setFilePosition(saved % lines.length);
-    } catch (err) {
-      setError(String(err));
+    const taken = promptFiles.map((f) => f.name);
+    const added: PromptFile[] = [];
+    for (const path of picked) {
+      if (promptFiles.some((f) => f.path === path)) continue;
+      const name = fileTokenName(path, taken);
+      taken.push(name);
+      added.push(await openPromptFile(path, name, "random"));
     }
+    const failed = added.filter((f) => f.error);
+    if (failed.length > 0) setError(failed.map((f) => `${f.path}: ${f.error}`).join(" "));
+    const ok = added.filter((f) => !f.error);
+    setPromptFiles((prev) => [...prev, ...ok]);
+    // A single new file goes straight into the field last typed in.
+    if (ok.length === 1 && promptFiles.length === 0) insertToken(ok[0].name);
   }
 
-  function choosePromptTarget(target: PromptFileTarget) {
-    setFileTarget(target);
-    // Aiming at a character that doesn't exist yet adds the slots up to it.
-    if (target !== "main") {
-      setCharacters((prev) =>
-        prev.length > target ? prev : [...prev, ...Array(target + 1 - prev.length).fill("")],
-      );
+  function updatePromptFile(path: string, change: Partial<PromptFile>) {
+    setPromptFiles((prev) => prev.map((f) => (f.path === path ? { ...f, ...change } : f)));
+  }
+
+  function resetPosition(file: PromptFile) {
+    updatePromptFile(file.path, { position: 0 });
+    void savePosition(file.path, 0);
+  }
+
+  // Puts `__name__` at the cursor in the prompt field last typed in, or at
+  // the end of the main prompt if none has been.
+  function insertToken(name: string) {
+    const token = tokenFor(name);
+    const last = lastFieldRef.current;
+    const current =
+      !last || last.field === "prompt" ? prompt : last.field === "negative" ? negativePrompt : characters[last.field] ?? "";
+    const el = last?.el.isConnected ? last.el : null;
+    let next: string;
+    let caret: number;
+    if (el) {
+      const [start, end] = [el.selectionStart ?? current.length, el.selectionEnd ?? current.length];
+      next = current.slice(0, start) + token + current.slice(end);
+      caret = start + token.length;
+    } else {
+      const base = current.replace(/[\s,]+$/, "");
+      next = base ? `${base}, ${token}` : token;
+      caret = next.length;
+    }
+    if (!last || last.field === "prompt") setPrompt(next);
+    else if (last.field === "negative") setNegativePrompt(next);
+    else {
+      const index = last.field;
+      setCharacters((prev) => prev.map((c, j) => (j === index ? next : c)));
+    }
+    if (el) {
+      requestAnimationFrame(() => {
+        el.focus();
+        el.setSelectionRange(caret, caret);
+      });
     }
   }
 
   function removeCharacter(index: number) {
     setCharacters((prev) => prev.filter((_, j) => j !== index));
-    // Keep the file aimed at the same character, or back at the main prompt
-    // if that character is the one removed.
-    if (fileTarget !== "main") {
-      if (fileTarget === index) setFileTarget("main");
-      else if (fileTarget > index) setFileTarget(fileTarget - 1);
-    }
-  }
-
-  function resetPosition() {
-    setFilePosition(0);
-    if (promptFile) void savePosition(promptFile.path, 0);
+    if (typeof lastFieldRef.current?.field === "number") lastFieldRef.current = null;
   }
 
   function cancelGenerate() {
@@ -1006,14 +1027,16 @@ export default function GenerateTab({ active }: { active: boolean }) {
             </div>
           </div>
 
-          <Field label={fileFillsPrompt ? "Prompt (from file)" : "Prompt"}>
+          <Field label="Prompt">
             <textarea
               rows={4}
-              value={fileFillsPrompt ? filePreview : prompt}
+              value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
-              disabled={generating || fileFillsPrompt}
+              onFocus={(e) => (lastFieldRef.current = { field: "prompt", el: e.currentTarget })}
+              disabled={generating}
               style={textareaStyle}
             />
+            {preview(prompt)}
           </Field>
 
           <Field label="Undesired content">
@@ -1021,25 +1044,30 @@ export default function GenerateTab({ active }: { active: boolean }) {
               rows={2}
               value={negativePrompt}
               onChange={(e) => setNegativePrompt(e.target.value)}
+              onFocus={(e) => (lastFieldRef.current = { field: "negative", el: e.currentTarget })}
               disabled={generating}
               style={textareaStyle}
             />
+            {preview(negativePrompt)}
           </Field>
 
           <Field label={`Characters (${characters.length}/${MAX_CHARACTERS})`}>
             {characters.map((c, i) => (
               <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-                <textarea
-                  rows={2}
-                  value={promptFile && fileTarget === i ? filePreview : c}
-                  placeholder={`Character ${i + 1}`}
-                  title={promptFile && fileTarget === i ? "Filled from the prompt file" : undefined}
-                  onChange={(e) =>
-                    setCharacters((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))
-                  }
-                  disabled={generating || (promptFile !== null && fileTarget === i)}
-                  style={{ ...textareaStyle, flex: 1 }}
-                />
+                <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 4 }}>
+                  <textarea
+                    rows={2}
+                    value={c}
+                    placeholder={`Character ${i + 1}`}
+                    onChange={(e) =>
+                      setCharacters((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))
+                    }
+                    onFocus={(e) => (lastFieldRef.current = { field: i, el: e.currentTarget })}
+                    disabled={generating}
+                    style={textareaStyle}
+                  />
+                  {preview(c)}
+                </div>
                 <button
                   onClick={() => removeCharacter(i)}
                   disabled={generating}
@@ -1063,6 +1091,136 @@ export default function GenerateTab({ active }: { active: boolean }) {
               </a>
             )}
           </Field>
+
+          <div
+            style={{
+              border: "1px solid var(--border)",
+              borderRadius: 8,
+              padding: "10px 14px",
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", flex: 1 }}>
+                PROMPT FILES
+              </span>
+              <button
+                onClick={() => void addPromptFiles()}
+                disabled={generating}
+                style={{ ...secondaryButtonStyle, padding: "5px 14px" }}
+              >
+                Add .txt files…
+              </button>
+            </div>
+
+            {promptFiles.length === 0 ? (
+              <div style={{ fontSize: 12.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif", lineHeight: 1.5 }}>
+                Text files with one prompt per line. Each file gets a token like{" "}
+                <code>__hair__</code>; put it in any prompt, undesired content or character, and every
+                image fills it with a line from that file.
+              </div>
+            ) : (
+              <>
+                {promptFiles.map((f) => (
+                  <div key={f.path} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12.5 }}>
+                    <button
+                      onClick={() => insertToken(f.name)}
+                      disabled={generating || f.lines.length === 0}
+                      title={`${f.path}\nClick to insert ${tokenFor(f.name)} where you're typing`}
+                      style={{
+                        padding: "3px 8px",
+                        borderRadius: 6,
+                        border: "1px solid var(--border)",
+                        background: "var(--bg-page)",
+                        color: "var(--text)",
+                        fontFamily: "'IBM Plex Mono', monospace",
+                        fontSize: 12,
+                        cursor: "pointer",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {tokenFor(f.name)}
+                    </button>
+                    <span
+                      style={{
+                        flex: 1,
+                        minWidth: 0,
+                        color: f.error ? "rgb(200,140,40)" : "var(--muted)",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                      title={f.error ?? f.path}
+                    >
+                      {f.error
+                        ? f.error
+                        : `${f.lines.length} line${f.lines.length === 1 ? "" : "s"}${usedTokens.has(f.name) ? "" : " · not used yet"}`}
+                    </span>
+                    {!f.error && (
+                      <>
+                        <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: 7, overflow: "hidden" }}>
+                          {(["random", "sequential"] as const).map((m: PromptFileMode) => (
+                            <button
+                              key={m}
+                              onClick={() => updatePromptFile(f.path, { mode: m })}
+                              disabled={generating}
+                              style={{
+                                padding: "3px 9px",
+                                border: "none",
+                                background: f.mode === m ? "var(--accent)" : "transparent",
+                                color: f.mode === m ? "var(--accent-contrast)" : "var(--text)",
+                                fontFamily: "'Space Grotesk', sans-serif",
+                                fontWeight: 600,
+                                fontSize: 12,
+                                cursor: "pointer",
+                              }}
+                            >
+                              {m === "random" ? "Random" : "Sequential"}
+                            </button>
+                          ))}
+                        </div>
+                        {f.mode === "sequential" && (
+                          <span style={{ whiteSpace: "nowrap", fontFamily: "'IBM Plex Mono', monospace", fontSize: 11.5 }}>
+                            next {f.position + 1}/{f.lines.length}
+                            {f.position > 0 && (
+                              <a
+                                href="#"
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  if (!generating) resetPosition(f);
+                                }}
+                                title="Start again from the first line"
+                                style={{ marginLeft: 6, fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600 }}
+                              >
+                                Reset
+                              </a>
+                            )}
+                          </span>
+                        )}
+                      </>
+                    )}
+                    <a
+                      href="#"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        if (!generating) setPromptFiles((prev) => prev.filter((x) => x.path !== f.path));
+                      }}
+                      title="Remove this file (its token is left in the prompt)"
+                      style={{ fontWeight: 600 }}
+                    >
+                      Remove
+                    </a>
+                  </div>
+                ))}
+                <div style={{ fontSize: 11.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif" }}>
+                  Click a token to insert it where you're typing. Each image uses one line per file.
+                </div>
+              </>
+            )}
+            {tokenProblem && <div style={{ ...warningBoxStyle, marginTop: 0, fontSize: 12.5 }}>{tokenProblem}</div>}
+          </div>
 
           <div
             style={{
@@ -1241,159 +1399,6 @@ export default function GenerateTab({ active }: { active: boolean }) {
                 </div>
               );
             })}
-          </div>
-
-          <div
-            style={{
-              border: "1px solid var(--border)",
-              borderRadius: 8,
-              padding: "12px 14px",
-              display: "flex",
-              flexDirection: "column",
-              gap: 12,
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", flex: 1 }}>
-                PROMPT FROM FILE
-              </span>
-              {promptFile && (
-                <a
-                  href="#"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    if (!generating) setPromptFile(null);
-                  }}
-                  style={{ fontSize: 13, fontWeight: 600 }}
-                >
-                  Stop using file
-                </a>
-              )}
-              <button
-                onClick={() => void choosePromptFile()}
-                disabled={generating}
-                style={{ ...secondaryButtonStyle, padding: "6px 14px" }}
-              >
-                {promptFile ? "Change…" : "Choose .txt…"}
-              </button>
-            </div>
-
-            {!promptFile && (
-              <div style={{ fontSize: 12.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif" }}>
-                Use a text file with one prompt per line. Each image takes one line and puts it
-                into the main prompt or a character prompt.
-              </div>
-            )}
-
-            {promptFile && (
-              <>
-                <div
-                  style={{
-                    fontSize: 12,
-                    fontFamily: "'IBM Plex Mono', monospace",
-                    color: "var(--muted)",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                  }}
-                  title={promptFile.path}
-                >
-                  {promptFile.lines.length} prompts · {promptFile.path}
-                </div>
-
-                <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
-                  <Field label="Put the line in">
-                    <select
-                      value={String(fileTarget)}
-                      onChange={(e) =>
-                        choosePromptTarget(e.target.value === "main" ? "main" : Number(e.target.value))
-                      }
-                      disabled={generating}
-                      style={{ ...inputStyle, background: "var(--bg-page)" }}
-                    >
-                      <option value="main">Main prompt</option>
-                      {Array.from({ length: MAX_CHARACTERS }, (_, i) => (
-                        <option key={i} value={i}>
-                          Character {i + 1}
-                        </option>
-                      ))}
-                    </select>
-                  </Field>
-                  <Field label="Order">
-                    <div style={{ display: "flex", gap: 6 }}>
-                      {(["random", "sequential"] as const).map((m) => (
-                        <button
-                          key={m}
-                          onClick={() => setFileMode(m)}
-                          disabled={generating}
-                          style={{
-                            padding: "6px 12px",
-                            borderRadius: 8,
-                            border: fileMode === m ? "none" : "1px solid var(--border)",
-                            background: fileMode === m ? "var(--accent)" : "transparent",
-                            color: fileMode === m ? "var(--accent-contrast)" : "var(--text)",
-                            fontFamily: "'Space Grotesk', sans-serif",
-                            fontWeight: 600,
-                            fontSize: 12.5,
-                            cursor: "pointer",
-                          }}
-                        >
-                          {m === "random" ? "Random" : "Sequential"}
-                        </button>
-                      ))}
-                    </div>
-                  </Field>
-                  {fileMode === "sequential" && (
-                    <Field label="Position">
-                      <div style={{ display: "flex", alignItems: "center", gap: 10, minHeight: 31 }}>
-                        <span style={{ fontSize: 12.5, fontFamily: "'IBM Plex Mono', monospace" }}>
-                          Next: line {filePosition + 1} of {promptFile.lines.length}
-                        </span>
-                        <a
-                          href="#"
-                          onClick={(e) => {
-                            e.preventDefault();
-                            if (!generating) resetPosition();
-                          }}
-                          style={{ fontSize: 13, fontWeight: 600 }}
-                        >
-                          Reset
-                        </a>
-                      </div>
-                    </Field>
-                  )}
-                </div>
-
-                <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
-                  <div style={{ flex: "1 1 220px" }}>
-                    <Field label="Text before the line">
-                      <textarea
-                        rows={2}
-                        value={fileBefore}
-                        onChange={(e) => setFileBefore(e.target.value)}
-                        disabled={generating}
-                        style={textareaStyle}
-                      />
-                    </Field>
-                  </div>
-                  <div style={{ flex: "1 1 220px" }}>
-                    <Field label="Text after the line">
-                      <textarea
-                        rows={2}
-                        value={fileAfter}
-                        onChange={(e) => setFileAfter(e.target.value)}
-                        disabled={generating}
-                        style={textareaStyle}
-                      />
-                    </Field>
-                  </div>
-                </div>
-                <div style={{ fontSize: 12, color: "var(--muted)", fontFamily: "system-ui, sans-serif" }}>
-                  Joined exactly as written, so include any commas or spaces you want between
-                  them.
-                </div>
-              </>
-            )}
           </div>
 
           <Field label="Output folder">

@@ -11,7 +11,8 @@ import {
   DEFAULT_STEPS,
   DEFAULT_SCALE,
 } from "./novelai";
-import type { PromptFileMode, PromptFileTarget } from "./promptFile";
+import type { PromptFileMode } from "./promptFile";
+import { fileTokenName, isValidTokenName, tokenFor } from "./promptTokens";
 
 // One store for everything the Generate tab saves, shared with the prompt
 // file's sequential positions. The API token is never stored here — it
@@ -27,6 +28,13 @@ export type SavedVibe = {
   enabled: boolean;
 };
 
+/** A prompt file as remembered between sessions; it's read again on load. */
+export type SavedPromptFile = {
+  path: string;
+  name: string;
+  mode: PromptFileMode;
+};
+
 export type GenerateSettings = {
   model: string;
   sizeIndex: number;
@@ -37,11 +45,7 @@ export type GenerateSettings = {
   scale: number;
   count: number;
   outputDir: string | null;
-  promptFilePath: string | null;
-  fileTarget: PromptFileTarget;
-  fileMode: PromptFileMode;
-  fileBefore: string;
-  fileAfter: string;
+  promptFiles: SavedPromptFile[];
   vibes: SavedVibe[];
 };
 
@@ -55,11 +59,7 @@ export const DEFAULT_SETTINGS: GenerateSettings = {
   scale: DEFAULT_SCALE,
   count: 1,
   outputDir: null,
-  promptFilePath: null,
-  fileTarget: "main",
-  fileMode: "random",
-  fileBefore: "",
-  fileAfter: "",
+  promptFiles: [],
   vibes: [],
 };
 
@@ -96,39 +96,80 @@ function sanitizeVibes(raw: unknown): SavedVibe[] {
   return vibes.map((v) => (v.enabled && ++on > MAX_VIBES ? { ...v, enabled: false } : v));
 }
 
+const MAX_PROMPT_FILES = 32;
+
+function sanitizePromptFiles(raw: unknown): SavedPromptFile[] {
+  if (!Array.isArray(raw)) return [];
+  const files: SavedPromptFile[] = [];
+  for (const f of raw.slice(0, MAX_PROMPT_FILES)) {
+    if (typeof f !== "object" || f === null) continue;
+    const r = f as Record<string, unknown>;
+    if (typeof r.path !== "string" || files.some((x) => x.path === r.path)) continue;
+    const taken = files.map((x) => x.name);
+    const name =
+      typeof r.name === "string" && isValidTokenName(r.name) && !taken.includes(r.name)
+        ? r.name
+        : fileTokenName(r.path, taken);
+    files.push({ path: r.path, name, mode: r.mode === "sequential" ? "sequential" : "random" });
+  }
+  return files;
+}
+
+// Before tokens, one file at a time replaced a whole field (the main prompt
+// or one character), with optional text before and after its line. That
+// becomes a file whose token stands in that field between the same text, so
+// an existing setup keeps generating exactly what it did.
+type Legacy = { promptFilePath?: unknown; fileTarget?: unknown; fileMode?: unknown; fileBefore?: unknown; fileAfter?: unknown };
+
+function migrateLegacyFile(raw: Legacy, prompt: string, characters: string[]) {
+  if (typeof raw.promptFilePath !== "string") return null;
+  const file: SavedPromptFile = {
+    path: raw.promptFilePath,
+    name: fileTokenName(raw.promptFilePath, []),
+    mode: raw.fileMode === "sequential" ? "sequential" : "random",
+  };
+  const field = str(raw.fileBefore, "") + tokenFor(file.name) + str(raw.fileAfter, "");
+  const t = raw.fileTarget;
+  if (typeof t === "number" && Number.isInteger(t) && t >= 0 && t < MAX_CHARACTERS) {
+    const chars = [...characters, ...Array(Math.max(0, t + 1 - characters.length)).fill("")];
+    chars[t] = field;
+    return { file, prompt, characters: chars };
+  }
+  return { file, prompt: field, characters };
+}
+
 // Saved settings come from a file on disk that an older version of the app
 // (or a hand edit) may have written, so each field is checked rather than
 // trusted: anything unusable falls back to its default.
-function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>>): GenerateSettings {
+function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy): GenerateSettings {
   const d = DEFAULT_SETTINGS;
-  const characters = Array.isArray(raw.characters)
+  let characters = Array.isArray(raw.characters)
     ? raw.characters.filter((c): c is string => typeof c === "string").slice(0, MAX_CHARACTERS)
     : d.characters;
-  const target = raw.fileTarget;
+  let prompt = str(raw.prompt, d.prompt);
+  let promptFiles = sanitizePromptFiles(raw.promptFiles);
+  const legacy = Array.isArray(raw.promptFiles) ? null : migrateLegacyFile(raw, prompt, characters);
+  if (legacy) {
+    ({ prompt, characters } = legacy);
+    promptFiles = [legacy.file];
+  }
   return {
     model: MODELS.some((m) => m.id === raw.model) ? (raw.model as string) : d.model,
     sizeIndex: Math.round(clamp(raw.sizeIndex, 0, SIZES.length - 1, d.sizeIndex)),
-    prompt: str(raw.prompt, d.prompt),
+    prompt,
     negativePrompt: str(raw.negativePrompt, d.negativePrompt),
     characters,
     steps: Math.round(clamp(raw.steps, 1, MAX_STEPS, d.steps)),
     scale: clamp(raw.scale, 0, MAX_SCALE, d.scale),
     count: Math.round(clamp(raw.count, 1, MAX_BATCH, d.count)),
     outputDir: typeof raw.outputDir === "string" ? raw.outputDir : d.outputDir,
-    promptFilePath: typeof raw.promptFilePath === "string" ? raw.promptFilePath : d.promptFilePath,
-    fileTarget:
-      typeof target === "number" && Number.isInteger(target) && target >= 0 && target < MAX_CHARACTERS
-        ? target
-        : d.fileTarget,
-    fileMode: raw.fileMode === "sequential" ? "sequential" : d.fileMode,
-    fileBefore: str(raw.fileBefore, d.fileBefore),
-    fileAfter: str(raw.fileAfter, d.fileAfter),
+    promptFiles,
     vibes: sanitizeVibes(raw.vibes),
   };
 }
 
 export async function loadGenerateSettings(): Promise<GenerateSettings> {
-  const raw = await generateStore.get<Partial<Record<keyof GenerateSettings, unknown>>>(SETTINGS_KEY);
+  const raw = await generateStore.get<Partial<Record<keyof GenerateSettings, unknown>> & Legacy>(SETTINGS_KEY);
   return raw ? sanitize(raw) : DEFAULT_SETTINGS;
 }
 
