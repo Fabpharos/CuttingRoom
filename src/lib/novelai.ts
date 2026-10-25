@@ -76,6 +76,38 @@ export const SIZES: { width: number; height: number; label: string }[] = [
 
 export const MAX_CHARACTERS = 4;
 
+/** Where a character sits, as fractions of the image from its top-left corner. */
+export type CharacterPosition = { x: number; y: number };
+export const CENTER: CharacterPosition = { x: 0.5, y: 0.5 };
+
+// Character placement, mirroring novelai-core (which enforces it): V5 places
+// characters anywhere, even a lone one; V4 and V4.5 snap to NovelAI's 5x5
+// grid and only place characters when there are two or more.
+export function freeCharacterPositions(model: string): boolean {
+  return model.startsWith("nai-diffusion-5");
+}
+
+export function positionsApply(model: string, count: number): boolean {
+  return count >= 2 || (count === 1 && freeCharacterPositions(model));
+}
+
+export function snapToGrid(v: number): number {
+  const k = Math.min(4, Math.max(0, Math.round((v - 0.1) / 0.2)));
+  return Math.round((0.1 + 0.2 * k) * 10) / 10;
+}
+
+export function positionForModel(model: string, p: CharacterPosition): CharacterPosition {
+  return freeCharacterPositions(model)
+    ? { x: Math.round(p.x * 1000) / 1000, y: Math.round(p.y * 1000) / 1000 }
+    : { x: snapToGrid(p.x), y: snapToGrid(p.y) };
+}
+
+/** A grid cell's name as NovelAI's site shows it: column A-E, row 1-5. */
+export function gridLabel(p: CharacterPosition): string {
+  const index = (v: number) => Math.min(4, Math.round((snapToGrid(v) - 0.1) / 0.2));
+  return `${"ABCDE"[index(p.x)]}${index(p.y) + 1}`;
+}
+
 // Each vibe past the fourth costs Anlas, so the Rust side refuses a fifth.
 export const MAX_VIBES = 4;
 export const DEFAULT_VIBE_STRENGTH = 0.6;
@@ -130,6 +162,8 @@ export type GenerateRequest = {
   characters: string[];
   /** Each character's undesired content, by position. */
   characterNegatives: string[];
+  /** Where each character goes; null lets the model place them. */
+  characterPositions: CharacterPosition[] | null;
   width: number;
   height: number;
   steps: number;
@@ -146,6 +180,8 @@ export type ImportedSettings = {
   characters: string[];
   /** Lined up with `characters`; empty where the image had none. */
   characterNegatives: string[];
+  /** Set when the image placed its characters itself. */
+  characterPositions: CharacterPosition[] | null;
   width: number | null;
   height: number | null;
   steps: number | null;
@@ -168,6 +204,8 @@ export type FormValues = {
   negativePrompt: string;
   characters: string[];
   characterNegatives: string[];
+  /** Null means "AI's choice". */
+  characterPositions: CharacterPosition[] | null;
   steps?: number;
   scale?: number;
 };
@@ -190,6 +228,9 @@ export function buildImportPlan(s: ImportedSettings): ImportPlan {
     negativePrompt: s.negativePrompt,
     characters: s.characters.slice(0, MAX_CHARACTERS),
     characterNegatives: s.characters.slice(0, MAX_CHARACTERS).map((_, i) => s.characterNegatives[i] ?? ""),
+    characterPositions: s.characterPositions
+      ? s.characters.slice(0, MAX_CHARACTERS).map((_, i) => s.characterPositions?.[i] ?? CENTER)
+      : null,
   };
   const shorten = (t: string) => (t.length > 90 ? t.slice(0, 90) + "…" : t || "(empty)");
 
@@ -214,6 +255,21 @@ export function buildImportPlan(s: ImportedSettings): ImportPlan {
           return `${i + 1}. ${shorten(c)}${uc ? ` (undesired: ${shorten(uc)})` : ""}`;
         })
         .join("  "),
+    });
+  }
+  if (s.characters.length > 0) {
+    const positions = values.characterPositions;
+    applied.push({
+      label: "Character positions",
+      value: positions
+        ? positions
+            .map((p, i) =>
+              freeCharacterPositions(values.model ?? "")
+                ? `${i + 1}. x ${p.x.toFixed(2)}, y ${p.y.toFixed(2)}`
+                : `${i + 1}. ${gridLabel(p)}`,
+            )
+            .join("  ")
+        : "AI's choice",
     });
   }
   if (s.characters.length > MAX_CHARACTERS) {
