@@ -516,12 +516,17 @@ export default function GenerateTab({ active }: { active: boolean }) {
         : unreadable.length > 0
           ? `${unreadable.map((f) => tokenFor(f.name)).join(", ")} couldn't be read, so it can't be used.`
           : null;
-  // A file's values for one entry: its main line and each labelled part.
-  // Entries without a part get it empty, which drops a character left blank.
+  // A file's values for one entry: its main line and each labelled part. A
+  // part the entry has no line for is `ABSENT`, which leaves its character
+  // out; a part line with nothing after the label is just empty.
+  const ABSENT = "\u0000absent";
   const entryValues = (f: PromptFile, index: number): [string, string][] => [
     [f.name, f.lines[index]],
-    ...f.partNames.map((p): [string, string] => [`${f.name}:${p}`, f.parts[index][p] ?? ""]),
+    ...f.partNames.map((p): [string, string] => [`${f.name}:${p}`, f.parts[index][p] ?? ABSENT]),
   ];
+  // Absent parts read as empty anywhere they're used.
+  const present = (values: Record<string, string>) =>
+    Object.fromEntries(Object.entries(values).map(([k, v]) => [k, v === ABSENT ? "" : v]));
   // What each token becomes for the next image: the actual next line in
   // sequential mode, a placeholder in random mode.
   const nextValues = Object.fromEntries(
@@ -536,12 +541,12 @@ export default function GenerateTab({ active }: { active: boolean }) {
   // A character using a paired file's part sits out any image whose entry
   // has no line for that part (its undesired content and position go too).
   const missingPart = (text: string, values: Record<string, string>) =>
-    tokensIn(text).some((k) => tokenPart(k) !== null && values[k] === "");
+    tokensIn(text).some((k) => tokenPart(k) !== null && values[k] === ABSENT);
   const preview = (text: string, character = false) =>
     tokensIn(text).length === 0 ? null : character && missingPart(text, nextValues) ? (
       <TokenPreview text="(left out of the next image: its entry has no line for this character)" />
     ) : (
-      <TokenPreview text={fillTokens(text, nextValues)} />
+      <TokenPreview text={fillTokens(text, present(nextValues))} />
     );
   const canGenerate =
     phase === "loggedIn" &&
@@ -710,12 +715,13 @@ export default function GenerateTab({ active }: { active: boolean }) {
     const picks = files.map((f) => pickLineIndices(f.lines.length, f.mode, f.position, count));
     const requests: GenerateRequest[] = Array.from({ length: count }, (_, i) => {
       const seed = randomSeed();
-      const values = Object.fromEntries(files.flatMap((f, k) => entryValues(f, picks[k][i])));
+      const entry = Object.fromEntries(files.flatMap((f, k) => entryValues(f, picks[k][i])));
+      const values = present(entry);
       return {
         model,
         prompt: fillTokens(prompt, values),
         negativePrompt: fillTokens(negativePrompt, values),
-        characters: characters.map((c) => (missingPart(c, values) ? "" : fillTokens(c, values))),
+        characters: characters.map((c) => (missingPart(c, entry) ? "" : fillTokens(c, values))),
         characterNegatives: characterNegatives.map((c) => fillTokens(c, values)),
         characterPositions: useCoords ? characterPositions : null,
         width: size.width,

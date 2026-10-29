@@ -32,28 +32,34 @@ export async function openWildcardsDir(): Promise<void> {
 }
 
 // A paired file's part line: a label of up to 30 characters starting with a
-// letter, one colon, then a space ("girl: smile, blush"). "Text:" is never a
-// label: that's NovelAI's syntax for writing in images.
-const PART_LINE = /^([A-Za-z][A-Za-z0-9 _-]{0,29}):\s+(.*)$/;
+// letter, one colon, then a space and its text ("girl: smile, blush") or
+// nothing ("boy:", a character with no extra tags). Needing the space keeps
+// NovelAI tags like "artist:name" from looking like labels, and "Text:" is
+// never a label: that's NovelAI's syntax for writing in images.
+const PART_LINE = /^([A-Za-z][A-Za-z0-9 _-]{0,29}):(?:\s+(.*))?$/;
 
 /**
  * Splits a file's lines into entries. A line starts a new entry unless it's
  * a labelled part line following one, so a plain file (one prompt per line)
  * is every line an entry, and a paired file is
  *
+ *     # an optional comment, ignored
  *     main prompt
  *     girl: tags for the girl
  *     boy: tags for the boy
+ *
+ * Lines starting with `#` are comments in any file.
  */
 export function parseEntries(rawLines: string[]): Pick<PromptFile, "lines" | "parts" | "partNames"> {
   const lines: string[] = [];
   const parts: Record<string, string>[] = [];
   const partNames: string[] = [];
   for (const raw of rawLines) {
+    if (raw.startsWith("#")) continue;
     const m = PART_LINE.exec(raw);
     const label = m ? partName(m[1]) : "";
     if (m && label && label !== "text" && lines.length > 0) {
-      parts[parts.length - 1][label] = m[2].trim();
+      parts[parts.length - 1][label] = (m[2] ?? "").trim();
       if (!partNames.includes(label)) partNames.push(label);
     } else {
       lines.push(raw);
