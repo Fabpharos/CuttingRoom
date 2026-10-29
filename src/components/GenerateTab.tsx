@@ -39,12 +39,14 @@ import {
 import ConfirmModal from "./ConfirmModal";
 import {
   openPromptFile,
+  openWildcardsDir,
+  wildcardsDir,
   pickLineIndices,
   savePosition,
   type PromptFile,
   type PromptFileMode,
 } from "../lib/promptFile";
-import { fileTokenName, fillTokens, tokenFor, tokensIn } from "../lib/promptTokens";
+import { fileTokenName, fillTokens, tokenFile, tokenFor, tokenPart, tokensIn } from "../lib/promptTokens";
 import {
   loadGenerateSettings,
   saveGenerateSettings,
@@ -495,23 +497,52 @@ export default function GenerateTab({ active }: { active: boolean }) {
     : [];
   // Prompt file tokens used anywhere in the form, and any that can't be filled.
   const usedTokens = new Set([prompt, negativePrompt, ...characters, ...characterNegatives].flatMap(tokensIn));
-  const usedFiles = promptFiles.filter((f) => usedTokens.has(f.name));
-  const unknownTokens = [...usedTokens].filter((name) => !promptFiles.some((f) => f.name === name));
+  const usedNames = new Set([...usedTokens].map(tokenFile));
+  const usedFiles = promptFiles.filter((f) => usedNames.has(f.name));
+  const unknownTokens = [...usedTokens].filter((key) => !promptFiles.some((f) => f.name === tokenFile(key)));
+  const missingParts = [...usedTokens].filter((key) => {
+    const part = tokenPart(key);
+    const file = promptFiles.find((f) => f.name === tokenFile(key));
+    return part !== null && file !== undefined && file.lines.length > 0 && !file.partNames.includes(part);
+  });
   const unreadable = usedFiles.filter((f) => f.lines.length === 0);
   const tokenProblem =
     unknownTokens.length > 0
-      ? `No prompt file is named ${unknownTokens.map(tokenFor).join(", ")}. Add the file or fix the token.`
-      : unreadable.length > 0
-        ? `${unreadable.map((f) => tokenFor(f.name)).join(", ")} couldn't be read, so it can't be used.`
-        : null;
+      ? `No prompt file is named ${unknownTokens.map((k) => tokenFor(tokenFile(k))).join(", ")}. Add the file or fix the token.`
+      : missingParts.length > 0
+        ? missingParts
+            .map((k) => `${tokenFor(k)}: ${tokenFile(k)} has no "${tokenPart(k)}:" lines.`)
+            .join(" ")
+        : unreadable.length > 0
+          ? `${unreadable.map((f) => tokenFor(f.name)).join(", ")} couldn't be read, so it can't be used.`
+          : null;
+  // A file's values for one entry: its main line and each labelled part.
+  // Entries without a part get it empty, which drops a character left blank.
+  const entryValues = (f: PromptFile, index: number): [string, string][] => [
+    [f.name, f.lines[index]],
+    ...f.partNames.map((p): [string, string] => [`${f.name}:${p}`, f.parts[index][p] ?? ""]),
+  ];
   // What each token becomes for the next image: the actual next line in
   // sequential mode, a placeholder in random mode.
   const nextValues = Object.fromEntries(
     promptFiles
       .filter((f) => f.lines.length > 0)
-      .map((f) => [f.name, f.mode === "sequential" ? f.lines[f.position % f.lines.length] : `‹random ${f.name}›`]),
+      .flatMap((f) =>
+        f.mode === "sequential"
+          ? entryValues(f, f.position % f.lines.length)
+          : [[f.name, `‹random ${f.name}›`], ...f.partNames.map((p) => [`${f.name}:${p}`, `‹random ${f.name}:${p}›`])],
+      ),
   );
-  const preview = (text: string) => (tokensIn(text).length > 0 ? <TokenPreview text={fillTokens(text, nextValues)} /> : null);
+  // A character using a paired file's part sits out any image whose entry
+  // has no line for that part (its undesired content and position go too).
+  const missingPart = (text: string, values: Record<string, string>) =>
+    tokensIn(text).some((k) => tokenPart(k) !== null && values[k] === "");
+  const preview = (text: string, character = false) =>
+    tokensIn(text).length === 0 ? null : character && missingPart(text, nextValues) ? (
+      <TokenPreview text="(left out of the next image: its entry has no line for this character)" />
+    ) : (
+      <TokenPreview text={fillTokens(text, nextValues)} />
+    );
   const canGenerate =
     phase === "loggedIn" &&
     !generating &&
@@ -679,12 +710,12 @@ export default function GenerateTab({ active }: { active: boolean }) {
     const picks = files.map((f) => pickLineIndices(f.lines.length, f.mode, f.position, count));
     const requests: GenerateRequest[] = Array.from({ length: count }, (_, i) => {
       const seed = randomSeed();
-      const values = Object.fromEntries(files.map((f, k) => [f.name, f.lines[picks[k][i]]]));
+      const values = Object.fromEntries(files.flatMap((f, k) => entryValues(f, picks[k][i])));
       return {
         model,
         prompt: fillTokens(prompt, values),
         negativePrompt: fillTokens(negativePrompt, values),
-        characters: characters.map((c) => fillTokens(c, values)),
+        characters: characters.map((c) => (missingPart(c, values) ? "" : fillTokens(c, values))),
         characterNegatives: characterNegatives.map((c) => fillTokens(c, values)),
         characterPositions: useCoords ? characterPositions : null,
         width: size.width,
@@ -758,6 +789,8 @@ export default function GenerateTab({ active }: { active: boolean }) {
     const picked = await open({
       directory: false,
       multiple: true,
+      // Opens in the project's wildcards folder; any other folder works too.
+      defaultPath: await wildcardsDir().catch(() => undefined),
       filters: [{ name: "Text file", extensions: ["txt"] }],
     });
     if (!Array.isArray(picked) || picked.length === 0) return;
@@ -789,6 +822,49 @@ export default function GenerateTab({ active }: { active: boolean }) {
 
   // Puts `__name__` at the cursor in the prompt field last typed in, or at
   // the end of the main prompt if none has been.
+  // Sets a paired file up in one go: its main token at the end of the main
+  // prompt, and each part in the character named for it (whose prompt
+  // starts with the label, like "girl, …"), else an empty character, else a
+  // new one that starts with the label.
+  function usePairedFile(f: PromptFile) {
+    const append = (text: string, token: string) => {
+      const base = text.replace(/[\s,]+$/, "");
+      return base ? `${base}, ${token}` : token;
+    };
+    if (![prompt, negativePrompt].some((t) => tokensIn(t).includes(f.name))) setPrompt((p) => append(p, tokenFor(f.name)));
+    const chars = [...characters];
+    const negatives = [...characterNegatives];
+    const positions = [...characterPositions];
+    const noRoom: string[] = [];
+    for (const part of f.partNames) {
+      const key = `${f.name}:${part}`;
+      if (chars.some((c) => tokensIn(c).includes(key))) continue;
+      const firstTag = (c: string) => c.split(",")[0].trim().toLowerCase().replace(/[^a-z0-9]+/g, "-");
+      const usesFile = (c: string) => tokensIn(c).some((k) => tokenFile(k) === f.name);
+      let i = chars.findIndex((c) => firstTag(c) === part && !usesFile(c));
+      if (i < 0) i = chars.findIndex((c) => c.trim() === "");
+      if (i < 0) {
+        if (chars.length >= MAX_CHARACTERS) {
+          noRoom.push(part);
+          continue;
+        }
+        chars.push(part.replace(/-/g, " "));
+        negatives.push("");
+        positions.push(CENTER);
+        i = chars.length - 1;
+      }
+      chars[i] = append(chars[i], tokenFor(f.name, part));
+    }
+    setCharacters(chars);
+    setCharacterNegatives(negatives);
+    setCharacterPositions(positions);
+    if (noRoom.length > 0) {
+      setError(
+        `There's room for ${MAX_CHARACTERS} characters, so ${noRoom.map((p) => tokenFor(f.name, p)).join(", ")} wasn't placed. Put it in a character yourself.`,
+      );
+    }
+  }
+
   function insertToken(name: string) {
     const token = tokenFor(name);
     const last = lastFieldRef.current;
@@ -1240,7 +1316,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
                     disabled={generating}
                     style={textareaStyle}
                   />
-                  {preview(c)}
+                  {preview(c, true)}
                   <textarea
                     rows={1}
                     value={characterNegatives[i] ?? ""}
@@ -1304,6 +1380,17 @@ export default function GenerateTab({ active }: { active: boolean }) {
               <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", flex: 1 }}>
                 PROMPT FILES
               </span>
+              <a
+                href="#"
+                onClick={(e) => {
+                  e.preventDefault();
+                  void openWildcardsDir().catch((err) => setError(String(err)));
+                }}
+                title="Open the project's wildcards folder, where prompt files live by default"
+                style={{ fontSize: 13, fontWeight: 600 }}
+              >
+                Open folder
+              </a>
               <button
                 onClick={() => void addPromptFiles()}
                 disabled={generating}
@@ -1315,14 +1402,15 @@ export default function GenerateTab({ active }: { active: boolean }) {
 
             {promptFiles.length === 0 ? (
               <div style={{ fontSize: 12.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif", lineHeight: 1.5 }}>
-                Text files with one prompt per line. Each file gets a token like{" "}
-                <code>__hair__</code>; put it in any prompt, undesired content or character, and every
-                image fills it with a line from that file.
+                Text files with one prompt per line, kept in the project's <code>wildcards</code>{" "}
+                folder. Each file gets a token like <code>__hair__</code>; put it in any prompt,
+                undesired content or character, and every image fills it with a line from that file.
               </div>
             ) : (
               <>
                 {promptFiles.map((f) => (
-                  <div key={f.path} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12.5 }}>
+                  <div key={f.path} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12.5 }}>
                     <button
                       onClick={() => insertToken(f.name)}
                       disabled={generating || f.lines.length === 0}
@@ -1354,7 +1442,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
                     >
                       {f.error
                         ? f.error
-                        : `${f.lines.length} line${f.lines.length === 1 ? "" : "s"}${usedTokens.has(f.name) ? "" : " · not used yet"}`}
+                        : `${f.lines.length} ${f.partNames.length > 0 ? "entr" + (f.lines.length === 1 ? "y" : "ies") : "line" + (f.lines.length === 1 ? "" : "s")}${usedNames.has(f.name) ? "" : " · not used yet"}`}
                     </span>
                     {!f.error && (
                       <>
@@ -1411,9 +1499,47 @@ export default function GenerateTab({ active }: { active: boolean }) {
                       Remove
                     </a>
                   </div>
+                  {f.partNames.length > 0 && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", paddingLeft: 12, fontSize: 12 }}>
+                      <span style={{ color: "var(--muted)" }}>Parts</span>
+                      {f.partNames.map((p) => (
+                        <button
+                          key={p}
+                          onClick={() => insertToken(`${f.name}:${p}`)}
+                          disabled={generating}
+                          title={`Click to insert ${tokenFor(f.name, p)}: each entry's "${p}:" line`}
+                          style={{
+                            padding: "1px 7px",
+                            borderRadius: 6,
+                            border: "1px solid var(--border)",
+                            background: "var(--bg-page)",
+                            color: "var(--text)",
+                            fontFamily: "'IBM Plex Mono', monospace",
+                            fontSize: 11.5,
+                            cursor: "pointer",
+                          }}
+                        >
+                          :{p}
+                        </button>
+                      ))}
+                      <a
+                        href="#"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          if (!generating) usePairedFile(f);
+                        }}
+                        title="Put the main token in the prompt and each part in its character"
+                        style={{ fontWeight: 600, marginLeft: 4 }}
+                      >
+                        Use in prompts
+                      </a>
+                    </div>
+                  )}
+                  </div>
                 ))}
                 <div style={{ fontSize: 11.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif" }}>
-                  Click a token to insert it where you're typing. Each image uses one line per file.
+                  Click a token to insert it where you're typing. Each image uses one entry per file, so a
+                  paired file's parts always match its main line.
                 </div>
               </>
             )}

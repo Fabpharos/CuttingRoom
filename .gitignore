@@ -38,3 +38,8 @@ CLAUDE.md
 # Rust build output for the crates outside src-tauri
 /crates/*/target/
 /mcp-server/target/
+
+# The user's own prompt files (wildcards) — personal, never pushed. Only the
+# README explaining the folder is tracked.
+/wildcards/*
+!/wildcards/README.md
