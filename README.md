@@ -24,7 +24,7 @@ Each tab keeps its own state — switching between them doesn't lose an open fol
 - `novelai_preview_inpaint` — shows the crop and mask on the image before inpainting (read-only, nothing sent to NovelAI).
 - `novelai_upscale` — doubles one image's size with NovelAI's upscaler. It costs 1 Anlas every time, so the approval dialog leads with the cost and your balance; images over 1 megapixel are refused. Saved as a new `name_upscaled.png`.
 
-**Every image needs your approval** in a Windows dialog showing the full request (including any vibe files) and whether it costs Anlas ("No" is the default button). The server uses the same limits as the Generate tab — free sizes and step counts only, at least 2 seconds between requests, and a stop if NovelAI unexpectedly charges Anlas. It reads the token Cutting Room saved in Windows Credential Manager, so log in once in the Generate tab first; the token is never passed to the AI client.
+**Free requests run without asking; anything that costs Anlas needs your approval** in a Windows dialog showing the full request (including any vibe files) and the cost ("No" is the default button). That covers every upscale, any request on a non-Opus account, and V5 once the Opus quota is used up. The server waits 1 second before each request to NovelAI, on top of the 2-second minimum gap between requests. The server uses the same limits as the Generate tab — free sizes and step counts only, at least 2 seconds between requests, and a stop if NovelAI unexpectedly charges Anlas. It reads the token Cutting Room saved in Windows Credential Manager, so log in once in the Generate tab first; the token is never passed to the AI client.
 
 Build it:
 
