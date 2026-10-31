@@ -656,11 +656,27 @@ pub struct NovelAiTools {
     /// Set once NovelAI unexpectedly charges for a should-be-free image;
     /// further generations are refused until the server restarts.
     pub paused: Option<String>,
+    /// Asks the user about a request that costs Anlas (free ones run without asking).
     pub approve: fn(&str, &str) -> bool,
     pub timestamp: fn() -> String,
+    /// Waited before every request to NovelAI, on top of the 2-second minimum
+    /// gap novelai-core keeps between requests, so automated use stays well
+    /// clear of rate limits.
+    pub request_delay: std::time::Duration,
 }
 
 impl NovelAiTools {
+    /// Free requests go ahead; anything that costs Anlas needs the user's yes.
+    fn allowed(&self, costs: bool, title: &str, text: &str) -> bool {
+        !costs || (self.approve)(title, text)
+    }
+
+    fn pause_before_request(&self) {
+        if !self.request_delay.is_zero() {
+            self.runtime.block_on(tokio::time::sleep(self.request_delay));
+        }
+    }
+
     fn status(&self) -> Result<AccountStatus, String> {
         self.runtime
             .block_on(account_status())?
@@ -724,6 +740,7 @@ impl NovelAiTools {
         }
 
         let run_id = format!("mcp-upscale-{}", random_seed());
+        self.pause_before_request();
         let summary = match self.runtime.block_on(upscale_batch(run_id, vec![image.path.clone()], save_to, |_| {})) {
             Ok(s) => s,
             Err(e) => return ToolResult::error(e),
@@ -810,7 +827,7 @@ impl NovelAiTools {
         let save_to = g.output_dir.clone().unwrap_or_else(|| self.output_dir.clone());
 
         let dialog = inpaint_approval_text(&a, &plan, inpaint_model, &save_to, &cost);
-        if !(self.approve)("NovelAI inpaint request", &dialog) {
+        if !self.allowed(costs, "NovelAI inpaint request (costs Anlas)", &dialog) {
             return ToolResult::error("The user declined this inpaint. Don't retry it unless they ask you to.");
         }
 
@@ -830,6 +847,7 @@ impl NovelAiTools {
         };
         // Guard whenever the inpaint should be free; a paid one was just
         // approved with its cost shown.
+        self.pause_before_request();
         let outcome = match self.runtime.block_on(run_inpaint(format!("mcp-inpaint-{seed}"), plan, settings, save_to, !costs, a.keep_raw)) {
             Ok(o) => o,
             Err(e) => return ToolResult::error(e),
@@ -892,7 +910,7 @@ impl NovelAiTools {
         let (costs, cost) = cost_line(&status, &a.model);
         let save_to = a.output_dir.clone().unwrap_or_else(|| self.output_dir.clone());
 
-        if !(self.approve)("NovelAI generation request", &approval_text(&a, &vibes, &save_to, &cost)) {
+        if !self.allowed(costs, "NovelAI generation request (costs Anlas)", &approval_text(&a, &vibes, &save_to, &cost)) {
             return ToolResult::error(
                 "The user declined this generation. Don't retry it unless they ask you to.",
             );
@@ -914,6 +932,7 @@ impl NovelAiTools {
             file_stem: format!("{}_mcp_{seed}", (self.timestamp)()),
             vibes: vibes.iter().map(|v| v.reference.clone()).collect(),
         };
+        self.pause_before_request();
         let summary = match self.runtime.block_on(generate_batch(
             format!("mcp-{seed}"),
             vec![request],
@@ -979,8 +998,9 @@ impl Tools for NovelAiTools {
             json!({
                 "name": "novelai_generate_image",
                 "description": "Generate ONE image with NovelAI and return it so you can look at it. \
-                    Every call shows the user a Windows approval dialog with the full request; they may decline, \
-                    in which case don't retry unless asked. Limited to free settings: three sizes, at most 28 steps, \
+                    Free requests run straight away; one that would cost Anlas (a non-Opus account, or V5 after the \
+                    Opus quota is used up) first shows the user a Windows approval dialog and may be declined, in which \
+                    case don't retry unless asked. Limited to free settings: three sizes, at most 28 steps, \
                     one image per call. On Opus, V4/V4.5 models are free and unlimited; V5 models use a limited quota. \
                     The full PNG is saved to disk; the returned image is a downscaled preview.",
                 "inputSchema": {
@@ -1095,8 +1115,8 @@ impl Tools for NovelAiTools {
                 "description": "Inpaint part of an image of any size (\"crop and stitch\", like NovelAI's Focused Inpainting): the crop \
                     is cut out, enlarged to about 1 megapixel, the masked part is repainted by NovelAI, and that part is blended back \
                     into the full image with a soft edge. Pixels outside the softened mask are untouched. The result is saved as a new \
-                    <name>_inpainted.png; the original isn't changed. Every call shows the user a Windows approval dialog and may be \
-                    declined. Free on Opus (V4/V4.5 unlimited, V5 from the quota). Returns the crop before/after and the whole result. \
+                    <name>_inpainted.png; the original isn't changed. Free on Opus (V4/V4.5 unlimited, V5 from the quota) and runs \
+                    straight away; if it would cost Anlas the user is asked first and may decline. Returns the crop before/after and the whole result. \
                     Preview the area with novelai_preview_inpaint first. Vibes aren't supported for inpainting.",
                 "inputSchema": {
                     "type": "object",
@@ -1553,7 +1573,19 @@ mod tests {
             paused: None,
             approve: never,
             timestamp: || "now".into(),
+            request_delay: std::time::Duration::ZERO,
         }
+    }
+
+    #[test]
+    fn only_asks_about_requests_that_cost_anlas() {
+        // Free: the dialog isn't shown at all (`never` panics if it is).
+        assert!(tools().allowed(false, "t", "x"));
+        let mut t = tools();
+        t.approve = |_, _| false;
+        assert!(!t.allowed(true, "t", "x"), "a paid request the user declines doesn't run");
+        t.approve = |_, _| true;
+        assert!(t.allowed(true, "t", "x"));
     }
 
     #[test]
