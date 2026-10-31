@@ -277,6 +277,32 @@ async fn nai_upscale_batch(
     .await
 }
 
+// The project's `wildcards` folder, where prompt files live by default. Its
+// path is fixed when the app is built: this is a single-user tool built from
+// its own project folder. Created if it's missing.
+fn wildcards_path() -> Result<std::path::PathBuf, String> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("the project folder isn't known")?
+        .join("wildcards");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+#[tauri::command]
+fn wildcards_dir() -> Result<String, String> {
+    Ok(wildcards_path()?.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn open_wildcards_dir() -> Result<(), String> {
+    std::process::Command::new("explorer.exe")
+        .arg(wildcards_path()?)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("couldn't open Explorer: {e}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -307,7 +333,9 @@ pub fn run() {
             nai_read_prompt_file,
             nai_read_vibe_file,
             nai_scan_upscale,
-            nai_upscale_batch
+            nai_upscale_batch,
+            wildcards_dir,
+            open_wildcards_dir
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
