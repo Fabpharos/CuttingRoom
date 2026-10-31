@@ -228,6 +228,10 @@ pub struct GenerateRequest {
     /// Each character's undesired content, by position; missing ones are empty.
     #[serde(default)]
     pub character_negatives: Vec<String>,
+    /// Where each character goes, lined up with `characters`; missing ones
+    /// are centred. None leaves placement to the model ("AI's choice").
+    #[serde(default)]
+    pub character_positions: Option<Vec<CharacterPosition>>,
     pub width: u32,
     pub height: u32,
     pub steps: u32,
@@ -255,6 +259,52 @@ struct ImageGenerationJsonResponse {
     images: Vec<ImageJson>,
 }
 
+/// Where a character sits, as fractions of the image's width and height
+/// from its top-left corner.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq)]
+pub struct CharacterPosition {
+    pub x: f64,
+    pub y: f64,
+}
+
+const CENTER: CharacterPosition = CharacterPosition { x: 0.5, y: 0.5 };
+
+/// V5 places characters anywhere, and even a lone character; V4 and V4.5
+/// snap to a 5x5 grid and only place characters when there are two or more.
+/// Both rules are NovelAI's web client's.
+pub fn free_character_positions(model: &str) -> bool {
+    model.starts_with("nai-diffusion-5")
+}
+
+/// The nearest point on NovelAI's 5x5 grid: 0.1, 0.3, 0.5, 0.7 or 0.9.
+pub fn snap_to_grid(v: f64) -> f64 {
+    let k = ((v - 0.1) / 0.2).round().clamp(0.0, 4.0);
+    ((0.1 + 0.2 * k) * 10.0).round() / 10.0
+}
+
+/// A grid position's name as NovelAI's site shows it: column letter A-E,
+/// row number 1-5 (C3 is the centre).
+pub fn grid_label(p: CharacterPosition) -> String {
+    let index = |v: f64| (((snap_to_grid(v) - 0.1) / 0.2).round() as u8).min(4);
+    format!("{}{}", (b'A' + index(p.x)) as char, index(p.y) + 1)
+}
+
+/// What a position becomes for `model`: snapped to the grid on V4 and V4.5,
+/// rounded to 0.001 (as NovelAI's site places them) on V5.
+pub fn position_for_model(model: &str, p: CharacterPosition) -> CharacterPosition {
+    if free_character_positions(model) {
+        let r = |v: f64| (v * 1000.0).round() / 1000.0;
+        CharacterPosition { x: r(p.x), y: r(p.y) }
+    } else {
+        CharacterPosition { x: snap_to_grid(p.x), y: snap_to_grid(p.y) }
+    }
+}
+
+/// Whether positions are used for `count` characters on `model`.
+pub fn positions_apply(model: &str, count: usize) -> bool {
+    count >= 2 || (count == 1 && free_character_positions(model))
+}
+
 fn build_body(req: &GenerateRequest, vibes: &[ResolvedVibe]) -> Result<serde_json::Value, String> {
     if !ALLOWED_SIZES.contains(&(req.width, req.height)) {
         return Err(format!(
@@ -280,29 +330,42 @@ fn request_body(req: &GenerateRequest, vibes: &[ResolvedVibe]) -> Result<serde_j
     if !(0.0..=MAX_GUIDANCE).contains(&req.scale) || req.scale.is_nan() {
         return Err(format!("Guidance must be between 0 and {MAX_GUIDANCE}."));
     }
-    // A character left blank is dropped together with its undesired content,
-    // so the two lists stay lined up.
-    let characters: Vec<(&str, &str)> = req
+    if let Some(positions) = &req.character_positions {
+        if positions.iter().any(|p| !(0.0..=1.0).contains(&p.x) || !(0.0..=1.0).contains(&p.y)) {
+            return Err("Character positions must be between 0 and 1.".into());
+        }
+    }
+    // A character left blank is dropped together with its undesired content
+    // and position, so the lists stay lined up.
+    let characters: Vec<(&str, &str, CharacterPosition)> = req
         .characters
         .iter()
         .enumerate()
-        .map(|(i, c)| (c.trim(), req.character_negatives.get(i).map_or("", |n| n.trim())))
-        .filter(|(c, _)| !c.is_empty())
+        .map(|(i, c)| {
+            let uc = req.character_negatives.get(i).map_or("", |n| n.trim());
+            let at = req.character_positions.as_ref().and_then(|p| p.get(i)).copied().unwrap_or(CENTER);
+            (c.trim(), uc, at)
+        })
+        .filter(|(c, _, _)| !c.is_empty())
         .collect();
     if characters.len() > MAX_CHARACTERS {
         return Err(format!("At most {MAX_CHARACTERS} character prompts are allowed."));
     }
 
-    // Character positions are left to the model (use_coords: false); the
-    // center is still required by the schema.
-    let center = json!([{ "x": 0.5, "y": 0.5 }]);
+    // Without positions the model places everyone (use_coords: false); the
+    // centre is still required by the schema.
+    let use_coords = req.character_positions.is_some() && positions_apply(&req.model, characters.len());
+    let center = |p: CharacterPosition| {
+        let p = if use_coords { position_for_model(&req.model, p) } else { CENTER };
+        json!([{ "x": p.x, "y": p.y }])
+    };
     let char_captions: Vec<_> = characters
         .iter()
-        .map(|(c, _)| json!({ "char_caption": c, "centers": center }))
+        .map(|(c, _, at)| json!({ "char_caption": c, "centers": center(*at) }))
         .collect();
     let neg_char_captions: Vec<_> = characters
         .iter()
-        .map(|(_, uc)| json!({ "char_caption": uc, "centers": center }))
+        .map(|(_, uc, at)| json!({ "char_caption": uc, "centers": center(*at) }))
         .collect();
 
     let mut parameters = json!({
@@ -321,7 +384,7 @@ fn request_body(req: &GenerateRequest, vibes: &[ResolvedVibe]) -> Result<serde_j
         "qualityToggle": false,
         "v4_prompt": {
             "caption": { "base_caption": req.prompt, "char_captions": char_captions },
-            "use_coords": false,
+            "use_coords": use_coords,
             "use_order": true,
         },
         "v4_negative_prompt": {
@@ -622,6 +685,8 @@ pub struct ImportedSettings {
     pub characters: Vec<String>,
     /// Lined up with `characters`; empty where the image had none.
     pub character_negatives: Vec<String>,
+    /// Set when the image placed its characters itself.
+    pub character_positions: Option<Vec<CharacterPosition>>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub steps: Option<u32>,
@@ -737,21 +802,31 @@ fn parse_settings(chunks: &[(String, String)]) -> Result<ImportedSettings, Strin
     let negative_prompt = str_at(caption("v4_negative_prompt").and_then(|cap| cap.get("base_caption")))
         .or_else(|| str_at(c.get("uc")))
         .unwrap_or_default();
-    let char_captions = |key: &str| {
+    let char_entries = |key: &str| {
         caption(key)
             .and_then(|cap| cap.get("char_captions"))
             .and_then(|cc| cc.as_array())
-            .map(|arr| arr.iter().map(|ch| ch.get("char_caption").and_then(|s| s.as_str())).collect::<Vec<_>>())
+            .cloned()
             .unwrap_or_default()
     };
     // Each character's undesired content sits at the same position in
     // v4_negative_prompt.
-    let negatives = char_captions("v4_negative_prompt");
-    let (characters, character_negatives): (Vec<String>, Vec<String>) = char_captions("v4_prompt")
-        .into_iter()
-        .enumerate()
-        .filter_map(|(i, c)| Some((c?.to_string(), negatives.get(i).copied().flatten().unwrap_or("").to_string())))
-        .unzip();
+    let negatives = char_entries("v4_negative_prompt");
+    let mut characters = Vec::new();
+    let mut character_negatives = Vec::new();
+    let mut positions = Vec::new();
+    for (i, ch) in char_entries("v4_prompt").iter().enumerate() {
+        let Some(text) = ch.get("char_caption").and_then(|s| s.as_str()) else { continue };
+        characters.push(text.to_string());
+        character_negatives.push(
+            negatives.get(i).and_then(|n| n.get("char_caption")).and_then(|s| s.as_str()).unwrap_or("").to_string(),
+        );
+        let at = ch.get("centers").and_then(|c| c.get(0));
+        let coord = |k: &str| at.and_then(|a| a.get(k)).and_then(|v| v.as_f64()).filter(|v| (0.0..=1.0).contains(v));
+        positions.push(CharacterPosition { x: coord("x").unwrap_or(0.5), y: coord("y").unwrap_or(0.5) });
+    }
+    let placed = c.get("v4_prompt").and_then(|v| v.get("use_coords")).and_then(|v| v.as_bool()) == Some(true);
+    let character_positions = (placed && !characters.is_empty()).then_some(positions);
 
     let num = |key: &str| c.get(key).and_then(|v| v.as_f64());
     let source = get("Source").map(str::to_string);
@@ -760,6 +835,7 @@ fn parse_settings(chunks: &[(String, String)]) -> Result<ImportedSettings, Strin
         negative_prompt,
         characters,
         character_negatives,
+        character_positions,
         width: num("width").map(|v| v as u32),
         height: num("height").map(|v| v as u32),
         steps: num("steps").map(|v| v as u32),
@@ -1386,6 +1462,7 @@ mod tests {
             negative_prompt: "lowres".into(),
             characters: characters.iter().map(|c| c.to_string()).collect(),
             character_negatives: vec![],
+            character_positions: None,
             width,
             height,
             steps: 28,
@@ -1482,6 +1559,69 @@ mod tests {
         assert_eq!(caps("v4_prompt"), vec!["girl, red hair", "boy, glasses"]);
         // The third character had none: sent empty.
         assert_eq!(caps("v4_negative_prompt"), vec!["blue hair", ""]);
+    }
+
+    fn centers_of(body: &serde_json::Value, key: &str) -> Vec<(f64, f64)> {
+        body["parameters"][key]["caption"]["char_captions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["centers"][0]["x"].as_f64().unwrap(), c["centers"][0]["y"].as_f64().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn leaves_placement_to_the_model_by_default() {
+        let body = body_of(&request("nai-diffusion-5-full", 832, 1216, &["a", "b"])).unwrap();
+        assert_eq!(body["parameters"]["v4_prompt"]["use_coords"], false);
+        assert_eq!(centers_of(&body, "v4_prompt"), vec![(0.5, 0.5), (0.5, 0.5)]);
+    }
+
+    #[test]
+    fn places_characters_anywhere_on_v5_even_alone() {
+        let mut req = request("nai-diffusion-5-full", 832, 1216, &["girl"]);
+        req.character_positions = Some(vec![CharacterPosition { x: 0.12345, y: 0.8 }]);
+        let body = body_of(&req).unwrap();
+        assert_eq!(body["parameters"]["v4_prompt"]["use_coords"], true);
+        assert_eq!(centers_of(&body, "v4_prompt"), vec![(0.123, 0.8)]);
+        // Undesired content carries the same centre.
+        assert_eq!(centers_of(&body, "v4_negative_prompt"), vec![(0.123, 0.8)]);
+    }
+
+    #[test]
+    fn snaps_to_the_grid_on_v4_and_needs_two_characters() {
+        let mut req = request("nai-diffusion-4-5-full", 832, 1216, &["girl", " ", "boy"]);
+        req.character_positions = Some(vec![
+            CharacterPosition { x: 0.04, y: 0.62 },
+            CharacterPosition { x: 0.9, y: 0.9 }, // dropped with its blank character
+            CharacterPosition { x: 0.81, y: 0.33 },
+        ]);
+        let body = body_of(&req).unwrap();
+        assert_eq!(body["parameters"]["v4_prompt"]["use_coords"], true);
+        assert_eq!(centers_of(&body, "v4_prompt"), vec![(0.1, 0.7), (0.9, 0.3)]);
+
+        // A lone character can't be placed on V4.5: the model decides.
+        let mut one = request("nai-diffusion-4-5-full", 832, 1216, &["girl"]);
+        one.character_positions = Some(vec![CharacterPosition { x: 0.1, y: 0.1 }]);
+        let body = body_of(&one).unwrap();
+        assert_eq!(body["parameters"]["v4_prompt"]["use_coords"], false);
+        assert_eq!(centers_of(&body, "v4_prompt"), vec![(0.5, 0.5)]);
+
+        // Missing positions are centred; out-of-range ones are refused.
+        let mut short = request("nai-diffusion-4-full", 832, 1216, &["a", "b"]);
+        short.character_positions = Some(vec![CharacterPosition { x: 0.3, y: 0.3 }]);
+        assert_eq!(centers_of(&body_of(&short).unwrap(), "v4_prompt"), vec![(0.3, 0.3), (0.5, 0.5)]);
+        short.character_positions = Some(vec![CharacterPosition { x: 1.2, y: 0.3 }]);
+        assert!(body_of(&short).is_err());
+    }
+
+    #[test]
+    fn names_grid_cells_like_novelais_site() {
+        assert_eq!(grid_label(CharacterPosition { x: 0.5, y: 0.5 }), "C3");
+        assert_eq!(grid_label(CharacterPosition { x: 0.0, y: 1.0 }), "A5");
+        assert_eq!(grid_label(CharacterPosition { x: 0.71, y: 0.29 }), "D2");
+        assert_eq!(snap_to_grid(0.2), 0.3);
+        assert_eq!(snap_to_grid(0.19), 0.1);
     }
 
     #[test]
@@ -1591,6 +1731,18 @@ mod tests {
         assert_eq!((s.width, s.height), (Some(832), Some(1216)));
         assert_eq!((s.steps, s.scale, s.seed), (Some(23), Some(7.0), Some(3216798432)));
         assert_eq!(s.model.as_deref(), Some("nai-diffusion-5-curated"));
+    }
+
+    #[test]
+    fn reads_character_positions_when_the_image_placed_them() {
+        let png = png_with(&[text_chunk("Software", "NovelAI"), text_chunk("Comment", V5_COMMENT)]);
+        assert_eq!(parse_settings(&png_text_chunks(&png).unwrap()).unwrap().character_positions, None);
+        let placed = V5_COMMENT
+            .replace(r#""use_coords": false"#, r#""use_coords": true"#)
+            .replacen(r#""centers": [{"x": 0.5, "y": 0.5}]"#, r#""centers": [{"x": 0.3, "y": 0.7}]"#, 1);
+        let png = png_with(&[text_chunk("Software", "NovelAI"), text_chunk("Comment", &placed)]);
+        let s = parse_settings(&png_text_chunks(&png).unwrap()).unwrap();
+        assert_eq!(s.character_positions, Some(vec![CharacterPosition { x: 0.3, y: 0.7 }]));
     }
 
     #[test]

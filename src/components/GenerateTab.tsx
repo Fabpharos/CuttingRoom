@@ -24,6 +24,12 @@ import {
   MAX_BATCH,
   MAX_VIBES,
   DEFAULT_VIBE_STRENGTH,
+  CENTER,
+  freeCharacterPositions,
+  positionsApply,
+  positionForModel,
+  gridLabel,
+  type CharacterPosition,
   type AccountStatus,
   type GenerateRequest,
   type ImportPlan,
@@ -182,6 +188,103 @@ function TokenPreview({ text }: { text: string }) {
   );
 }
 
+// A small board for placing one character, shaped like the image. Other
+// characters show faintly for reference. On V4 and V4.5 it shows NovelAI's
+// 5x5 grid and places on it.
+function PositionPicker({
+  index,
+  positions,
+  model,
+  aspect,
+  disabled,
+  onChange,
+}: {
+  index: number;
+  positions: CharacterPosition[];
+  model: string;
+  aspect: number;
+  disabled: boolean;
+  onChange: (p: CharacterPosition) => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const free = freeCharacterPositions(model);
+  const width = aspect >= 1 ? 84 : Math.round(84 * aspect);
+  const height = aspect >= 1 ? Math.round(84 / aspect) : 84;
+  function place(e: React.PointerEvent) {
+    const r = ref.current?.getBoundingClientRect();
+    if (!r || disabled) return;
+    const clamp = (v: number) => Math.min(1, Math.max(0, v));
+    onChange(positionForModel(model, { x: clamp((e.clientX - r.left) / r.width), y: clamp((e.clientY - r.top) / r.height) }));
+  }
+  const shown = (p: CharacterPosition) => positionForModel(model, p);
+  const own = shown(positions[index] ?? CENTER);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3, flexShrink: 0 }}>
+      <div
+        ref={ref}
+        role="slider"
+        aria-label={`Position of character ${index + 1}`}
+        title="Click or drag to place this character"
+        onPointerDown={(e) => {
+          e.currentTarget.setPointerCapture(e.pointerId);
+          place(e);
+        }}
+        onPointerMove={(e) => {
+          if (e.buttons === 1) place(e);
+        }}
+        style={{
+          position: "relative",
+          width,
+          height,
+          borderRadius: 6,
+          border: "1px solid var(--border)",
+          background: "var(--bg-page)",
+          cursor: disabled ? "default" : "crosshair",
+          opacity: disabled ? 0.6 : 1,
+          touchAction: "none",
+          backgroundImage: free
+            ? "none"
+            : "linear-gradient(var(--border) 1px, transparent 1px), linear-gradient(90deg, var(--border) 1px, transparent 1px)",
+          backgroundSize: free ? undefined : `${width / 5}px ${height / 5}px`,
+        }}
+      >
+        {positions.map((p, j) => {
+          const at = shown(p);
+          const mine = j === index;
+          return (
+            <span
+              key={j}
+              style={{
+                position: "absolute",
+                left: `${at.x * 100}%`,
+                top: `${at.y * 100}%`,
+                transform: "translate(-50%, -50%)",
+                width: mine ? 16 : 11,
+                height: mine ? 16 : 11,
+                borderRadius: "50%",
+                background: mine ? "var(--accent)" : "var(--muted)",
+                color: mine ? "var(--accent-contrast)" : "var(--bg-card)",
+                opacity: mine ? 1 : 0.45,
+                fontSize: mine ? 10 : 7,
+                fontWeight: 700,
+                lineHeight: mine ? "16px" : "11px",
+                textAlign: "center",
+                pointerEvents: "none",
+                zIndex: mine ? 1 : 0,
+              }}
+            >
+              {j + 1}
+            </span>
+          );
+        })}
+      </div>
+      <span style={{ fontSize: 10.5, fontFamily: "'IBM Plex Mono', monospace", color: "var(--muted)" }}>
+        {free ? `${Math.round(own.x * 100)}%, ${Math.round(own.y * 100)}%` : gridLabel(own)}
+      </span>
+    </div>
+  );
+}
+
 const textareaStyle: React.CSSProperties = {
   padding: "8px 10px",
   borderRadius: 8,
@@ -270,6 +373,9 @@ export default function GenerateTab({ active }: { active: boolean }) {
   const [characters, setCharacters] = useState<string[]>([]);
   // Each character's undesired content, kept the same length as `characters`.
   const [characterNegatives, setCharacterNegatives] = useState<string[]>([]);
+  // "Custom" placement, and each character's position (kept the same length).
+  const [useCoords, setUseCoords] = useState(false);
+  const [characterPositions, setCharacterPositions] = useState<CharacterPosition[]>([]);
   const [steps, setSteps] = useState(DEFAULT_STEPS);
   const [scale, setScale] = useState(DEFAULT_SCALE);
   const [outputDir, setOutputDir] = useState<string | null>(null);
@@ -305,6 +411,8 @@ export default function GenerateTab({ active }: { active: boolean }) {
         setOutputDir(s.outputDir);
         setCharacters(s.characters);
         setCharacterNegatives(s.characterNegatives);
+        setUseCoords(s.useCoords);
+        setCharacterPositions(s.characterPositions);
         if (s.vibes.length > 0) setVibes(await loadVibeEntries(s.vibes));
         // A file that can't be read now stays listed with its error.
         setPromptFiles(await Promise.all(s.promptFiles.map((f) => openPromptFile(f.path, f.name, f.mode))));
@@ -328,6 +436,8 @@ export default function GenerateTab({ active }: { active: boolean }) {
         negativePrompt,
         characters,
         characterNegatives,
+        useCoords,
+        characterPositions,
         steps,
         scale,
         count,
@@ -351,6 +461,8 @@ export default function GenerateTab({ active }: { active: boolean }) {
     negativePrompt,
     characters,
     characterNegatives,
+    useCoords,
+    characterPositions,
     steps,
     scale,
     count,
@@ -487,6 +599,8 @@ export default function GenerateTab({ active }: { active: boolean }) {
     setNegativePrompt(v.negativePrompt);
     setCharacters(v.characters);
     setCharacterNegatives(v.characterNegatives);
+    setUseCoords(v.characterPositions !== null);
+    setCharacterPositions(v.characterPositions ?? v.characters.map(() => CENTER));
     setImportPlan(null);
   }
 
@@ -572,6 +686,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
         negativePrompt: fillTokens(negativePrompt, values),
         characters: characters.map((c) => fillTokens(c, values)),
         characterNegatives: characterNegatives.map((c) => fillTokens(c, values)),
+        characterPositions: useCoords ? characterPositions : null,
         width: size.width,
         height: size.height,
         steps: effectiveSteps,
@@ -713,11 +828,13 @@ export default function GenerateTab({ active }: { active: boolean }) {
   function addCharacter() {
     setCharacters((prev) => [...prev, ""]);
     setCharacterNegatives((prev) => [...prev, ""]);
+    setCharacterPositions((prev) => [...prev, CENTER]);
   }
 
   function removeCharacter(index: number) {
     setCharacters((prev) => prev.filter((_, j) => j !== index));
     setCharacterNegatives((prev) => prev.filter((_, j) => j !== index));
+    setCharacterPositions((prev) => prev.filter((_, j) => j !== index));
     if (typeof lastFieldRef.current?.field === "object") lastFieldRef.current = null;
   }
 
@@ -1071,6 +1188,42 @@ export default function GenerateTab({ active }: { active: boolean }) {
           </Field>
 
           <Field label={`Characters (${characters.length}/${MAX_CHARACTERS})`}>
+            {characters.length > 0 && (
+              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", fontSize: 12.5 }}>
+                <span style={{ color: "var(--muted)", fontWeight: 600, fontSize: 12 }}>Placement</span>
+                <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: 7, overflow: "hidden" }}>
+                  {([false, true] as const).map((custom) => (
+                    <button
+                      key={String(custom)}
+                      onClick={() => setUseCoords(custom)}
+                      disabled={generating}
+                      style={{
+                        padding: "3px 10px",
+                        border: "none",
+                        background: useCoords === custom ? "var(--accent)" : "transparent",
+                        color: useCoords === custom ? "var(--accent-contrast)" : "var(--text)",
+                        fontFamily: "'Space Grotesk', sans-serif",
+                        fontWeight: 600,
+                        fontSize: 12,
+                        cursor: "pointer",
+                      }}
+                    >
+                      {custom ? "Custom" : "AI's choice"}
+                    </button>
+                  ))}
+                </div>
+                {useCoords && !positionsApply(model, characters.filter((c) => c.trim() !== "").length) && (
+                  <span style={{ color: "rgb(200,140,40)", fontFamily: "system-ui, sans-serif" }}>
+                    V4 and V4.5 place characters only when there are two or more; until then the model decides.
+                  </span>
+                )}
+                {useCoords && positionsApply(model, characters.filter((c) => c.trim() !== "").length) && (
+                  <span style={{ color: "var(--muted)", fontFamily: "system-ui, sans-serif" }}>
+                    {freeCharacterPositions(model) ? "V5: place anywhere." : "V4/V4.5: snaps to NovelAI's 5×5 grid."}
+                  </span>
+                )}
+              </div>
+            )}
             {characters.map((c, i) => (
               <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
                 <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 4 }}>
@@ -1103,6 +1256,16 @@ export default function GenerateTab({ active }: { active: boolean }) {
                   />
                   {preview(characterNegatives[i] ?? "")}
                 </div>
+                {useCoords && (
+                  <PositionPicker
+                    index={i}
+                    positions={characterPositions}
+                    model={model}
+                    aspect={SIZES[sizeIndex].width / SIZES[sizeIndex].height}
+                    disabled={generating}
+                    onChange={(p) => setCharacterPositions((prev) => prev.map((q, j) => (j === i ? p : q)))}
+                  />
+                )}
                 <button
                   onClick={() => removeCharacter(i)}
                   disabled={generating}

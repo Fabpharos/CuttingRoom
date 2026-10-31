@@ -5,6 +5,9 @@
 use crate::protocol::{ToolResult, Tools};
 use base64::Engine;
 use novelai_core::{
+    free_character_positions, grid_label, position_for_model, positions_apply, CharacterPosition,
+};
+use novelai_core::{
     scan_for_upscale, upscale_batch, upscaled_stem, UpscaleCandidate, UPSCALE_COST,
 };
 use novelai_core::{
@@ -45,6 +48,8 @@ pub struct GenerateArgs {
     pub characters: Vec<String>,
     /// Lined up with `characters`; empty where none was given.
     pub character_negatives: Vec<String>,
+    /// Lined up with `characters`; None lets the model place them.
+    pub character_positions: Option<Vec<CharacterPosition>>,
     pub model: String,
     pub size: &'static str,
     pub width: u32,
@@ -171,13 +176,43 @@ pub fn parse_generate_args(args: &Value) -> Result<GenerateArgs, String> {
     if raw_negatives.len() > raw_characters.len() {
         return Err("`character_negatives` has more entries than `characters`; give one per character, in the same order.".into());
     }
-    // Blank characters are dropped together with their undesired content.
-    let (characters, character_negatives): (Vec<String>, Vec<String>) = raw_characters
-        .into_iter()
-        .enumerate()
-        .filter(|(_, c)| !c.is_empty())
-        .map(|(i, c)| (c, raw_negatives.get(i).cloned().unwrap_or_default()))
-        .unzip();
+    let raw_positions: Option<Vec<Option<CharacterPosition>>> = match args.get("character_positions") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(items)) if items.is_empty() => None,
+        Some(Value::Array(items)) => Some(
+            items
+                .iter()
+                .map(|item| match item {
+                    Value::Null => Ok(None),
+                    v => serde_json::from_value::<CharacterPosition>(v.clone())
+                        .ok()
+                        .filter(|p| (0.0..=1.0).contains(&p.x) && (0.0..=1.0).contains(&p.y))
+                        .map(Some)
+                        .ok_or_else(|| {
+                            "Each entry in `character_positions` must be {\"x\", \"y\"} with both from 0 to 1, or null.".to_string()
+                        }),
+                })
+                .collect::<Result<_, _>>()?,
+        ),
+        Some(_) => return Err("`character_positions` must be a list.".into()),
+    };
+    if raw_positions.as_ref().is_some_and(|p| p.len() > raw_characters.len()) {
+        return Err("`character_positions` has more entries than `characters`; give one per character, in the same order.".into());
+    }
+    // Blank characters are dropped together with their undesired content and position.
+    let mut characters = Vec::new();
+    let mut character_negatives = Vec::new();
+    let mut positions = Vec::new();
+    for (i, c) in raw_characters.into_iter().enumerate() {
+        if c.is_empty() {
+            continue;
+        }
+        characters.push(c);
+        character_negatives.push(raw_negatives.get(i).cloned().unwrap_or_default());
+        let at = raw_positions.as_ref().and_then(|p| p.get(i).copied().flatten());
+        positions.push(at.unwrap_or(CharacterPosition { x: 0.5, y: 0.5 }));
+    }
+    let character_positions = raw_positions.map(|_| positions);
     if characters.len() > MAX_CHARACTERS {
         return Err(format!("At most {MAX_CHARACTERS} character prompts are allowed."));
     }
@@ -216,6 +251,7 @@ pub fn parse_generate_args(args: &Value) -> Result<GenerateArgs, String> {
         negative_prompt: text("negative_prompt"),
         characters,
         character_negatives,
+        character_positions,
         model,
         size,
         width,
@@ -368,10 +404,22 @@ fn clip(s: &str) -> String {
     }
 }
 
-fn characters_text(characters: &[String], negatives: &[String]) -> String {
+fn characters_text(model: &str, characters: &[String], negatives: &[String], positions: &Option<Vec<CharacterPosition>>) -> String {
     let mut t = String::new();
+    let placed = positions.as_ref().filter(|_| positions_apply(model, characters.len()));
+    if positions.is_some() && placed.is_none() {
+        t += "Character positions: not used (V4 and V4.5 place characters only when there are two or more).\n\n";
+    }
     for (i, c) in characters.iter().enumerate() {
-        t += &format!("Character {}:\n{}\n", i + 1, clip(c));
+        let at = placed.and_then(|p| p.get(i)).map(|&p| {
+            let p = position_for_model(model, p);
+            if free_character_positions(model) {
+                format!(" (at x {:.3}, y {:.3})", p.x, p.y)
+            } else {
+                format!(" (at {})", grid_label(p))
+            }
+        });
+        t += &format!("Character {}{}:\n{}\n", i + 1, at.unwrap_or_default(), clip(c));
         if let Some(uc) = negatives.get(i).filter(|n| !n.is_empty()) {
             t += &format!("Character {} undesired:\n{}\n", i + 1, clip(uc));
         }
@@ -392,7 +440,7 @@ pub fn approval_text(a: &GenerateArgs, vibes: &[PreparedVibe], save_to: &str, co
     if !a.negative_prompt.is_empty() {
         t += &format!("Undesired content:\n{}\n\n", clip(&a.negative_prompt));
     }
-    t += &characters_text(&a.characters, &a.character_negatives);
+    t += &characters_text(&a.model, &a.characters, &a.character_negatives, &a.character_positions);
     if !vibes.is_empty() {
         t += "Vibes (already encoded, no Anlas):\n";
         for v in vibes {
@@ -585,7 +633,7 @@ pub fn inpaint_approval_text(a: &InpaintArgs, plan: &InpaintPlan, inpaint_model:
     if !g.negative_prompt.is_empty() {
         t += &format!("Undesired content:\n{}\n\n", clip(&g.negative_prompt));
     }
-    t += &characters_text(&g.characters, &g.character_negatives);
+    t += &characters_text(inpaint_model, &g.characters, &g.character_negatives, &g.character_positions);
     t += &format!(
         "Save to: {} (as {}.png; the original isn't changed)\n\n",
         clip(save_to),
@@ -774,6 +822,7 @@ impl NovelAiTools {
             negative_prompt: g.negative_prompt.clone(),
             characters: g.characters.clone(),
             character_negatives: g.character_negatives.clone(),
+            character_positions: g.character_positions.clone(),
             steps: g.steps,
             scale: g.guidance,
             seed,
@@ -856,6 +905,7 @@ impl NovelAiTools {
             negative_prompt: a.negative_prompt.clone(),
             characters: a.characters.clone(),
             character_negatives: a.character_negatives.clone(),
+            character_positions: a.character_positions.clone(),
             width: a.width,
             height: a.height,
             steps: a.steps,
@@ -945,6 +995,16 @@ impl Tools for NovelAiTools {
                         "character_negatives": {
                             "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS,
                             "description": "Undesired content for each character, in the same order as `characters` (use \"\" to skip one)."
+                        },
+                        "character_positions": {
+                            "type": "array", "maxItems": MAX_CHARACTERS,
+                            "items": { "anyOf": [
+                                { "type": "object", "properties": { "x": { "type": "number", "minimum": 0, "maximum": 1 },
+                                                                    "y": { "type": "number", "minimum": 0, "maximum": 1 } },
+                                  "required": ["x", "y"], "additionalProperties": false },
+                                { "type": "null" }
+                            ] },
+                            "description": "Where each character goes, in the same order as `characters`: x and y as fractions of the image from the top-left (0.5, 0.5 is the centre); null centres one. Omit to let the model place them. V5 places them anywhere, even a single character; V4 and V4.5 snap to a 5x5 grid (0.1, 0.3, 0.5, 0.7, 0.9) and only place characters when there are two or more."
                         },
                         "model": { "type": "string", "enum": MODELS, "default": DEFAULT_MODEL },
                         "size": { "type": "string", "enum": ["portrait", "landscape", "square"], "default": "portrait",
@@ -1085,6 +1145,16 @@ impl Tools for NovelAiTools {
                             "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS,
                             "description": "Undesired content for each character, in the same order as `characters` (use \"\" to skip one)."
                         },
+                        "character_positions": {
+                            "type": "array", "maxItems": MAX_CHARACTERS,
+                            "items": { "anyOf": [
+                                { "type": "object", "properties": { "x": { "type": "number", "minimum": 0, "maximum": 1 },
+                                                                    "y": { "type": "number", "minimum": 0, "maximum": 1 } },
+                                  "required": ["x", "y"], "additionalProperties": false },
+                                { "type": "null" }
+                            ] },
+                            "description": "Where each character goes, in the same order as `characters`: x and y as fractions of the crop from the top-left (0.5, 0.5 is the centre); null centres one. Omit to let the model place them. V5 places them anywhere, even a single character; V4 and V4.5 snap to a 5x5 grid (0.1, 0.3, 0.5, 0.7, 0.9) and only place characters when there are two or more."
+                        },
                         "model": { "type": "string", "enum": MODELS, "default": DEFAULT_MODEL,
                                    "description": "Its inpainting version is used (V5 Curated uses V4.5 Curated's, as on NovelAI's site)." },
                         "strength": { "type": "number", "minimum": 0.01, "maximum": 1, "default": 1,
@@ -1202,6 +1272,39 @@ mod tests {
         assert!(!t.contains("Character 2 undesired"), "{t}");
         assert!(parse_generate_args(&json!({ "prompt": "x", "characters": ["a"], "character_negatives": ["b", "c"] })).is_err());
         assert!(parse_generate_args(&json!({ "prompt": "x", "character_negatives": "b" })).is_err());
+    }
+
+    #[test]
+    fn places_characters_and_shows_where_in_the_dialog() {
+        let a = parse_generate_args(&json!({
+            "prompt": "x", "model": "nai-diffusion-5-full",
+            "characters": ["girl", " ", "boy"],
+            "character_positions": [{ "x": 0.25, "y": 0.75 }, { "x": 0.9, "y": 0.1 }, null]
+        }))
+        .unwrap();
+        // The blank character's position goes with it; null is centred.
+        assert_eq!(
+            a.character_positions,
+            Some(vec![CharacterPosition { x: 0.25, y: 0.75 }, CharacterPosition { x: 0.5, y: 0.5 }])
+        );
+        let t = approval_text(&a, &[], "C:\\out", "Free.");
+        assert!(t.contains("Character 1 (at x 0.250, y 0.750):") && t.contains("Character 2 (at x 0.500, y 0.500):"), "{t}");
+
+        // V4.5 shows grid cells, and says when positions can't apply.
+        let g = parse_generate_args(&json!({ "prompt": "x", "characters": ["a", "b"], "character_positions": [{ "x": 0.1, "y": 0.9 }] })).unwrap();
+        assert!(approval_text(&g, &[], "C:\\out", "Free.").contains("Character 1 (at A5):"));
+        let one = parse_generate_args(&json!({ "prompt": "x", "characters": ["a"], "character_positions": [{ "x": 0.1, "y": 0.9 }] })).unwrap();
+        assert!(approval_text(&one, &[], "C:\\out", "Free.").contains("not used"));
+
+        assert_eq!(parse_generate_args(&json!({ "prompt": "x", "characters": ["a"] })).unwrap().character_positions, None);
+        for bad in [
+            json!({ "prompt": "x", "characters": ["a"], "character_positions": [{ "x": 1.5, "y": 0 }] }),
+            json!({ "prompt": "x", "characters": ["a"], "character_positions": [{ "x": 0.5 }] }),
+            json!({ "prompt": "x", "characters": ["a"], "character_positions": [null, null] }),
+            json!({ "prompt": "x", "characters": ["a"], "character_positions": "C3" }),
+        ] {
+            assert!(parse_generate_args(&bad).is_err(), "accepted {bad}");
+        }
     }
 
     #[test]

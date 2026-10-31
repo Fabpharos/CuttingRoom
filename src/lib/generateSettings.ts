@@ -10,6 +10,8 @@ import {
   DEFAULT_VIBE_STRENGTH,
   DEFAULT_STEPS,
   DEFAULT_SCALE,
+  CENTER,
+  type CharacterPosition,
 } from "./novelai";
 import type { PromptFileMode } from "./promptFile";
 import { fileTokenName, isValidTokenName, tokenFor } from "./promptTokens";
@@ -43,6 +45,10 @@ export type GenerateSettings = {
   characters: string[];
   /** Each character's undesired content, the same length as `characters`. */
   characterNegatives: string[];
+  /** On: characters go where `characterPositions` says ("Custom"); off: "AI's choice". */
+  useCoords: boolean;
+  /** Each character's position, the same length as `characters`. */
+  characterPositions: CharacterPosition[];
   steps: number;
   scale: number;
   count: number;
@@ -58,6 +64,8 @@ export const DEFAULT_SETTINGS: GenerateSettings = {
   negativePrompt: "",
   characters: [],
   characterNegatives: [],
+  useCoords: false,
+  characterPositions: [],
   steps: DEFAULT_STEPS,
   scale: DEFAULT_SCALE,
   count: 1,
@@ -168,6 +176,11 @@ function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy
         ? (raw.characterNegatives[i] as string)
         : "",
     ),
+    useCoords: raw.useCoords === true,
+    characterPositions: characters.map((_, i) => {
+      const p = Array.isArray(raw.characterPositions) ? (raw.characterPositions[i] as Record<string, unknown> | null) : null;
+      return p && typeof p === "object" ? { x: clamp(p.x, 0, 1, 0.5), y: clamp(p.y, 0, 1, 0.5) } : CENTER;
+    }),
     steps: Math.round(clamp(raw.steps, 1, MAX_STEPS, d.steps)),
     scale: clamp(raw.scale, 0, MAX_SCALE, d.scale),
     count: Math.round(clamp(raw.count, 1, MAX_BATCH, d.count)),

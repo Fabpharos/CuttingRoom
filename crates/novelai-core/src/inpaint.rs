@@ -570,6 +570,8 @@ pub struct InpaintSettings {
     pub characters: Vec<String>,
     /// Each character's undesired content, by position.
     pub character_negatives: Vec<String>,
+    /// Where each character goes within the crop; None lets the model decide.
+    pub character_positions: Option<Vec<CharacterPosition>>,
     pub steps: u32,
     pub scale: f64,
     pub seed: u32,
@@ -592,6 +594,15 @@ fn inpaint_body(plan: &InpaintPlan, s: &InpaintSettings, prepared: &Prepared) ->
         negative_prompt: s.negative_prompt.clone(),
         characters: s.characters.clone(),
         character_negatives: s.character_negatives.clone(),
+        character_positions: match &s.character_positions {
+            // V5 Curated inpaints with V4.5 Curated's model, so it follows the grid rules.
+            Some(p) if !inpaint_model.starts_with("nai-diffusion-5") && free_character_positions(&s.model) => {
+                let named = s.characters.iter().filter(|c| !c.trim().is_empty()).count();
+                positions_apply("nai-diffusion-4-5-curated", named)
+                    .then(|| p.iter().map(|&at| position_for_model("nai-diffusion-4-5-curated", at)).collect())
+            }
+            other => other.clone(),
+        },
         width: w,
         height: h,
         steps: s.steps,
@@ -860,6 +871,7 @@ mod tests {
             negative_prompt: "lowres".into(),
             characters: vec![],
             character_negatives: vec![],
+            character_positions: None,
             steps: 28,
             scale: 5.0,
             seed: 7,
