@@ -821,9 +821,15 @@ export default function GenerateTab({ active }: { active: boolean }) {
     setPromptFiles((prev) => prev.map((f) => (f.path === path ? { ...f, ...change } : f)));
   }
 
+  // `line` is 1-based, as shown; out-of-range or non-numbers are ignored.
+  function setPosition(file: PromptFile, line: number) {
+    if (!Number.isInteger(line) || line < 1 || line > file.lines.length) return;
+    updatePromptFile(file.path, { position: line - 1 });
+    void savePosition(file.path, line - 1);
+  }
+
   function resetPosition(file: PromptFile) {
-    updatePromptFile(file.path, { position: 0 });
-    void savePosition(file.path, 0);
+    setPosition(file, 1);
   }
 
   // Puts `__name__` at the cursor in the prompt field last typed in, or at
@@ -1475,7 +1481,27 @@ export default function GenerateTab({ active }: { active: boolean }) {
                         </div>
                         {f.mode === "sequential" && (
                           <span style={{ whiteSpace: "nowrap", fontFamily: "'IBM Plex Mono', monospace", fontSize: 11.5 }}>
-                            next {f.position + 1}/{f.lines.length}
+                            next{" "}
+                            <input
+                              type="number"
+                              min={1}
+                              max={f.lines.length}
+                              value={f.position + 1}
+                              onChange={(e) => setPosition(f, Math.round(Number(e.target.value)))}
+                              disabled={generating}
+                              title={`Which ${f.partNames.length > 0 ? "entry" : "line"} the next image uses (1–${f.lines.length})`}
+                              style={{
+                                width: `${String(f.lines.length).length + 3}ch`,
+                                padding: "1px 4px",
+                                borderRadius: 5,
+                                border: "1px solid var(--border)",
+                                background: "var(--bg-page)",
+                                color: "var(--text)",
+                                fontFamily: "'IBM Plex Mono', monospace",
+                                fontSize: 11.5,
+                              }}
+                            />
+                            /{f.lines.length}
                             {f.position > 0 && (
                               <a
                                 href="#"
