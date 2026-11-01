@@ -673,7 +673,10 @@ impl NovelAiTools {
 
     fn pause_before_request(&self) {
         if !self.request_delay.is_zero() {
-            self.runtime.block_on(tokio::time::sleep(self.request_delay));
+            // The timer has to be created inside the runtime, so build it in
+            // the async block rather than passing `sleep(..)` in from outside.
+            let delay = self.request_delay;
+            self.runtime.block_on(async move { tokio::time::sleep(delay).await });
         }
     }
 
@@ -1575,6 +1578,17 @@ mod tests {
             timestamp: || "now".into(),
             request_delay: std::time::Duration::ZERO,
         }
+    }
+
+    #[test]
+    fn waits_before_a_request_without_crashing() {
+        // A zero delay in the other tests skipped this path; it once panicked
+        // by creating the timer outside the runtime.
+        let mut t = tools();
+        t.request_delay = std::time::Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        t.pause_before_request();
+        assert!(start.elapsed() >= std::time::Duration::from_millis(50));
     }
 
     #[test]
