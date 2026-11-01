@@ -713,7 +713,7 @@ fn inflate(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Every tEXt / zTXt / iTXt chunk in a PNG as (keyword, text).
-fn png_text_chunks(data: &[u8]) -> Result<Vec<(String, String)>, String> {
+pub fn png_text_chunks(data: &[u8]) -> Result<Vec<(String, String)>, String> {
     if data.len() < 8 || data[..8] != PNG_SIGNATURE {
         return Err("That file isn't a PNG.".into());
     }
@@ -782,7 +782,8 @@ fn model_from_source(source: &str) -> Option<&'static str> {
     None
 }
 
-fn parse_settings(chunks: &[(String, String)]) -> Result<ImportedSettings, String> {
+/// NovelAI's settings from an image's text chunks.
+pub fn parse_settings(chunks: &[(String, String)]) -> Result<ImportedSettings, String> {
     let get = |key: &str| chunks.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
 
     let comment = get("Comment")

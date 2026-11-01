@@ -33,6 +33,7 @@ import {
   type AccountStatus,
   type GenerateRequest,
   type ImportPlan,
+  type ImportedSettings,
   type VibeInfo,
   type VibeRef,
 } from "../lib/novelai";
@@ -360,7 +361,16 @@ const warningBoxStyle: React.CSSProperties = {
   lineHeight: 1.5,
 };
 
-export default function GenerateTab({ active }: { active: boolean }) {
+/** Settings sent from another tab (Convert); `id` changes with every send. */
+export type IncomingSettings = { id: number; settings: ImportedSettings };
+
+export default function GenerateTab({
+  active,
+  incoming,
+}: {
+  active: boolean;
+  incoming: IncomingSettings | null;
+}) {
   const [phase, setPhase] = useState<AccountPhase>("unchecked");
   const [status, setStatus] = useState<AccountStatus | null>(null);
   const [tokenInput, setTokenInput] = useState("");
@@ -624,6 +634,19 @@ export default function GenerateTab({ active }: { active: boolean }) {
       setError(String(err));
     }
   }
+
+  // A prompt sent from the Convert tab goes through the same confirmation
+  // as importing an image.
+  useEffect(() => {
+    if (!incoming) return;
+    if (generating) {
+      setError("Wait for the current generation to finish, then send the prompt again.");
+      return;
+    }
+    setError(null);
+    setImportPlan(buildImportPlan(incoming.settings));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [incoming]);
 
   function applyImport(plan: ImportPlan) {
     const v = plan.values;
@@ -1257,7 +1280,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
               onFocus={(e) => (lastFieldRef.current = { field: "prompt", el: e.currentTarget })}
-              disabled={generating}
+              readOnly={generating}
               style={textareaStyle}
             />
             {preview(prompt)}
@@ -1269,7 +1292,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
               value={negativePrompt}
               onChange={(e) => setNegativePrompt(e.target.value)}
               onFocus={(e) => (lastFieldRef.current = { field: "negative", el: e.currentTarget })}
-              disabled={generating}
+              readOnly={generating}
               style={textareaStyle}
             />
             {preview(negativePrompt)}
@@ -1325,7 +1348,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
                     onFocus={(e) =>
                       (lastFieldRef.current = { field: { character: i, negative: false }, el: e.currentTarget })
                     }
-                    disabled={generating}
+                    readOnly={generating}
                     style={textareaStyle}
                   />
                   {preview(c, true)}
@@ -1339,7 +1362,7 @@ export default function GenerateTab({ active }: { active: boolean }) {
                     onFocus={(e) =>
                       (lastFieldRef.current = { field: { character: i, negative: true }, el: e.currentTarget })
                     }
-                    disabled={generating}
+                    readOnly={generating}
                     style={{ ...textareaStyle, fontSize: 12.5, padding: "6px 10px" }}
                   />
                   {preview(characterNegatives[i] ?? "")}

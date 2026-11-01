@@ -5,8 +5,9 @@ import AlbumTab from "./components/AlbumTab";
 import MatchingTab from "./components/MatchingTab";
 import DetectionTab from "./components/DetectionTab";
 import StripMetadataTab from "./components/StripMetadataTab";
-import GenerateTab from "./components/GenerateTab";
+import GenerateTab, { type IncomingSettings } from "./components/GenerateTab";
 import UpscaleTab from "./components/UpscaleTab";
+import ConvertTab from "./components/ConvertTab";
 
 type Theme = "light" | "dark";
 
@@ -28,6 +29,8 @@ export default function App() {
   const [theme, setTheme] = useState<Theme>(getSystemTheme);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [activeTab, setActiveTab] = useState<TabId>("album");
+  // A prompt sent from Convert to Generate; the id makes each send new.
+  const [sentToGenerate, setSentToGenerate] = useState<IncomingSettings | null>(null);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -53,7 +56,7 @@ export default function App() {
       />
       <div style={{ flex: 1, minWidth: 0, overflowY: "auto" }}>
         <TabPanel active={activeTab === "album"}>
-          <AlbumTab />
+          <AlbumTab active={activeTab === "album"} />
         </TabPanel>
         <TabPanel active={activeTab === "matching"}>
           <MatchingTab />
@@ -65,10 +68,19 @@ export default function App() {
           <StripMetadataTab />
         </TabPanel>
         <TabPanel active={activeTab === "generate"}>
-          <GenerateTab active={activeTab === "generate"} />
+          <GenerateTab active={activeTab === "generate"} incoming={sentToGenerate} />
         </TabPanel>
         <TabPanel active={activeTab === "upscale"}>
           <UpscaleTab active={activeTab === "upscale"} />
+        </TabPanel>
+        <TabPanel active={activeTab === "convert"}>
+          <ConvertTab
+            active={activeTab === "convert"}
+            onSendToGenerate={(settings) => {
+              setSentToGenerate((prev) => ({ id: (prev?.id ?? 0) + 1, settings }));
+              setActiveTab("generate");
+            }}
+          />
         </TabPanel>
       </div>
     </div>

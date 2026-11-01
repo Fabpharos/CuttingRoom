@@ -37,7 +37,7 @@ type PendingPhotoRename = {
   order: string[];
 };
 
-export default function AlbumTab() {
+export default function AlbumTab({ active }: { active: boolean }) {
   const [folderPath, setFolderPath] = useState<string | null>(null);
   const [albumName, setAlbumName] = useState("");
   const [images, setImages] = useState<ImageEntry[]>([]);
@@ -151,8 +151,14 @@ export default function AlbumTab() {
     }
   }
 
+  // Key presses reach the whole window, so the shortcuts below only act
+  // while this tab is the one showing — Ctrl+C in another tab is that tab's.
+  const activeRef = useRef(active);
+  activeRef.current = active;
+
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
+      if (!activeRef.current) return;
       const isTyping =
         e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement;
 
