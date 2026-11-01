@@ -238,7 +238,7 @@ export function buildImportPlan(s: ImportedSettings): ImportPlan {
   if (model) {
     values.model = model.id;
     applied.push({ label: "Model", value: model.label });
-  } else {
+  } else if (s.model !== null || s.source !== null) {
     skipped.push(
       `Model: ${s.source ?? "unknown"} isn't available here, so the current model is kept.`,
     );

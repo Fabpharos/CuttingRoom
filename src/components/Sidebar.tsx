@@ -1,6 +1,6 @@
 import ThemeSwitch from "./ThemeSwitch";
 
-export type TabId = "album" | "matching" | "detection" | "stripMetadata" | "generate" | "upscale";
+export type TabId = "album" | "matching" | "detection" | "stripMetadata" | "generate" | "upscale" | "convert";
 
 type Theme = "light" | "dark";
 
@@ -75,6 +75,24 @@ function GenerateTabIcon({ color }: { color: string }) {
     >
       <path d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3Z" />
       <path d="M18.5 15l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2Z" />
+    </svg>
+  );
+}
+
+function ConvertTabIcon({ color }: { color: string }) {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      style={{ stroke: color }}
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M4 8h14l-3.5-3.5" />
+      <path d="M20 16H6l3.5 3.5" />
     </svg>
   );
 }
@@ -304,6 +322,13 @@ export default function Sidebar({
           active={activeTab === "upscale"}
           collapsed={collapsed}
           onClick={() => onSelectTab("upscale")}
+        />
+        <NavItem
+          icon={<ConvertTabIcon color={iconColorFor("convert")} />}
+          label="Convert Prompt"
+          active={activeTab === "convert"}
+          collapsed={collapsed}
+          onClick={() => onSelectTab("convert")}
         />
       </nav>
 

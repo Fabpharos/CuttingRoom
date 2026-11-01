@@ -2,6 +2,7 @@ mod detection;
 mod matching;
 mod novelai;
 mod pdf_export;
+mod prompt_scan;
 mod strip_metadata;
 
 use detection::{DetectionOutput, DetectionProgress, PixelateJob};
@@ -245,6 +246,13 @@ fn nai_cancel_batch(run_id: String) {
 }
 
 #[tauri::command]
+async fn scan_image_prompt(path: String) -> Result<prompt_scan::ScannedPrompt, String> {
+    tauri::async_runtime::spawn_blocking(move || prompt_scan::scan(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn nai_read_image_metadata(path: String) -> Result<novelai::ImportedSettings, String> {
     novelai::read_image_metadata(path).await
 }
@@ -330,6 +338,7 @@ pub fn run() {
             nai_generate_batch,
             nai_cancel_batch,
             nai_read_image_metadata,
+            scan_image_prompt,
             nai_read_prompt_file,
             nai_read_vibe_file,
             nai_scan_upscale,
