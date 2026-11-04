@@ -52,6 +52,7 @@ export default function ConfirmModal({
             fontFamily: "system-ui, sans-serif",
             lineHeight: 1.5,
             marginBottom: 20,
+            whiteSpace: "pre-line",
           }}
         >
           {message}

@@ -3,6 +3,7 @@ mod matching;
 mod novelai;
 mod pdf_export;
 mod prompt_scan;
+mod character_card;
 mod strip_metadata;
 
 use detection::{DetectionOutput, DetectionProgress, PixelateJob};
@@ -253,6 +254,25 @@ async fn scan_image_prompt(path: String) -> Result<prompt_scan::ScannedPrompt, S
 }
 
 #[tauri::command]
+async fn read_character_card(path: String) -> Result<character_card::CardInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || character_card::read(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn write_character_card(source: String, dest: String, data: serde_json::Value) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || character_card::write(&source, &dest, data))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn suggest_card_output(source: String) -> String {
+    character_card::suggest_output(&source)
+}
+
+#[tauri::command]
 async fn nai_read_image_metadata(path: String) -> Result<novelai::ImportedSettings, String> {
     novelai::read_image_metadata(path).await
 }
@@ -339,6 +359,9 @@ pub fn run() {
             nai_cancel_batch,
             nai_read_image_metadata,
             scan_image_prompt,
+            read_character_card,
+            write_character_card,
+            suggest_card_output,
             nai_read_prompt_file,
             nai_read_vibe_file,
             nai_scan_upscale,

@@ -3731,6 +3731,7 @@ dependencies = [
 name = "tauri-app"
 version = "1.2.0"
 dependencies = [
+ "base64 0.22.1",
  "clipboard-win",
  "image",
  "miniz_oxide 0.9.1",

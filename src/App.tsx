@@ -8,6 +8,7 @@ import StripMetadataTab from "./components/StripMetadataTab";
 import GenerateTab, { type IncomingSettings } from "./components/GenerateTab";
 import UpscaleTab from "./components/UpscaleTab";
 import ConvertTab from "./components/ConvertTab";
+import CharacterCardTab from "./components/CharacterCardTab";
 
 type Theme = "light" | "dark";
 
@@ -81,6 +82,9 @@ export default function App() {
               setActiveTab("generate");
             }}
           />
+        </TabPanel>
+        <TabPanel active={activeTab === "characterCard"}>
+          <CharacterCardTab active={activeTab === "characterCard"} />
         </TabPanel>
       </div>
     </div>
