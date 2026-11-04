@@ -125,12 +125,22 @@ export default function AlbumTab({ active }: { active: boolean }) {
     };
   }, [folderPath, selectedNames]);
 
+  // Key presses and copies reach the whole window, so the shortcuts below
+  // only act while this tab is the one showing — Ctrl+C in another tab is
+  // that tab's.
+  const activeRef = useRef(active);
+  activeRef.current = active;
+
   useEffect(() => {
-    // Block the webview's own native clipboard "copy" handling so it can
-    // never race with / overwrite the native file-list clipboard write
-    // triggered by our own Ctrl+C handler below.
+    // When Ctrl+C copies the selected photos, block the webview's own text
+    // copy so it can't overwrite the native file-list clipboard write made
+    // by the handler below. Any other copy (text in a field, another tab)
+    // goes through as normal.
     function handleCopy(e: ClipboardEvent) {
-      e.preventDefault();
+      const typing =
+        e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement;
+      const { folderPath: fp, selectedNames: sel, viewerOpen } = latestRef.current;
+      if (activeRef.current && !typing && fp && sel.size > 0 && !viewerOpen) e.preventDefault();
     }
     document.addEventListener("copy", handleCopy);
     return () => document.removeEventListener("copy", handleCopy);
@@ -150,11 +160,6 @@ export default function AlbumTab({ active }: { active: boolean }) {
       setError(`Couldn't copy photos: ${String(err)}`);
     }
   }
-
-  // Key presses reach the whole window, so the shortcuts below only act
-  // while this tab is the one showing — Ctrl+C in another tab is that tab's.
-  const activeRef = useRef(active);
-  activeRef.current = active;
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
