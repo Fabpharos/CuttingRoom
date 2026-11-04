@@ -1,6 +1,6 @@
 import ThemeSwitch from "./ThemeSwitch";
 
-export type TabId = "album" | "matching" | "detection" | "stripMetadata" | "generate" | "upscale" | "convert";
+export type TabId = "album" | "matching" | "detection" | "stripMetadata" | "generate" | "upscale" | "convert" | "characterCard";
 
 type Theme = "light" | "dark";
 
@@ -93,6 +93,26 @@ function ConvertTabIcon({ color }: { color: string }) {
     >
       <path d="M4 8h14l-3.5-3.5" />
       <path d="M20 16H6l3.5 3.5" />
+    </svg>
+  );
+}
+
+function CharacterCardTabIcon({ color }: { color: string }) {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      style={{ stroke: color }}
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <rect x="3.5" y="5" width="17" height="14" rx="1.5" />
+      <circle cx="9" cy="11" r="2.2" />
+      <path d="M5.8 16.5c.7-1.6 1.8-2.4 3.2-2.4s2.5.8 3.2 2.4" />
+      <path d="M14.5 10h3.5M14.5 13.5h3.5" />
     </svg>
   );
 }
@@ -329,6 +349,13 @@ export default function Sidebar({
           active={activeTab === "convert"}
           collapsed={collapsed}
           onClick={() => onSelectTab("convert")}
+        />
+        <NavItem
+          icon={<CharacterCardTabIcon color={iconColorFor("characterCard")} />}
+          label="Character Card"
+          active={activeTab === "characterCard"}
+          collapsed={collapsed}
+          onClick={() => onSelectTab("characterCard")}
         />
       </nav>
 
