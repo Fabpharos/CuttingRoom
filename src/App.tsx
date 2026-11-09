@@ -5,10 +5,11 @@ import AlbumTab from "./components/AlbumTab";
 import MatchingTab from "./components/MatchingTab";
 import DetectionTab from "./components/DetectionTab";
 import StripMetadataTab from "./components/StripMetadataTab";
-import GenerateTab, { type IncomingSettings } from "./components/GenerateTab";
+import GenerateTab, { type IncomingSettings, type RemixJob } from "./components/GenerateTab";
 import UpscaleTab from "./components/UpscaleTab";
 import ConvertTab from "./components/ConvertTab";
 import CharacterCardTab from "./components/CharacterCardTab";
+import RemixTab from "./components/RemixTab";
 
 type Theme = "light" | "dark";
 
@@ -32,6 +33,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<TabId>("album");
   // A prompt sent from Convert to Generate; the id makes each send new.
   const [sentToGenerate, setSentToGenerate] = useState<IncomingSettings | null>(null);
+  const [remixJob, setRemixJob] = useState<RemixJob | null>(null);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -69,10 +71,18 @@ export default function App() {
           <StripMetadataTab />
         </TabPanel>
         <TabPanel active={activeTab === "generate"}>
-          <GenerateTab active={activeTab === "generate"} incoming={sentToGenerate} />
+          <GenerateTab active={activeTab === "generate"} incoming={sentToGenerate} remix={remixJob} />
         </TabPanel>
         <TabPanel active={activeTab === "upscale"}>
           <UpscaleTab active={activeTab === "upscale"} />
+        </TabPanel>
+        <TabPanel active={activeTab === "remix"}>
+          <RemixTab
+            onSendToGenerate={(folder, items) => {
+              setRemixJob((prev) => ({ id: (prev?.id ?? 0) + 1, folder, items }));
+              setActiveTab("generate");
+            }}
+          />
         </TabPanel>
         <TabPanel active={activeTab === "convert"}>
           <ConvertTab

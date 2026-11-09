@@ -1,6 +1,6 @@
 import ThemeSwitch from "./ThemeSwitch";
 
-export type TabId = "album" | "matching" | "detection" | "stripMetadata" | "generate" | "upscale" | "convert" | "characterCard";
+export type TabId = "album" | "matching" | "detection" | "stripMetadata" | "generate" | "upscale" | "convert" | "characterCard" | "remix";
 
 type Theme = "light" | "dark";
 
@@ -113,6 +113,25 @@ function CharacterCardTabIcon({ color }: { color: string }) {
       <circle cx="9" cy="11" r="2.2" />
       <path d="M5.8 16.5c.7-1.6 1.8-2.4 3.2-2.4s2.5.8 3.2 2.4" />
       <path d="M14.5 10h3.5M14.5 13.5h3.5" />
+    </svg>
+  );
+}
+
+function RemixTabIcon({ color }: { color: string }) {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      style={{ stroke: color }}
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M3 7h4l8 10h5" />
+      <path d="M3 17h4l2.5-3.1M13.5 10.1 15 7h5" />
+      <path d="M17.5 4.5 20 7l-2.5 2.5M17.5 14.5 20 17l-2.5 2.5" />
     </svg>
   );
 }
@@ -342,6 +361,13 @@ export default function Sidebar({
           active={activeTab === "upscale"}
           collapsed={collapsed}
           onClick={() => onSelectTab("upscale")}
+        />
+        <NavItem
+          icon={<RemixTabIcon color={iconColorFor("remix")} />}
+          label="Remix"
+          active={activeTab === "remix"}
+          collapsed={collapsed}
+          onClick={() => onSelectTab("remix")}
         />
         <NavItem
           icon={<ConvertTabIcon color={iconColorFor("convert")} />}
