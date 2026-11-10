@@ -3,7 +3,7 @@
 // the Generate tab. Pure helpers; the tab reads the images.
 
 import { splitTags } from "./promptConvert";
-import { MAX_CHARACTERS, SIZES, type CharacterPosition, type ImportedSettings } from "./novelai";
+import { MAX_CHARACTERS, fitFreeSize, type CharacterPosition, type ImportedSettings } from "./novelai";
 
 export type RemixSource = { path: string; settings: ImportedSettings };
 
@@ -37,7 +37,10 @@ export type RemixItem = {
   characterPositions: CharacterPosition[] | null;
   /** The original seed when reused, else null for a random one. */
   seed: number | null;
-  /** The original size when it's one of the free sizes, else null for Generate's size. */
+  /**
+   * The original size when it's free, else the free size closest to it with
+   * the same shape; null (Generate's size) when the image has no size.
+   */
   size: { width: number; height: number } | null;
 };
 
@@ -113,7 +116,6 @@ export function remixItems(
   };
   return sources.map(({ path, settings: s }) => {
     const characters = s.characters.slice(0, MAX_CHARACTERS);
-    const free = SIZES.some((z) => z.width === s.width && z.height === s.height);
     const seedOk = s.seed !== null && Number.isInteger(s.seed) && s.seed >= 0 && s.seed <= 0xffff_ffff;
     return {
       source: path,
@@ -123,7 +125,7 @@ export function remixItems(
       characterNegatives: characters.map((_, i) => s.characterNegatives[i] ?? ""),
       characterPositions: s.characterPositions?.slice(0, characters.length) ?? null,
       seed: reuseSeeds && seedOk ? s.seed : null,
-      size: free ? { width: s.width!, height: s.height! } : null,
+      size: fitFreeSize(s.width, s.height),
     };
   });
 }

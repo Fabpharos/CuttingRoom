@@ -191,9 +191,13 @@ pub async fn clear_token() -> Result<(), String> {
 
 // NovelAI's own rule for a free Opus generation (from its web client):
 // at most 1024x1024 worth of pixels and at most 28 steps, one image per
-// request. The sizes and step cap below keep every request inside it;
+// request. The size and step checks below keep every request inside it;
 // guidance doesn't affect cost.
-pub const ALLOWED_SIZES: [(u32, u32); 3] = [(832, 1216), (1216, 832), (1024, 1024)];
+pub const MAX_FREE_PIXELS: u64 = 1_048_576;
+/// NovelAI sizes go in steps of 64 pixels.
+pub const SIZE_STEP: u32 = 64;
+/// Keeps custom shapes sensible (2048x512 at the extreme).
+pub const MAX_SIDE: u32 = 2048;
 pub const MAX_STEPS: u32 = 28;
 pub const MAX_GUIDANCE: f64 = 10.0;
 pub const MAX_CHARACTERS: usize = 4;
@@ -306,13 +310,25 @@ pub fn positions_apply(model: &str, count: usize) -> bool {
 }
 
 fn build_body(req: &GenerateRequest, vibes: &[ResolvedVibe]) -> Result<serde_json::Value, String> {
-    if !ALLOWED_SIZES.contains(&(req.width, req.height)) {
+    check_free_size(req.width, req.height)?;
+    request_body(req, vibes)
+}
+
+/// Any size in steps of 64, each side 64–2048, with at most 1,048,576
+/// pixels (1024x1024) in all: the most an Opus generation can be for free.
+pub fn check_free_size(width: u32, height: u32) -> Result<(), String> {
+    if width % SIZE_STEP != 0 || height % SIZE_STEP != 0 {
+        return Err(format!("{width}x{height}: width and height must be multiples of {SIZE_STEP}."));
+    }
+    if !(SIZE_STEP..=MAX_SIDE).contains(&width) || !(SIZE_STEP..=MAX_SIDE).contains(&height) {
+        return Err(format!("{width}x{height}: each side must be between {SIZE_STEP} and {MAX_SIDE}."));
+    }
+    if width as u64 * height as u64 > MAX_FREE_PIXELS {
         return Err(format!(
-            "{}x{} isn't one of the allowed sizes (832x1216, 1216x832, 1024x1024).",
-            req.width, req.height
+            "{width}x{height} is over 1,048,576 pixels (1024x1024), so it would cost Anlas."
         ));
     }
-    request_body(req, vibes)
+    Ok(())
 }
 
 /// Everything `build_body` checks except the size, which inpainting checks
@@ -1517,9 +1533,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_sizes_outside_the_allowed_three() {
-        assert!(body_of(&request("nai-diffusion-4-5-full", 1024, 1536, &[])).is_err());
-        assert!(body_of(&request("nai-diffusion-4-5-full", 2048, 2048, &[])).is_err());
+    fn accepts_any_free_size_and_rejects_the_rest() {
+        for (w, h) in [(832, 1216), (1216, 832), (1024, 1024), (1472, 704), (640, 640), (2048, 512)] {
+            assert!(body_of(&request("nai-diffusion-4-5-full", w, h, &[])).is_ok(), "{w}x{h}");
+        }
+        // Over 1 megapixel, not a multiple of 64, a side out of range.
+        for (w, h) in [(1024, 1536), (2048, 2048), (1088, 1024), (1000, 1000), (832, 1215), (0, 1024), (2112, 448)] {
+            assert!(body_of(&request("nai-diffusion-4-5-full", w, h, &[])).is_err(), "{w}x{h}");
+        }
     }
 
     #[test]

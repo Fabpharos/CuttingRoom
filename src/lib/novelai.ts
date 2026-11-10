@@ -74,6 +74,45 @@ export const SIZES: { width: number; height: number; label: string }[] = [
   { width: 1024, height: 1024, label: "Square" },
 ];
 
+// Any size is free on Opus up to 1024×1024 worth of pixels, in steps of 64
+// (Rust checks the same rule before sending).
+export const MAX_FREE_PIXELS = 1_048_576;
+export const SIZE_STEP = 64;
+export const MAX_SIDE = 2048;
+/** The `sizeIndex` that means "use the custom width and height". */
+export const CUSTOM_SIZE = SIZES.length;
+
+/** Why width × height can't be generated for free, or null when it can. */
+export function sizeProblem(width: number, height: number): string | null {
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width % SIZE_STEP || height % SIZE_STEP)
+    return `Width and height must be multiples of ${SIZE_STEP}.`;
+  if (width < SIZE_STEP || height < SIZE_STEP || width > MAX_SIDE || height > MAX_SIDE)
+    return `Each side must be between ${SIZE_STEP} and ${MAX_SIDE}.`;
+  if (width * height > MAX_FREE_PIXELS)
+    return `${(width * height).toLocaleString()} pixels is over 1,048,576 (1024×1024), which would cost Anlas.`;
+  return null;
+}
+
+/**
+ * The free size closest to width × height with the same shape: the size
+ * itself when it's free, else scaled down (an upscaled image) and rounded to
+ * steps of 64.
+ */
+export function fitFreeSize(width: number | null, height: number | null): { width: number; height: number } | null {
+  if (!width || !height || width <= 0 || height <= 0) return null;
+  if (sizeProblem(width, height) === null) return { width, height };
+  const scale = Math.min(1, Math.sqrt(MAX_FREE_PIXELS / (width * height)));
+  const snap = (v: number) => Math.min(MAX_SIDE, Math.max(SIZE_STEP, Math.round((v * scale) / SIZE_STEP) * SIZE_STEP));
+  let w = snap(width);
+  let h = snap(height);
+  // Rounding up can tip it over; trim whichever side rounded up the most.
+  while (w * h > MAX_FREE_PIXELS) {
+    if (w / (width * scale) >= h / (height * scale)) w -= SIZE_STEP;
+    else h -= SIZE_STEP;
+  }
+  return { width: w, height: h };
+}
+
 export const MAX_CHARACTERS = 4;
 
 /** Where a character sits, as fractions of the image from its top-left corner. */
@@ -200,6 +239,8 @@ export async function readImageMetadata(path: string): Promise<ImportedSettings>
 export type FormValues = {
   model?: string;
   sizeIndex?: number;
+  /** Set with `sizeIndex: CUSTOM_SIZE`. */
+  customSize?: { width: number; height: number };
   prompt: string;
   negativePrompt: string;
   characters: string[];
@@ -283,9 +324,13 @@ export function buildImportPlan(s: ImportedSettings): ImportPlan {
     if (sizeIndex >= 0) {
       values.sizeIndex = sizeIndex;
       applied.push({ label: "Resolution", value: `${SIZES[sizeIndex].label} ${s.width}×${s.height}` });
+    } else if (sizeProblem(s.width, s.height) === null) {
+      values.sizeIndex = CUSTOM_SIZE;
+      values.customSize = { width: s.width, height: s.height };
+      applied.push({ label: "Resolution", value: `Custom ${s.width}×${s.height}` });
     } else {
       skipped.push(
-        `Resolution: ${s.width}×${s.height} isn't one of the three allowed sizes, so the current one is kept.`,
+        `Resolution: ${s.width}×${s.height} can't be made for free (${sizeProblem(s.width, s.height)}), so the current size is kept.`,
       );
     }
   }

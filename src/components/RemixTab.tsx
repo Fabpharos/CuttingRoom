@@ -2,6 +2,7 @@ import { useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readDir } from "@tauri-apps/plugin-fs";
 import { join } from "@tauri-apps/api/path";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { readImageMetadata } from "../lib/novelai";
 import {
   findShared,
@@ -66,6 +67,15 @@ const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
 
 type FieldSwap = { remove: Set<string>; replacement: string };
 
+function pixelSize(path: string): Promise<{ width: number; height: number } | null> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(img.naturalWidth && img.naturalHeight ? { width: img.naturalWidth, height: img.naturalHeight } : null);
+    img.onerror = () => resolve(null);
+    img.src = convertFileSrc(path);
+  });
+}
+
 export default function RemixTab({
   onSendToGenerate,
 }: {
@@ -102,7 +112,13 @@ export default function RemixTab({
         if (scanIdRef.current !== scanId) return; // another folder was chosen
         const path = await join(dir, name);
         try {
-          found.push({ path, settings: await readImageMetadata(path) });
+          const settings = await readImageMetadata(path);
+          if (!settings.width || !settings.height) {
+            // No size in the metadata: use the PNG's own pixel size for its shape.
+            const px = await pixelSize(path);
+            if (px) Object.assign(settings, px);
+          }
+          found.push({ path, settings });
         } catch {
           missed.push(name);
         }
@@ -296,8 +312,8 @@ export default function RemixTab({
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
               <span style={{ fontSize: 14, fontWeight: 700 }}>Preview</span>
               <span style={{ fontSize: 12, color: "var(--muted)" }}>
-                {changed} of {items.length} prompts changed · {seedsKept} seeds reused · {sizesKept} sizes kept
-                {sizesKept < items.length && " (the rest use Generate's size)"}
+                {changed} of {items.length} prompts changed · {seedsKept} seeds reused · {sizesKept} sizes matched
+                {sizesKept < items.length && " (the rest have no size and use Generate's)"}
               </span>
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 10, maxHeight: 520, overflowY: "auto" }}>

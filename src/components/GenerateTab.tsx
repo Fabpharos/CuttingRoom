@@ -16,6 +16,10 @@ import {
   fileStemFor,
   MODELS,
   SIZES,
+  CUSTOM_SIZE,
+  SIZE_STEP,
+  MAX_SIDE,
+  sizeProblem,
   MAX_CHARACTERS,
   DEFAULT_STEPS,
   MAX_STEPS,
@@ -368,6 +372,57 @@ export type IncomingSettings = { id: number; settings: ImportedSettings };
 /** Per-image prompts sent from the Remix tab; `id` changes with every send. */
 export type RemixJob = { id: number; folder: string; items: RemixItem[] };
 
+/** A width or height box: free typing, snapped to steps of 64 on blur. */
+function SideInput({
+  label,
+  value,
+  onChange,
+  disabled,
+}: {
+  label: string;
+  value: number;
+  onChange: (v: number) => void;
+  disabled: boolean;
+}) {
+  const [text, setText] = useState(String(value));
+  useEffect(() => setText(String(value)), [value]);
+  return (
+    <input
+      type="number"
+      aria-label={label}
+      title={label}
+      min={SIZE_STEP}
+      max={MAX_SIDE}
+      step={SIZE_STEP}
+      value={text}
+      disabled={disabled}
+      onChange={(e) => {
+        setText(e.target.value);
+        const n = Number(e.target.value);
+        if (e.target.value !== "" && Number.isFinite(n)) onChange(n);
+      }}
+      onBlur={() => {
+        const n = Number(text);
+        const snapped = Number.isFinite(n) && n > 0
+          ? Math.min(MAX_SIDE, Math.max(SIZE_STEP, Math.round(n / SIZE_STEP) * SIZE_STEP))
+          : value;
+        onChange(snapped);
+        setText(String(snapped));
+      }}
+      style={{
+        width: 76,
+        padding: "5px 8px",
+        borderRadius: 6,
+        border: "1px solid var(--border)",
+        background: "var(--bg-page)",
+        color: "var(--text)",
+        fontFamily: "'IBM Plex Mono', monospace",
+        fontSize: 12.5,
+      }}
+    />
+  );
+}
+
 export default function GenerateTab({
   active,
   incoming,
@@ -386,6 +441,10 @@ export default function GenerateTab({
 
   const [model, setModel] = useState(MODELS[0].id);
   const [sizeIndex, setSizeIndex] = useState(0);
+  const [customWidth, setCustomWidth] = useState(1024);
+  const [customHeight, setCustomHeight] = useState(1024);
+  const size = sizeIndex === CUSTOM_SIZE ? { width: customWidth, height: customHeight } : SIZES[sizeIndex];
+  const sizeError = sizeProblem(size.width, size.height);
   const [prompt, setPrompt] = useState("");
   const [negativePrompt, setNegativePrompt] = useState("");
   const [characters, setCharacters] = useState<string[]>([]);
@@ -424,6 +483,8 @@ export default function GenerateTab({
         const s = await loadGenerateSettings();
         setModel(s.model);
         setSizeIndex(s.sizeIndex);
+        setCustomWidth(s.customWidth);
+        setCustomHeight(s.customHeight);
         setPrompt(s.prompt);
         setNegativePrompt(s.negativePrompt);
         setSteps(s.steps);
@@ -453,6 +514,8 @@ export default function GenerateTab({
       void saveGenerateSettings({
         model,
         sizeIndex,
+        customWidth,
+        customHeight,
         prompt,
         negativePrompt,
         characters,
@@ -478,6 +541,8 @@ export default function GenerateTab({
     settingsLoaded,
     model,
     sizeIndex,
+    customWidth,
+    customHeight,
     prompt,
     negativePrompt,
     characters,
@@ -572,6 +637,7 @@ export default function GenerateTab({
     !generating &&
     prompt.trim() !== "" &&
     tokenProblem === null &&
+    sizeError === null &&
     outputDir !== null;
   // V5 is free on Opus only while its refilling quota lasts.
   const quotaExhausted =
@@ -661,6 +727,10 @@ export default function GenerateTab({
     const v = plan.values;
     if (v.model) setModel(v.model);
     if (v.sizeIndex !== undefined) setSizeIndex(v.sizeIndex);
+    if (v.customSize) {
+      setCustomWidth(v.customSize.width);
+      setCustomHeight(v.customSize.height);
+    }
     if (v.steps !== undefined) setSteps(v.steps);
     if (v.scale !== undefined) setScale(v.scale);
     setPrompt(v.prompt);
@@ -738,7 +808,13 @@ export default function GenerateTab({
   }
 
   const remixBatch = remixQueue ? remixQueue.items.slice(remixQueue.next, remixQueue.next + MAX_BATCH) : [];
-  const canRemix = phase === "loggedIn" && !generating && outputDir !== null && remixBatch.length > 0;
+  // Images without a size of their own use this tab's, so it must be valid then.
+  const canRemix =
+    phase === "loggedIn" &&
+    !generating &&
+    outputDir !== null &&
+    remixBatch.length > 0 &&
+    (sizeError === null || remixBatch.every((item) => item.size !== null));
 
   function requestRemix() {
     if (!canRemix || !status) return;
@@ -760,7 +836,6 @@ export default function GenerateTab({
 
   async function runGenerate(fromRemix = false) {
     if (!outputDir) return;
-    const size = SIZES[sizeIndex];
     const batchStart = new Date();
     const remixStart = remixQueue?.next ?? 0;
     // One line per file per image: a token used in several fields gets the
@@ -1264,7 +1339,7 @@ export default function GenerateTab({
               </Field>
             </div>
             <Field label="Resolution">
-              <div style={{ display: "flex", gap: 6 }}>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                 {SIZES.map((s, i) => (
                   <button
                     key={s.label}
@@ -1290,7 +1365,65 @@ export default function GenerateTab({
                     </span>
                   </button>
                 ))}
+                <button
+                  onClick={() => setSizeIndex(CUSTOM_SIZE)}
+                  disabled={generating}
+                  title="Any size up to 1024×1024 worth of pixels, in steps of 64"
+                  style={{
+                    padding: "6px 12px",
+                    borderRadius: 8,
+                    border: sizeIndex === CUSTOM_SIZE ? "none" : "1px solid var(--border)",
+                    background: sizeIndex === CUSTOM_SIZE ? "var(--accent)" : "transparent",
+                    color: sizeIndex === CUSTOM_SIZE ? "var(--accent-contrast)" : "var(--text)",
+                    fontFamily: "'Space Grotesk', sans-serif",
+                    fontWeight: 600,
+                    fontSize: 12.5,
+                    cursor: "pointer",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  Custom
+                </button>
               </div>
+              {sizeIndex === CUSTOM_SIZE && (
+                <div style={{ marginTop: 8 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <SideInput label="Width" value={customWidth} onChange={setCustomWidth} disabled={generating} />
+                    <span style={{ color: "var(--muted)" }}>×</span>
+                    <SideInput label="Height" value={customHeight} onChange={setCustomHeight} disabled={generating} />
+                    <button
+                      onClick={() => {
+                        setCustomWidth(customHeight);
+                        setCustomHeight(customWidth);
+                      }}
+                      disabled={generating}
+                      title="Swap width and height"
+                      style={{
+                        padding: "4px 8px",
+                        borderRadius: 6,
+                        border: "1px solid var(--border)",
+                        background: "transparent",
+                        color: "var(--text)",
+                        cursor: "pointer",
+                        fontSize: 13,
+                      }}
+                    >
+                      ⇄
+                    </button>
+                  </div>
+                  <div
+                    style={{
+                      marginTop: 4,
+                      fontSize: 11.5,
+                      fontFamily: "'IBM Plex Mono', monospace",
+                      color: sizeError ? "#c9482f" : "var(--muted)",
+                    }}
+                  >
+                    {sizeError ??
+                      `${(customWidth * customHeight).toLocaleString()} of 1,048,576 pixels · free on Opus`}
+                  </div>
+                </div>
+              )}
             </Field>
           </div>
 
@@ -1429,7 +1562,7 @@ export default function GenerateTab({
                     index={i}
                     positions={characterPositions}
                     model={model}
-                    aspect={SIZES[sizeIndex].width / SIZES[sizeIndex].height}
+                    aspect={size.width / size.height}
                     disabled={generating}
                     onChange={(p) => setCharacterPositions((prev) => prev.map((q, j) => (j === i ? p : q)))}
                   />
