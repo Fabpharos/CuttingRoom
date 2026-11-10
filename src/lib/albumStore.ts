@@ -9,12 +9,20 @@ export type AlbumData = {
 
 const store = new LazyStore("albums.json");
 
+// Written to disk on every change rather than left to the plugin's
+// auto-save: album order, tags and recent folders were found unsaved for
+// months while the other settings files kept updating.
+async function persist() {
+  await store.save();
+}
+
 export async function loadAlbum(folderPath: string): Promise<AlbumData | undefined> {
   return store.get<AlbumData>(folderPath);
 }
 
 export async function saveAlbum(folderPath: string, data: AlbumData): Promise<void> {
   await store.set(folderPath, data);
+  await persist();
 }
 
 export async function moveAlbum(oldFolderPath: string, newFolderPath: string): Promise<void> {
@@ -22,6 +30,7 @@ export async function moveAlbum(oldFolderPath: string, newFolderPath: string): P
   if (data) {
     await store.delete(oldFolderPath);
     await store.set(newFolderPath, data);
+    await persist();
   }
 }
 
@@ -38,6 +47,7 @@ export async function addRecentFolder(path: string): Promise<string[]> {
   const current = await getRecentFolders();
   const next = [path, ...current.filter((p) => p !== path)].slice(0, MAX_RECENT);
   await store.set(RECENT_KEY, next);
+  await persist();
   return next;
 }
 
@@ -50,6 +60,7 @@ export async function renameRecentFolder(oldPath: string, newPath: string): Prom
     MAX_RECENT,
   );
   await store.set(RECENT_KEY, next);
+  await persist();
   return next;
 }
 
@@ -57,5 +68,6 @@ export async function removeRecentFolder(path: string): Promise<string[]> {
   const current = await getRecentFolders();
   const next = current.filter((p) => p !== path);
   await store.set(RECENT_KEY, next);
+  await persist();
   return next;
 }

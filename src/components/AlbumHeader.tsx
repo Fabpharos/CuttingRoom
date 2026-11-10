@@ -113,7 +113,7 @@ export default function AlbumHeader({
               e.preventDefault();
               onRefresh();
             }}
-            title="Look for newly added photos"
+            title="Look for added or removed photos"
             style={{ fontSize: 13, fontWeight: 600, whiteSpace: "nowrap" }}
           >
             Refresh
