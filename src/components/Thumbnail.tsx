@@ -103,7 +103,7 @@ export default function Thumbnail({
           e.stopPropagation();
           onToggleFavorite();
         }}
-        title={favorite ? "Favorited" : "Mark as favorite"}
+        title={favorite ? "Favorited (F)" : "Mark as favorite (F)"}
         style={{
           position: "absolute",
           top: 6,

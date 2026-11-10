@@ -2,6 +2,8 @@ import { LazyStore } from "@tauri-apps/plugin-store";
 import {
   MODELS,
   SIZES,
+  SIZE_STEP,
+  MAX_SIDE,
   MAX_CHARACTERS,
   MAX_STEPS,
   MAX_SCALE,
@@ -39,7 +41,10 @@ export type SavedPromptFile = {
 
 export type GenerateSettings = {
   model: string;
+  /** One of SIZES, or SIZES.length (CUSTOM_SIZE) for the custom size. */
   sizeIndex: number;
+  customWidth: number;
+  customHeight: number;
   prompt: string;
   negativePrompt: string;
   characters: string[];
@@ -60,6 +65,8 @@ export type GenerateSettings = {
 export const DEFAULT_SETTINGS: GenerateSettings = {
   model: MODELS[0].id,
   sizeIndex: 0,
+  customWidth: 1024,
+  customHeight: 1024,
   prompt: "",
   negativePrompt: "",
   characters: [],
@@ -78,6 +85,8 @@ const SETTINGS_KEY = "form";
 
 const clamp = (n: unknown, min: number, max: number, fallback: number) =>
   typeof n === "number" && Number.isFinite(n) ? Math.min(Math.max(n, min), max) : fallback;
+const side = (v: unknown, fallback: number) =>
+  Math.round(clamp(v, SIZE_STEP, MAX_SIDE, fallback) / SIZE_STEP) * SIZE_STEP;
 const str = (v: unknown, fallback: string) => (typeof v === "string" ? v : fallback);
 
 // A list the user builds by hand stays small; this only guards against a
@@ -166,7 +175,9 @@ function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy
   }
   return {
     model: MODELS.some((m) => m.id === raw.model) ? (raw.model as string) : d.model,
-    sizeIndex: Math.round(clamp(raw.sizeIndex, 0, SIZES.length - 1, d.sizeIndex)),
+    sizeIndex: Math.round(clamp(raw.sizeIndex, 0, SIZES.length, d.sizeIndex)),
+    customWidth: side(raw.customWidth, d.customWidth),
+    customHeight: side(raw.customHeight, d.customHeight),
     prompt,
     negativePrompt: str(raw.negativePrompt, d.negativePrompt),
     characters,

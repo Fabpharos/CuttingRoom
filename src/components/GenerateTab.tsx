@@ -16,6 +16,10 @@ import {
   fileStemFor,
   MODELS,
   SIZES,
+  CUSTOM_SIZE,
+  SIZE_STEP,
+  MAX_SIDE,
+  sizeProblem,
   MAX_CHARACTERS,
   DEFAULT_STEPS,
   MAX_STEPS,
@@ -54,6 +58,7 @@ import {
   type SavedVibe,
 } from "../lib/generateSettings";
 import { revealFilesInExplorer } from "../lib/nativeOps";
+import type { RemixItem } from "../lib/remix";
 
 type AccountPhase = "unchecked" | "checking" | "loggedOut" | "loggedIn";
 
@@ -364,12 +369,68 @@ const warningBoxStyle: React.CSSProperties = {
 /** Settings sent from another tab (Convert); `id` changes with every send. */
 export type IncomingSettings = { id: number; settings: ImportedSettings };
 
+/** Per-image prompts sent from the Remix tab; `id` changes with every send. */
+export type RemixJob = { id: number; folder: string; items: RemixItem[] };
+
+/** A width or height box: free typing, snapped to steps of 64 on blur. */
+function SideInput({
+  label,
+  value,
+  onChange,
+  disabled,
+}: {
+  label: string;
+  value: number;
+  onChange: (v: number) => void;
+  disabled: boolean;
+}) {
+  const [text, setText] = useState(String(value));
+  useEffect(() => setText(String(value)), [value]);
+  return (
+    <input
+      type="number"
+      aria-label={label}
+      title={label}
+      min={SIZE_STEP}
+      max={MAX_SIDE}
+      step={SIZE_STEP}
+      value={text}
+      disabled={disabled}
+      onChange={(e) => {
+        setText(e.target.value);
+        const n = Number(e.target.value);
+        if (e.target.value !== "" && Number.isFinite(n)) onChange(n);
+      }}
+      onBlur={() => {
+        const n = Number(text);
+        const snapped = Number.isFinite(n) && n > 0
+          ? Math.min(MAX_SIDE, Math.max(SIZE_STEP, Math.round(n / SIZE_STEP) * SIZE_STEP))
+          : value;
+        onChange(snapped);
+        setText(String(snapped));
+      }}
+      style={{
+        width: 76,
+        padding: "5px 8px",
+        borderRadius: 6,
+        border: "1px solid var(--border)",
+        background: "var(--bg-page)",
+        color: "var(--text)",
+        fontFamily: "'IBM Plex Mono', monospace",
+        fontSize: 12.5,
+      }}
+    />
+  );
+}
+
 export default function GenerateTab({
   active,
   incoming,
+  remix,
 }: {
   active: boolean;
   incoming: IncomingSettings | null;
+  remix: RemixJob | null;
 }) {
   const [phase, setPhase] = useState<AccountPhase>("unchecked");
   const [status, setStatus] = useState<AccountStatus | null>(null);
@@ -380,6 +441,10 @@ export default function GenerateTab({
 
   const [model, setModel] = useState(MODELS[0].id);
   const [sizeIndex, setSizeIndex] = useState(0);
+  const [customWidth, setCustomWidth] = useState(1024);
+  const [customHeight, setCustomHeight] = useState(1024);
+  const size = sizeIndex === CUSTOM_SIZE ? { width: customWidth, height: customHeight } : SIZES[sizeIndex];
+  const sizeError = sizeProblem(size.width, size.height);
   const [prompt, setPrompt] = useState("");
   const [negativePrompt, setNegativePrompt] = useState("");
   const [characters, setCharacters] = useState<string[]>([]);
@@ -392,7 +457,10 @@ export default function GenerateTab({
   const [scale, setScale] = useState(DEFAULT_SCALE);
   const [outputDir, setOutputDir] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
-  const [confirmCost, setConfirmCost] = useState(false);
+  // Which run a cost confirmation is for: the form's, or the next remix batch.
+  const [confirmCost, setConfirmCost] = useState<"form" | "remix" | null>(null);
+  // A remix runs MAX_BATCH images at a time; `next` is the first not yet made.
+  const [remixQueue, setRemixQueue] = useState<{ folder: string; items: RemixItem[]; next: number } | null>(null);
   const [lastResult, setLastResult] = useState<LastResult | null>(null);
   const [count, setCount] = useState(1);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
@@ -415,6 +483,8 @@ export default function GenerateTab({
         const s = await loadGenerateSettings();
         setModel(s.model);
         setSizeIndex(s.sizeIndex);
+        setCustomWidth(s.customWidth);
+        setCustomHeight(s.customHeight);
         setPrompt(s.prompt);
         setNegativePrompt(s.negativePrompt);
         setSteps(s.steps);
@@ -444,6 +514,8 @@ export default function GenerateTab({
       void saveGenerateSettings({
         model,
         sizeIndex,
+        customWidth,
+        customHeight,
         prompt,
         negativePrompt,
         characters,
@@ -469,6 +541,8 @@ export default function GenerateTab({
     settingsLoaded,
     model,
     sizeIndex,
+    customWidth,
+    customHeight,
     prompt,
     negativePrompt,
     characters,
@@ -563,6 +637,7 @@ export default function GenerateTab({
     !generating &&
     prompt.trim() !== "" &&
     tokenProblem === null &&
+    sizeError === null &&
     outputDir !== null;
   // V5 is free on Opus only while its refilling quota lasts.
   const quotaExhausted =
@@ -652,6 +727,10 @@ export default function GenerateTab({
     const v = plan.values;
     if (v.model) setModel(v.model);
     if (v.sizeIndex !== undefined) setSizeIndex(v.sizeIndex);
+    if (v.customSize) {
+      setCustomWidth(v.customSize.width);
+      setCustomHeight(v.customSize.height);
+    }
     if (v.steps !== undefined) setSteps(v.steps);
     if (v.scale !== undefined) setScale(v.scale);
     setPrompt(v.prompt);
@@ -724,19 +803,66 @@ export default function GenerateTab({
 
   function requestGenerate() {
     if (!canGenerate || !status) return;
-    if (costsAnlas) setConfirmCost(true);
+    if (costsAnlas) setConfirmCost("form");
     else void runGenerate();
   }
 
-  async function runGenerate() {
+  const remixBatch = remixQueue ? remixQueue.items.slice(remixQueue.next, remixQueue.next + MAX_BATCH) : [];
+  // Images without a size of their own use this tab's, so it must be valid then.
+  const canRemix =
+    phase === "loggedIn" &&
+    !generating &&
+    outputDir !== null &&
+    remixBatch.length > 0 &&
+    (sizeError === null || remixBatch.every((item) => item.size !== null));
+
+  function requestRemix() {
+    if (!canRemix || !status) return;
+    if (costsAnlas) setConfirmCost("remix");
+    else void runGenerate(true);
+  }
+
+  // A remix sent from the Remix tab waits here until the user starts it.
+  useEffect(() => {
+    if (!remix) return;
+    if (generating) {
+      setError("Wait for the current generation to finish, then send the remix again.");
+      return;
+    }
+    setError(null);
+    setRemixQueue({ folder: remix.folder, items: remix.items, next: 0 });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [remix]);
+
+  async function runGenerate(fromRemix = false) {
     if (!outputDir) return;
-    const size = SIZES[sizeIndex];
     const batchStart = new Date();
+    const remixStart = remixQueue?.next ?? 0;
     // One line per file per image: a token used in several fields gets the
     // same line in each, so they stay consistent within an image.
     const files = usedFiles;
     const picks = files.map((f) => pickLineIndices(f.lines.length, f.mode, f.position, count));
-    const requests: GenerateRequest[] = Array.from({ length: count }, (_, i) => {
+    // A remix image keeps its own prompt, and its seed and size when the
+    // Remix tab kept them; the model, steps, guidance and vibes are this tab's.
+    const remixRequests: GenerateRequest[] = remixBatch.map((item, i) => {
+      const seed = item.seed ?? randomSeed();
+      return {
+        model,
+        prompt: item.prompt,
+        negativePrompt: item.negativePrompt,
+        characters: item.characters,
+        characterNegatives: item.characterNegatives,
+        characterPositions: item.characterPositions,
+        width: item.size?.width ?? size.width,
+        height: item.size?.height ?? size.height,
+        steps: effectiveSteps,
+        scale,
+        seed,
+        fileStem: fileStemFor(seed, i, batchStart),
+        vibes: vibeRefs,
+      };
+    });
+    const requests: GenerateRequest[] = fromRemix ? remixRequests : Array.from({ length: count }, (_, i) => {
       const seed = randomSeed();
       const entry = Object.fromEntries(files.flatMap((f, k) => entryValues(f, picks[k][i])));
       const values = present(entry);
@@ -785,7 +911,13 @@ export default function GenerateTab({
       const made = summary.images.length;
       // Advance only past lines that actually produced an image, so a
       // cancelled or stopped batch doesn't skip the rest of its lines.
-      if (made > 0) {
+      if (fromRemix) {
+        setRemixQueue((q) => {
+          if (!q) return q;
+          const next = remixStart + made;
+          return next >= q.items.length ? null : { ...q, next };
+        });
+      } else if (made > 0) {
         const advanced = new Map(
           files.filter((f) => f.mode === "sequential").map((f) => [f.path, (f.position + made) % f.lines.length]),
         );
@@ -1207,7 +1339,7 @@ export default function GenerateTab({
               </Field>
             </div>
             <Field label="Resolution">
-              <div style={{ display: "flex", gap: 6 }}>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                 {SIZES.map((s, i) => (
                   <button
                     key={s.label}
@@ -1233,7 +1365,65 @@ export default function GenerateTab({
                     </span>
                   </button>
                 ))}
+                <button
+                  onClick={() => setSizeIndex(CUSTOM_SIZE)}
+                  disabled={generating}
+                  title="Any size up to 1024×1024 worth of pixels, in steps of 64"
+                  style={{
+                    padding: "6px 12px",
+                    borderRadius: 8,
+                    border: sizeIndex === CUSTOM_SIZE ? "none" : "1px solid var(--border)",
+                    background: sizeIndex === CUSTOM_SIZE ? "var(--accent)" : "transparent",
+                    color: sizeIndex === CUSTOM_SIZE ? "var(--accent-contrast)" : "var(--text)",
+                    fontFamily: "'Space Grotesk', sans-serif",
+                    fontWeight: 600,
+                    fontSize: 12.5,
+                    cursor: "pointer",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  Custom
+                </button>
               </div>
+              {sizeIndex === CUSTOM_SIZE && (
+                <div style={{ marginTop: 8 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <SideInput label="Width" value={customWidth} onChange={setCustomWidth} disabled={generating} />
+                    <span style={{ color: "var(--muted)" }}>×</span>
+                    <SideInput label="Height" value={customHeight} onChange={setCustomHeight} disabled={generating} />
+                    <button
+                      onClick={() => {
+                        setCustomWidth(customHeight);
+                        setCustomHeight(customWidth);
+                      }}
+                      disabled={generating}
+                      title="Swap width and height"
+                      style={{
+                        padding: "4px 8px",
+                        borderRadius: 6,
+                        border: "1px solid var(--border)",
+                        background: "transparent",
+                        color: "var(--text)",
+                        cursor: "pointer",
+                        fontSize: 13,
+                      }}
+                    >
+                      ⇄
+                    </button>
+                  </div>
+                  <div
+                    style={{
+                      marginTop: 4,
+                      fontSize: 11.5,
+                      fontFamily: "'IBM Plex Mono', monospace",
+                      color: sizeError ? "#c9482f" : "var(--muted)",
+                    }}
+                  >
+                    {sizeError ??
+                      `${(customWidth * customHeight).toLocaleString()} of 1,048,576 pixels · free on Opus`}
+                  </div>
+                </div>
+              )}
             </Field>
           </div>
 
@@ -1372,7 +1562,7 @@ export default function GenerateTab({
                     index={i}
                     positions={characterPositions}
                     model={model}
-                    aspect={SIZES[sizeIndex].width / SIZES[sizeIndex].height}
+                    aspect={size.width / size.height}
                     disabled={generating}
                     onChange={(p) => setCharacterPositions((prev) => prev.map((q, j) => (j === i ? p : q)))}
                   />
@@ -1807,6 +1997,30 @@ export default function GenerateTab({
             </div>
           </Field>
 
+          {remixQueue && (
+            <div style={{ ...warningBoxStyle, marginTop: 0, display: "flex", flexDirection: "column", gap: 10 }}>
+              <div>
+                <strong>Remix of {fileName(remixQueue.folder)}</strong>: {remixQueue.items.length} image
+                {remixQueue.items.length === 1 ? "" : "s"}
+                {remixQueue.next > 0 && `, ${remixQueue.next} done`}. Each image uses its remixed prompt
+                (and its own seed and size where the Remix tab kept them) with this tab's model, steps,
+                guidance, vibes and output folder.
+              </div>
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                <button
+                  onClick={requestRemix}
+                  disabled={!canRemix}
+                  style={{ ...primaryButtonStyle, opacity: canRemix ? 1 : 0.5, cursor: canRemix ? "pointer" : "default" }}
+                >
+                  Generate {remixQueue.next + 1}–{remixQueue.next + remixBatch.length} of {remixQueue.items.length}
+                </button>
+                <button onClick={() => setRemixQueue(null)} disabled={generating} style={secondaryButtonStyle}>
+                  Cancel Remix
+                </button>
+              </div>
+            </div>
+          )}
+
           <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
             <label
               style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, fontWeight: 600 }}
@@ -1940,23 +2154,26 @@ export default function GenerateTab({
         </div>
       )}
 
-      {confirmCost && status && (
+      {confirmCost && status && (() => {
+        const n = confirmCost === "remix" ? remixBatch.length : count;
+        return (
         <ConfirmModal
           title={quotaExhausted ? "V5 quota used up" : "This will cost Anlas"}
           message={
             quotaExhausted
-              ? `Your Opus quota for V5 models is used up, so this may cost Anlas. You have ${status.anlas.toLocaleString()} Anlas. V4.5 models stay free. Generate ${count === 1 ? "1 image" : `${count} images`}?`
-              : `Your ${status.tierName} subscription doesn't include free generations. You have ${status.anlas.toLocaleString()} Anlas. Generate ${count === 1 ? "1 image" : `${count} images`}?`
+              ? `Your Opus quota for V5 models is used up, so this may cost Anlas. You have ${status.anlas.toLocaleString()} Anlas. V4.5 models stay free. Generate ${n === 1 ? "1 image" : `${n} images`}?`
+              : `Your ${status.tierName} subscription doesn't include free generations. You have ${status.anlas.toLocaleString()} Anlas. Generate ${n === 1 ? "1 image" : `${n} images`}?`
           }
           confirmLabel="Generate"
           cancelLabel="Cancel"
           onConfirm={() => {
-            setConfirmCost(false);
-            void runGenerate();
+            setConfirmCost(null);
+            void runGenerate(confirmCost === "remix");
           }}
-          onCancel={() => setConfirmCost(false)}
+          onCancel={() => setConfirmCost(null)}
         />
-      )}
+        );
+      })()}
 
       {importPlan && (
         <ImportConfirmModal
