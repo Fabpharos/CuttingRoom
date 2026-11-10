@@ -1,19 +1,23 @@
 import { useEffect, useRef, useState } from "react";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import ConfirmModal from "./ConfirmModal";
+import { readImageMetadata } from "../lib/novelai";
+import { moveFilesToTrash } from "../lib/nativeOps";
+import { guessName } from "../lib/characterTags";
 import {
-  TEXT_FIELDS,
-  emptyCard,
-  listOf,
-  readCharacterCard,
-  suggestCardOutput,
-  textOf,
-  writeCharacterCard,
-  type CardData,
-  type CardInfo,
-} from "../lib/characterCard";
+  PARTS,
+  listCards,
+  loadCardFolder,
+  promptOf,
+  saveCard,
+  saveCardFolder,
+  tagsFromPrompt,
+  type CardFile,
+  type CardTag,
+  type Part,
+} from "../lib/characterCards";
 
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "webp"];
 
@@ -66,49 +70,134 @@ const secondaryButtonStyle: React.CSSProperties = {
 
 const labelStyle: React.CSSProperties = { fontSize: 12, fontWeight: 600, color: "var(--muted)" };
 
-const SPEC_LABELS: Record<string, string> = {
-  chara_card_v3: "Character card V3",
-  chara_card_v2: "Character card V2",
-  v1: "Character card V1",
-};
-
 const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
 
-type PendingSave = { dest: string; inPlace: boolean };
+/** A prompt the image offers to make the card from. */
+type PromptChoice = { label: string; prompt: string; negative: string };
+
+type Draft = {
+  /** The card's file when editing one; null for a new card. */
+  path: string | null;
+  /** The image a new card is made from. */
+  image: string | null;
+  name: string;
+  text: string;
+  tags: CardTag[];
+  negative: string;
+  /** The prompts the source image has (new cards only). */
+  choices: PromptChoice[];
+  choice: number;
+};
 
 export default function CharacterCardTab({ active }: { active: boolean }) {
-  const [path, setPath] = useState<string | null>(null);
-  const [info, setInfo] = useState<CardInfo | null>(null);
-  // The card being edited; null while the image has none and none is being made.
-  const [card, setCard] = useState<CardData | null>(null);
+  const [folder, setFolder] = useState<string | null>(null);
+  const [cards, setCards] = useState<CardFile[]>([]);
+  const [draft, setDraft] = useState<Draft | null>(null);
   const [dirty, setDirty] = useState(false);
-  const [pendingSave, setPendingSave] = useState<PendingSave | null>(null);
-  const [pendingOpen, setPendingOpen] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [pendingDiscard, setPendingDiscard] = useState<(() => void) | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<CardFile | null>(null);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
-  const [imageVersion, setImageVersion] = useState(0);
+  const [version, setVersion] = useState(0);
 
-  async function load(p: string) {
-    setError(null);
-    setMessage(null);
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  const dirtyRef = useRef(dirty);
+  dirtyRef.current = dirty;
+
+  // The folder is remembered; its cards are read the first time the tab opens.
+  const loadedRef = useRef(false);
+  useEffect(() => {
+    if (!active || loadedRef.current) return;
+    loadedRef.current = true;
+    void (async () => {
+      const f = await loadCardFolder().catch(() => null);
+      if (f) {
+        setFolder(f);
+        await refresh(f);
+      }
+    })();
+  }, [active]);
+
+  async function refresh(f = folder) {
+    if (!f) return;
     try {
-      const read = await readCharacterCard(p);
-      setPath(p);
-      setInfo(read);
-      setCard(read.data);
-      setDirty(false);
-      setImageVersion((v) => v + 1);
+      setCards(await listCards(f));
+      setVersion((v) => v + 1);
     } catch (err) {
       setError(String(err));
+      setCards([]);
     }
   }
 
-  // Opening another image drops unsaved edits, so ask first.
-  function requestOpen(p: string) {
-    if (dirtyRef.current) setPendingOpen(p);
-    else void load(p);
+  /** Runs `action` now, or after asking when there are unsaved changes. */
+  function guard(action: () => void) {
+    if (dirtyRef.current) setPendingDiscard(() => action);
+    else action();
+  }
+
+  async function chooseFolder(): Promise<string | null> {
+    const picked = await open({ directory: true, multiple: false });
+    if (typeof picked !== "string") return null;
+    setFolder(picked);
+    setDraft(null);
+    setDirty(false);
+    setError(null);
+    setMessage(null);
+    await saveCardFolder(picked).catch((err) => setError(`Couldn't remember the folder: ${String(err)}`));
+    await refresh(picked);
+    return picked;
+  }
+
+  function openCard(file: CardFile) {
+    guard(() => {
+      setError(null);
+      setMessage(null);
+      setSelected(new Set());
+      setDraft({
+        path: file.path,
+        image: null,
+        name: file.card.name,
+        text: promptOf(file.card.tags),
+        tags: file.card.tags,
+        negative: file.card.negative,
+        choices: [],
+        choice: 0,
+      });
+      setDirty(false);
+    });
+  }
+
+  async function startFromImage(image: string) {
+    setError(null);
+    setMessage(null);
+    const choices: PromptChoice[] = [];
+    try {
+      const s = await readImageMetadata(image);
+      s.characters.forEach((c, i) => {
+        if (c.trim()) choices.push({ label: `Character ${i + 1}`, prompt: c, negative: s.characterNegatives[i] ?? "" });
+      });
+      if (s.prompt.trim()) choices.push({ label: "Main prompt", prompt: s.prompt, negative: "" });
+    } catch {
+      // No NovelAI prompt: the user types one.
+    }
+    const first = choices[0];
+    const tags = first ? tagsFromPrompt(first.prompt) : [];
+    setSelected(new Set());
+    setDraft({
+      path: null,
+      image,
+      name: guessName(tags.map((t) => t.text)),
+      text: first?.prompt ?? "",
+      tags,
+      negative: first?.negative ?? "",
+      choices,
+      choice: 0,
+    });
+    setDirty(true);
   }
 
   async function chooseImage() {
@@ -117,16 +206,10 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
       multiple: false,
       filters: [{ name: "Image", extensions: IMAGE_EXTENSIONS }],
     });
-    if (typeof file === "string") requestOpen(file);
+    if (typeof file === "string") guard(() => void startFromImage(file));
   }
 
-  // Drops are delivered window-wide, so only act on them while this tab is
-  // the one showing.
-  const activeRef = useRef(active);
-  activeRef.current = active;
-  const dirtyRef = useRef(dirty);
-  dirtyRef.current = dirty;
-
+  // Drops are delivered window-wide, so only act on them while this tab is showing.
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
@@ -148,7 +231,7 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
         else if (p.type === "drop") {
           setDragging(false);
           const image = p.paths.find((f) => IMAGE_EXTENSIONS.some((ext) => f.toLowerCase().endsWith(`.${ext}`)));
-          if (image) requestOpen(image);
+          if (image) guard(() => void startFromImage(image));
           else if (p.paths.length > 0) setError("Drop a PNG, JPEG or WebP image.");
         }
       })
@@ -164,30 +247,66 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function update(key: string, value: unknown) {
-    setCard((c) => (c ? { ...c, [key]: value } : c));
+  function edit(change: Partial<Draft>) {
+    setDraft((d) => (d ? { ...d, ...change } : d));
     setDirty(true);
     setMessage(null);
   }
 
-  async function saveAs() {
-    if (!path) return;
-    const dest = await save({
-      defaultPath: await suggestCardOutput(path),
-      filters: [{ name: "PNG image", extensions: ["png"] }],
-    });
-    if (dest) setPendingSave({ dest, inPlace: dest.toLowerCase() === path.toLowerCase() });
+  function setText(text: string) {
+    if (!draft) return;
+    setSelected(new Set());
+    edit({ text, tags: tagsFromPrompt(text, draft.tags) });
   }
 
-  async function runSave({ dest }: PendingSave) {
-    if (!path || !card) return;
-    setPendingSave(null);
+  function pickChoice(i: number) {
+    if (!draft) return;
+    const c = draft.choices[i];
+    const tags = tagsFromPrompt(c.prompt);
+    setSelected(new Set());
+    edit({ choice: i, text: c.prompt, tags, negative: c.negative, name: draft.name || guessName(tags.map((t) => t.text)) });
+  }
+
+  function moveSelected(part: Part) {
+    if (!draft || selected.size === 0) return;
+    edit({ tags: draft.tags.map((t, i) => (selected.has(i) ? { ...t, part } : t)) });
+    setSelected(new Set());
+  }
+
+  // Keys 1–6 move the selected tags to that part.
+  const moveRef = useRef(moveSelected);
+  moveRef.current = moveSelected;
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (!activeRef.current || e.ctrlKey || e.metaKey || e.altKey) return;
+      const el = e.target as HTMLElement | null;
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) return;
+      const n = Number(e.key);
+      if (n >= 1 && n <= PARTS.length) {
+        moveRef.current(PARTS[n - 1].key);
+        e.preventDefault();
+      } else if (e.key === "Escape") setSelected(new Set());
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  async function runSave() {
+    if (!draft) return;
+    let f = folder;
+    if (!f) {
+      f = await chooseFolder();
+      if (!f) return;
+    }
     setSaving(true);
     setError(null);
     try {
-      await writeCharacterCard(path, dest, card);
-      await load(dest);
-      setMessage(`Saved the character card to ${fileName(dest)}.`);
+      const card = { version: 1 as const, name: draft.name.trim(), tags: draft.tags, negative: draft.negative };
+      const path = await saveCard(f, card, draft.path ? { existing: draft.path } : { image: draft.image! });
+      await refresh(f);
+      setDraft({ ...draft, path, image: null, name: card.name, choices: [], choice: 0 });
+      setDirty(false);
+      setMessage(`Saved ${fileName(path)}.`);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -195,47 +314,61 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
     }
   }
 
-  function saveWarning({ dest, inPlace }: PendingSave): string {
-    const lines = ["Existing AI image metadata might be overwritten."];
-    if (info?.aiMetadata.length) {
-      lines.push(
-        `This image has ${info.aiMetadata.join(", ")} generation metadata. Cutting Room keeps it in the PNG, but other apps that read or edit character cards may replace or remove it.`,
-      );
+  async function runDelete(file: CardFile) {
+    setPendingDelete(null);
+    try {
+      await moveFilesToTrash([file.path]);
+      if (draft?.path === file.path) {
+        setDraft(null);
+        setDirty(false);
+      }
+      await refresh();
+      setMessage(`Moved ${fileName(file.path)} to the Recycle Bin.`);
+    } catch (err) {
+      setError(String(err));
     }
-    if (info && !info.isPng) {
-      lines.push("The image isn't a PNG, so it's converted to one; its own metadata (such as EXIF) is not carried over.");
-    }
-    if (info?.data && inPlace) lines.push("The character card already in this image will be replaced.");
-    lines.push(inPlace ? `${fileName(dest)} is changed in place.` : `The card is saved in a new image: ${fileName(dest)}.`);
-    return lines.join("\n\n");
   }
 
-  const tags = card ? listOf(card, "tags") : [];
-  const greetings = card ? listOf(card, "alternate_greetings") : [];
+  const imageSrc = draft
+    ? draft.image
+      ? convertFileSrc(draft.image)
+      : draft.path
+        ? `${convertFileSrc(draft.path)}?v=${version}`
+        : null
+    : null;
 
   return (
-    <div style={{ padding: 24, maxWidth: 1100 }}>
+    <div style={{ padding: 24, maxWidth: 1200 }}>
       <div style={{ marginBottom: 18 }}>
-        <div style={{ fontSize: 21, fontWeight: 700, marginBottom: 4 }}>Character Card</div>
-        <div
-          style={{
-            fontSize: 13,
-            color: "var(--muted)",
-            fontFamily: "system-ui, sans-serif",
-            lineHeight: 1.6,
-          }}
-        >
-          Views and edits the character card (SillyTavern / Tavern V1–V3 format) stored in a PNG,
-          or makes a new one. Open or drop an image to start. Saving writes a V2 and a V3 card into
-          the PNG, as SillyTavern does.
+        <div style={{ fontSize: 21, fontWeight: 700, marginBottom: 4 }}>Character Cards</div>
+        <div style={{ fontSize: 13, color: "var(--muted)", fontFamily: "system-ui, sans-serif", lineHeight: 1.6 }}>
+          Character prompt presets for NovelAI. Make a card from a NovelAI image (open or drop one): its character
+          prompt is split into tags, with eye and hair tags sorted automatically, and you sort the rest into face,
+          upper body and lower body. In Generate, <b>Load character card</b> fills a character with it and can leave
+          out what won't be seen (facing away, closed eyes, upper or lower body). Cards are saved as small PNGs in
+          the folder you choose.
         </div>
       </div>
 
       <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", marginBottom: 14 }}>
-        <button style={primaryButtonStyle} onClick={() => void chooseImage()}>
-          Open Image…
+        <button style={secondaryButtonStyle} onClick={() => guard(() => void chooseFolder())}>
+          {folder ? "Change Folder…" : "Choose Card Folder…"}
         </button>
-        {path && <span style={{ fontSize: 12.5, color: "var(--muted)" }}>{fileName(path)}</span>}
+        {folder && (
+          <>
+            <span style={{ fontSize: 12.5, color: "var(--muted)", wordBreak: "break-all" }}>{folder}</span>
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                void refresh();
+              }}
+              style={{ fontSize: 12.5, fontWeight: 600 }}
+            >
+              Refresh
+            </a>
+          </>
+        )}
       </div>
 
       {error && (
@@ -254,169 +387,271 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
       )}
       {message && <div style={{ marginBottom: 14, fontSize: 13 }}>{message}</div>}
 
-      {path && info && (
-        <div style={{ display: "flex", gap: 20, alignItems: "flex-start", flexWrap: "wrap" }}>
-          <div style={{ ...cardStyle, width: 260, flexShrink: 0, display: "flex", flexDirection: "column", gap: 10 }}>
-            <img
-              src={`${convertFileSrc(path)}?v=${imageVersion}`}
-              alt=""
-              style={{ width: "100%", borderRadius: 6, display: "block" }}
-            />
-            <div style={{ fontSize: 13, fontWeight: 600 }}>
-              {info.spec ? (SPEC_LABELS[info.spec] ?? info.spec) : "No character card"}
-            </div>
-            <div style={{ fontSize: 12.5, color: "var(--muted)", lineHeight: 1.5 }}>
-              {info.isPng
-                ? info.aiMetadata.length > 0
-                  ? `AI metadata: ${info.aiMetadata.join(", ")}`
-                  : "No AI generation metadata found."
-                : "Not a PNG: a card can be saved into a PNG copy."}
-            </div>
-            {!card && (
-              <button
-                style={{ ...primaryButtonStyle, alignSelf: "flex-start" }}
-                onClick={() => {
-                  setCard(emptyCard());
-                  setDirty(true);
-                }}
-              >
-                Create Card
-              </button>
-            )}
+      <div style={{ display: "flex", gap: 20, alignItems: "flex-start", flexWrap: "wrap" }}>
+        <div style={{ ...cardStyle, width: 240, flexShrink: 0, display: "flex", flexDirection: "column", gap: 8 }}>
+          <button style={primaryButtonStyle} onClick={() => void chooseImage()}>
+            New Card from Image…
+          </button>
+          <div
+            style={{
+              fontSize: 12,
+              color: dragging ? "var(--accent)" : "var(--muted)",
+              textAlign: "center",
+              padding: "6px 0",
+              border: `1px dashed ${dragging ? "var(--accent)" : "var(--border)"}`,
+              borderRadius: 8,
+            }}
+          >
+            {dragging ? "Drop to make a card" : "or drop an image here"}
           </div>
-
-          {card && (
-            <div style={{ ...cardStyle, flex: 1, minWidth: 320, display: "flex", flexDirection: "column", gap: 12 }}>
-              {TEXT_FIELDS.map((f) => (
-                <label key={f.key} style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-                  <span style={labelStyle}>{f.label}</span>
-                  <textarea
-                    rows={f.rows}
-                    value={textOf(card, f.key)}
-                    onChange={(e) => update(f.key, e.target.value)}
-                    style={{ ...textareaStyle, resize: f.rows === 1 ? "none" : "vertical" }}
-                  />
-                </label>
-              ))}
-
-              <label style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-                <span style={labelStyle}>Tags (comma-separated)</span>
-                <textarea
-                  rows={1}
-                  value={tags.join(", ")}
-                  onChange={(e) =>
-                    update(
-                      "tags",
-                      e.target.value.split(",").map((t, i, all) => (i < all.length - 1 ? t.trim() : t.trimStart())),
-                    )
-                  }
-                  onBlur={() => update("tags", tags.map((t) => t.trim()).filter((t) => t !== ""))}
-                  style={{ ...textareaStyle, resize: "none" }}
-                />
-              </label>
-
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                <span style={labelStyle}>Alternate greetings ({greetings.length})</span>
-                {greetings.map((g, i) => (
-                  <div key={i} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                    <textarea
-                      rows={4}
-                      value={g}
-                      onChange={(e) => update("alternate_greetings", greetings.map((x, j) => (j === i ? e.target.value : x)))}
-                      style={textareaStyle}
-                    />
-                    <button
-                      onClick={() => update("alternate_greetings", greetings.filter((_, j) => j !== i))}
-                      style={{ alignSelf: "flex-start", border: "none", background: "none", padding: 0, color: "var(--muted)", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
-                    >
-                      Remove greeting
-                    </button>
-                  </div>
-                ))}
-                <button
-                  onClick={() => update("alternate_greetings", [...greetings, ""])}
-                  style={{ alignSelf: "flex-start", border: "none", background: "none", padding: 0, color: "var(--accent)", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
-                >
-                  + Add greeting
-                </button>
-              </div>
-
-              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginTop: 4 }}>
-                {info.isPng && (
-                  <button
-                    style={primaryButtonStyle}
-                    disabled={saving}
-                    onClick={() => setPendingSave({ dest: path, inPlace: true })}
-                  >
-                    Save to This Image
-                  </button>
-                )}
-                <button style={secondaryButtonStyle} disabled={saving} onClick={() => void saveAs()}>
-                  Save as New PNG…
-                </button>
-                {dirty && (
-                  <button
-                    style={secondaryButtonStyle}
-                    disabled={saving}
-                    onClick={() => {
-                      setCard(info.data);
-                      setDirty(false);
-                    }}
-                  >
-                    Discard Changes
-                  </button>
-                )}
-                {saving && <span style={{ fontSize: 12.5, color: "var(--muted)" }}>Saving…</span>}
-              </div>
+          {!folder && (
+            <div style={{ fontSize: 12.5, color: "var(--muted)", lineHeight: 1.5 }}>
+              Choose a folder to keep your cards in.
             </div>
           )}
+          {folder && cards.length === 0 && (
+            <div style={{ fontSize: 12.5, color: "var(--muted)", lineHeight: 1.5 }}>No cards in this folder yet.</div>
+          )}
+          {cards.map((c) => {
+            const isOpen = draft?.path === c.path;
+            return (
+              <button
+                key={c.path}
+                onClick={() => openCard(c)}
+                title={fileName(c.path)}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                  padding: 6,
+                  border: `1px solid ${isOpen ? "var(--accent)" : "transparent"}`,
+                  borderRadius: 8,
+                  background: isOpen ? "var(--bg-page)" : "transparent",
+                  color: "var(--text)",
+                  cursor: "pointer",
+                  textAlign: "left",
+                }}
+              >
+                <img
+                  src={`${convertFileSrc(c.path)}?v=${version}`}
+                  alt=""
+                  style={{ width: 44, height: 44, objectFit: "cover", borderRadius: 6, flexShrink: 0 }}
+                />
+                <span style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis" }}>
+                  {c.card.name}
+                </span>
+              </button>
+            );
+          })}
         </div>
-      )}
 
-      {pendingSave && (
-        <ConfirmModal
-          title={info?.data ? "Save the character card?" : "Add a character card?"}
-          message={saveWarning(pendingSave)}
-          confirmLabel="Save"
-          cancelLabel="Cancel"
-          onConfirm={() => void runSave(pendingSave)}
-          onCancel={() => setPendingSave(null)}
-        />
-      )}
+        {draft && (
+          <div style={{ ...cardStyle, flex: 1, minWidth: 360, display: "flex", flexDirection: "column", gap: 14 }}>
+            <div style={{ display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
+              {imageSrc && (
+                <img
+                  src={imageSrc}
+                  alt=""
+                  style={{ width: 150, maxHeight: 220, objectFit: "contain", borderRadius: 6, flexShrink: 0 }}
+                />
+              )}
+              <div style={{ flex: 1, minWidth: 220, display: "flex", flexDirection: "column", gap: 10 }}>
+                <label style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                  <span style={labelStyle}>Name</span>
+                  <input
+                    value={draft.name}
+                    onChange={(e) => edit({ name: e.target.value })}
+                    placeholder="e.g. Sparkle"
+                    style={{ ...textareaStyle, resize: "none" }}
+                  />
+                </label>
+                {draft.image && draft.choices.length > 1 && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                    <span style={labelStyle}>Read the prompt from</span>
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                      {draft.choices.map((c, i) => (
+                        <button
+                          key={i}
+                          onClick={() => pickChoice(i)}
+                          title={c.prompt}
+                          style={{
+                            ...secondaryButtonStyle,
+                            padding: "4px 12px",
+                            fontSize: 12,
+                            background: draft.choice === i ? "var(--accent)" : "transparent",
+                            color: draft.choice === i ? "var(--accent-contrast)" : "var(--text)",
+                            borderColor: draft.choice === i ? "var(--accent)" : "var(--border)",
+                          }}
+                        >
+                          {c.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {draft.image && draft.choices.length === 0 && (
+                  <div style={{ fontSize: 12.5, color: "var(--muted)", lineHeight: 1.5 }}>
+                    No NovelAI prompt found in {fileName(draft.image)}. Type or paste the character's prompt below.
+                  </div>
+                )}
+              </div>
+            </div>
 
-      {pendingOpen && (
+            <label style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+              <span style={labelStyle}>Character prompt</span>
+              <textarea rows={4} value={draft.text} onChange={(e) => setText(e.target.value)} style={textareaStyle} />
+            </label>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <span style={{ fontSize: 12.5, color: "var(--muted)", lineHeight: 1.5 }}>
+                Click tags to select them, then press a part's <b>Move here</b> (or its number key). Eye and hair tags
+                were sorted for you; check them.
+              </span>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(230px, 1fr))", gap: 10 }}>
+                {PARTS.map((p, n) => {
+                  const tags = draft.tags.map((t, i) => ({ t, i })).filter(({ t }) => t.part === p.key);
+                  return (
+                    <div
+                      key={p.key}
+                      style={{
+                        border: "1px solid var(--border)",
+                        borderRadius: 8,
+                        padding: "8px 10px",
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 6,
+                        minHeight: 70,
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+                        <span style={{ fontSize: 13, fontWeight: 700 }}>
+                          {n + 1}. {p.label}
+                        </span>
+                        <span style={{ fontSize: 11.5, color: "var(--muted)", flex: 1 }}>{p.hint}</span>
+                        {selected.size > 0 && (
+                          <a
+                            href="#"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              moveSelected(p.key);
+                            }}
+                            style={{ fontSize: 12, fontWeight: 600, whiteSpace: "nowrap" }}
+                          >
+                            Move here
+                          </a>
+                        )}
+                      </div>
+                      <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+                        {tags.length === 0 && <span style={{ fontSize: 12, color: "var(--muted)" }}>—</span>}
+                        {tags.map(({ t, i }) => {
+                          const on = selected.has(i);
+                          return (
+                            <button
+                              key={i}
+                              onClick={() =>
+                                setSelected((s) => {
+                                  const next = new Set(s);
+                                  if (next.has(i)) next.delete(i);
+                                  else next.add(i);
+                                  return next;
+                                })
+                              }
+                              style={{
+                                padding: "2px 9px",
+                                borderRadius: 999,
+                                border: `1px solid ${on ? "var(--accent)" : "var(--border)"}`,
+                                background: on ? "var(--accent)" : "var(--bg-page)",
+                                color: on ? "var(--accent-contrast)" : "var(--text)",
+                                fontSize: 12.5,
+                                fontFamily: "system-ui, sans-serif",
+                                cursor: "pointer",
+                              }}
+                            >
+                              {t.text}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <label style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+              <span style={labelStyle}>Undesired content for this character</span>
+              <textarea
+                rows={2}
+                value={draft.negative}
+                onChange={(e) => edit({ negative: e.target.value })}
+                style={textareaStyle}
+              />
+            </label>
+
+            <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+              <button
+                style={{ ...primaryButtonStyle, opacity: saving || !dirty || !draft.name.trim() ? 0.5 : 1 }}
+                disabled={saving || !dirty || !draft.name.trim()}
+                onClick={() => void runSave()}
+              >
+                {saving ? "Saving…" : draft.path ? "Save Changes" : "Save Card"}
+              </button>
+              {dirty && (
+                <button
+                  style={secondaryButtonStyle}
+                  onClick={() => {
+                    const file = cards.find((c) => c.path === draft.path);
+                    setDirty(false);
+                    dirtyRef.current = false;
+                    if (file) openCard(file);
+                    else setDraft(null);
+                  }}
+                >
+                  Discard Changes
+                </button>
+              )}
+              {draft.path && (
+                <button
+                  style={secondaryButtonStyle}
+                  onClick={() => {
+                    const file = cards.find((c) => c.path === draft.path);
+                    if (file) setPendingDelete(file);
+                  }}
+                >
+                  Delete Card
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {pendingDiscard && (
         <ConfirmModal
           title="Discard unsaved changes?"
-          message={`The card you're editing has changes that aren't saved. Open ${fileName(pendingOpen)} anyway?`}
-          confirmLabel="Discard and Open"
+          message="The card you're editing has changes that aren't saved."
+          confirmLabel="Discard"
           cancelLabel="Cancel"
           onConfirm={() => {
-            const p = pendingOpen;
-            setPendingOpen(null);
-            void load(p);
+            const action = pendingDiscard;
+            setPendingDiscard(null);
+            setDirty(false);
+            dirtyRef.current = false;
+            action();
           }}
-          onCancel={() => setPendingOpen(null)}
+          onCancel={() => setPendingDiscard(null)}
         />
       )}
 
-      {dragging && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            zIndex: 250,
-            background: "rgba(0,0,0,.45)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            pointerEvents: "none",
-            color: "#fff",
-            fontSize: 16,
-            fontWeight: 600,
-          }}
-        >
-          Drop an image to open its character card
-        </div>
+      {pendingDelete && (
+        <ConfirmModal
+          title="Delete this card?"
+          message={`${fileName(pendingDelete.path)} will be moved to the Recycle Bin.`}
+          confirmLabel="Delete"
+          cancelLabel="Cancel"
+          onConfirm={() => void runDelete(pendingDelete)}
+          onCancel={() => setPendingDelete(null)}
+        />
       )}
     </div>
   );
