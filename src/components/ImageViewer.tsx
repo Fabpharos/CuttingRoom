@@ -84,6 +84,12 @@ export default function ImageViewer({
           e.preventDefault();
           onToggleTag(current.name);
           break;
+        case "f":
+        case "F":
+          if (e.ctrlKey || e.metaKey || e.altKey) break;
+          e.preventDefault();
+          onToggleFavorite(current.name);
+          break;
         case "Escape":
           e.preventDefault();
           void closeAndRestore();
@@ -93,7 +99,7 @@ export default function ImageViewer({
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [index, images.length, isFullscreen, current.name, onNavigate, onToggleTag, onClose]);
+  }, [index, images.length, isFullscreen, current.name, onNavigate, onToggleTag, onToggleFavorite, onClose]);
 
   const needsEdit = !!tags[current.name];
   const favorite = !!favorites[current.name];
@@ -134,7 +140,7 @@ export default function ImageViewer({
               e.stopPropagation();
               onToggleFavorite(current.name);
             }}
-            title={favorite ? "Favorited" : "Mark as favorite"}
+            title={favorite ? "Favorited (F)" : "Mark as favorite (F)"}
             style={{
               width: 30,
               height: 30,

@@ -29,7 +29,25 @@ import {
   removeRecentFolder,
   type AlbumData,
 } from "../lib/albumStore";
-import { renameFolder, buildRenamePlan, renamePhotos } from "../lib/rename";
+import {
+  renameFolder,
+  buildRenamePlan,
+  renamePhotos,
+  RenameError,
+  TEMP_MARKER,
+  LEGACY_TEMP_MARKER,
+} from "../lib/rename";
+
+/** A warning when an interrupted rename left files under temporary names. */
+function leftoverWarning(names: string[]): string | null {
+  const stuck = names.filter((n) => n.includes(TEMP_MARKER) || n.includes(LEGACY_TEMP_MARKER));
+  if (stuck.length === 0) return null;
+  return (
+    `${stuck.length} file${stuck.length === 1 ? " was" : "s were"} left under a temporary name by an ` +
+    `interrupted rename (${stuck.slice(0, 3).join(", ")}${stuck.length > 3 ? ", …" : ""}). ` +
+    "They're intact; rename them back in File Explorer."
+  );
+}
 
 type PendingPhotoRename = {
   folderPath: string;
@@ -201,6 +219,15 @@ export default function AlbumTab({ active }: { active: boolean }) {
         return;
       }
 
+      if (e.key.toLowerCase() === "f" && !e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        const { selectedNames: sel, viewerOpen } = latestRef.current;
+        if (sel.size > 0 && !viewerOpen) {
+          e.preventDefault();
+          void toggleSelectedFavoritesRef.current();
+        }
+        return;
+      }
+
       if (e.key === "Delete" && !e.repeat) {
         const { selectedNames: sel, viewerOpen } = latestRef.current;
         if (sel.size > 0 && !viewerOpen) {
@@ -275,7 +302,7 @@ export default function AlbumTab({ active }: { active: boolean }) {
     setTags(albumTags);
     setFavorites(albumFavorites);
     setPendingRename(null);
-    setError(null);
+    setError(leftoverWarning(entries.map((e) => e.name)));
     setViewerIndex(null);
     setIsDirty(false);
     setNeedsEditFilterOn(false);
@@ -370,6 +397,20 @@ export default function AlbumTab({ active }: { active: boolean }) {
     await persist({ favorites: newFavorites });
   }
 
+  // F in the grid: favorites every selected photo, or unfavorites them all
+  // when they're all favorites already.
+  async function toggleSelectedFavorites() {
+    const names = images.filter((img) => selectedNames.has(img.name)).map((img) => img.name);
+    if (names.length === 0) return;
+    const value = !names.every((n) => favorites[n]);
+    const newFavorites = { ...favorites };
+    for (const n of names) newFavorites[n] = value;
+    setFavorites(newFavorites);
+    await persist({ favorites: newFavorites });
+  }
+  const toggleSelectedFavoritesRef = useRef(toggleSelectedFavorites);
+  toggleSelectedFavoritesRef.current = toggleSelectedFavorites;
+
   function handleSelect(index: number, shiftKey: boolean, ctrlKey: boolean) {
     const name = visibleImages[index]?.name;
     if (!name) return;
@@ -415,21 +456,34 @@ export default function AlbumTab({ active }: { active: boolean }) {
       setError(`Couldn't refresh folder: ${String(err)}`);
       return;
     }
+    // Drop photos that are gone (deleted in File Explorer, say) as well as
+    // adding new ones: a missing photo left in the album would make the next
+    // rename fail.
+    const onDisk = new Set(entries.filter((e) => e.isFile && isImageFile(e.name)).map((e) => e.name));
+    const kept = images.filter((i) => onDisk.has(i.name));
+    const removed = images.length - kept.length;
     const currentNames = new Set(images.map((i) => i.name));
-    const newNames = entries
-      .filter((e) => e.isFile && isImageFile(e.name) && !currentNames.has(e.name))
-      .map((e) => e.name)
-      .sort(naturalCompare);
-    if (newNames.length === 0) return;
+    const newNames = [...onDisk].filter((n) => !currentNames.has(n)).sort(naturalCompare);
+    setError(leftoverWarning(entries.map((e) => e.name)));
+    if (newNames.length === 0 && removed === 0) return;
 
-    const newImages = [...images, ...newNames.map((name) => ({ name, src: "" }))];
+    const newImages = [...kept, ...newNames.map((name) => ({ name, src: "" }))];
+    const newTags = Object.fromEntries(Object.entries(tags).filter(([n]) => onDisk.has(n)));
+    const newFavorites = Object.fromEntries(Object.entries(favorites).filter(([n]) => onDisk.has(n)));
     setImages(newImages);
+    setTags(newTags);
+    setFavorites(newFavorites);
+    if (removed > 0) {
+      setSelectedNames((prev) => new Set([...prev].filter((n) => onDisk.has(n))));
+      setSelectionAnchor(null);
+      setViewerIndex(null);
+    }
     setIsDirty(true);
     await saveAlbum(folderPath, {
       name: albumName,
       order: newImages.map((i) => i.name),
-      tags,
-      favorites,
+      tags: newTags,
+      favorites: newFavorites,
     });
 
     const myLoad = loadTokenRef.current;
@@ -572,7 +626,7 @@ export default function AlbumTab({ active }: { active: boolean }) {
       });
       return true;
     } catch (err) {
-      setError(`Couldn't rename photos: ${String(err)}`);
+      setError(err instanceof RenameError ? err.message : `Couldn't rename photos: ${String(err)}`);
       return false;
     }
   }
