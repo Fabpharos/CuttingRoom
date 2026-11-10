@@ -378,7 +378,7 @@ export default function Sidebar({
         />
         <NavItem
           icon={<CharacterCardTabIcon color={iconColorFor("characterCard")} />}
-          label="Character Card"
+          label="Character Cards"
           active={activeTab === "characterCard"}
           collapsed={collapsed}
           onClick={() => onSelectTab("characterCard")}

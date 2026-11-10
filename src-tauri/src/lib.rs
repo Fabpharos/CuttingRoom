@@ -3,7 +3,7 @@ mod matching;
 mod novelai;
 mod pdf_export;
 mod prompt_scan;
-mod character_card;
+mod character_preset;
 mod strip_metadata;
 
 use detection::{DetectionOutput, DetectionProgress, PixelateJob};
@@ -254,22 +254,25 @@ async fn scan_image_prompt(path: String) -> Result<prompt_scan::ScannedPrompt, S
 }
 
 #[tauri::command]
-async fn read_character_card(path: String) -> Result<character_card::CardInfo, String> {
-    tauri::async_runtime::spawn_blocking(move || character_card::read(&path))
+async fn list_character_cards(folder: String) -> Result<Vec<character_preset::CardFile>, String> {
+    tauri::async_runtime::spawn_blocking(move || character_preset::list(&folder))
         .await
         .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-async fn write_character_card(source: String, dest: String, data: serde_json::Value) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || character_card::write(&source, &dest, data))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-fn suggest_card_output(source: String) -> String {
-    character_card::suggest_output(&source)
+async fn save_character_card(
+    folder: String,
+    name: String,
+    card: serde_json::Value,
+    image: Option<String>,
+    existing: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        character_preset::save(&folder, &name, card, image.as_deref(), existing.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -359,9 +362,8 @@ pub fn run() {
             nai_cancel_batch,
             nai_read_image_metadata,
             scan_image_prompt,
-            read_character_card,
-            write_character_card,
-            suggest_card_output,
+            list_character_cards,
+            save_character_card,
             nai_read_prompt_file,
             nai_read_vibe_file,
             nai_scan_upscale,

@@ -42,6 +42,7 @@ import {
   type VibeRef,
 } from "../lib/novelai";
 import ConfirmModal from "./ConfirmModal";
+import CharacterCardDialog from "./CharacterCardDialog";
 import {
   openPromptFile,
   openWildcardsDir,
@@ -453,6 +454,7 @@ export default function GenerateTab({
   // "Custom" placement, and each character's position (kept the same length).
   const [useCoords, setUseCoords] = useState(false);
   const [characterPositions, setCharacterPositions] = useState<CharacterPosition[]>([]);
+  const [showCardDialog, setShowCardDialog] = useState(false);
   const [steps, setSteps] = useState(DEFAULT_STEPS);
   const [scale, setScale] = useState(DEFAULT_SCALE);
   const [outputDir, setOutputDir] = useState<string | null>(null);
@@ -1068,6 +1070,20 @@ export default function GenerateTab({
     }
   }
 
+  // Fills a character from a character card: a new one, or replaces one.
+  function loadCharacterCard(prompt: string, negative: string, slot: number | null) {
+    setShowCardDialog(false);
+    if (slot === null) {
+      if (characters.length >= MAX_CHARACTERS) return;
+      setCharacters((prev) => [...prev, prompt]);
+      setCharacterNegatives((prev) => [...prev, negative]);
+      setCharacterPositions((prev) => [...prev, CENTER]);
+    } else {
+      setCharacters((prev) => prev.map((c, j) => (j === slot ? prompt : c)));
+      setCharacterNegatives((prev) => prev.map((c, j) => (j === slot ? negative : c)));
+    }
+  }
+
   function addCharacter() {
     setCharacters((prev) => [...prev, ""]);
     setCharacterNegatives((prev) => [...prev, ""]);
@@ -1151,8 +1167,8 @@ export default function GenerateTab({
             lineHeight: 1.6,
           }}
         >
-          Text-to-image generation through your NovelAI account, limited to default
-          settings and the three standard resolutions.
+          Text-to-image generation through your NovelAI account, limited to settings
+          that are free on Opus: up to 28 steps and 1024×1024 worth of pixels.
         </div>
       </div>
 
@@ -1577,17 +1593,38 @@ export default function GenerateTab({
                 </button>
               </div>
             ))}
-            {characters.length < MAX_CHARACTERS && (
+            <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+              {characters.length < MAX_CHARACTERS && (
+                <a
+                  href="#"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    if (!generating) addCharacter();
+                  }}
+                  style={{ fontSize: 13, fontWeight: 600 }}
+                >
+                  + Add character
+                </a>
+              )}
               <a
                 href="#"
                 onClick={(e) => {
                   e.preventDefault();
-                  if (!generating) addCharacter();
+                  if (!generating) setShowCardDialog(true);
                 }}
-                style={{ fontSize: 13, fontWeight: 600, alignSelf: "flex-start" }}
+                title="Fill a character from one of your character cards"
+                style={{ fontSize: 13, fontWeight: 600 }}
               >
-                + Add character
+                Load character card…
               </a>
+            </div>
+            {showCardDialog && (
+              <CharacterCardDialog
+                characterCount={characters.length}
+                maxCharacters={MAX_CHARACTERS}
+                onLoad={loadCharacterCard}
+                onClose={() => setShowCardDialog(false)}
+              />
             )}
           </Field>
 
