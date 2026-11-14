@@ -43,6 +43,7 @@ import {
 } from "../lib/novelai";
 import ConfirmModal from "./ConfirmModal";
 import CharacterCardDialog from "./CharacterCardDialog";
+import TagSuggestions from "./TagSuggestions";
 import {
   openPromptFile,
   openWildcardsDir,
@@ -455,6 +456,8 @@ export default function GenerateTab({
   const [useCoords, setUseCoords] = useState(false);
   const [characterPositions, setCharacterPositions] = useState<CharacterPosition[]>([]);
   const [showCardDialog, setShowCardDialog] = useState(false);
+  // Prompt boxes marked data-tags get Danbooru tag suggestions.
+  const rootRef = useRef<HTMLDivElement>(null);
   const [steps, setSteps] = useState(DEFAULT_STEPS);
   const [scale, setScale] = useState(DEFAULT_SCALE);
   const [outputDir, setOutputDir] = useState<string | null>(null);
@@ -1156,7 +1159,8 @@ export default function GenerateTab({
   }
 
   return (
-    <div style={{ padding: 24, maxWidth: 720 }}>
+    <div ref={rootRef} style={{ padding: 24, maxWidth: 720 }}>
+      <TagSuggestions root={rootRef} active={active} />
       <div style={{ marginBottom: 18 }}>
         <div style={{ fontSize: 21, fontWeight: 700, marginBottom: 4 }}>Generate</div>
         <div
@@ -1484,6 +1488,7 @@ export default function GenerateTab({
             <textarea
               rows={4}
               value={prompt}
+              data-tags
               onChange={(e) => setPrompt(e.target.value)}
               onFocus={(e) => (lastFieldRef.current = { field: "prompt", el: e.currentTarget })}
               readOnly={generating}
@@ -1496,6 +1501,7 @@ export default function GenerateTab({
             <textarea
               rows={2}
               value={negativePrompt}
+              data-tags
               onChange={(e) => setNegativePrompt(e.target.value)}
               onFocus={(e) => (lastFieldRef.current = { field: "negative", el: e.currentTarget })}
               readOnly={generating}
@@ -1548,6 +1554,7 @@ export default function GenerateTab({
                     rows={2}
                     value={c}
                     placeholder={`Character ${i + 1}`}
+                    data-tags
                     onChange={(e) =>
                       setCharacters((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))
                     }
@@ -1562,6 +1569,7 @@ export default function GenerateTab({
                     rows={1}
                     value={characterNegatives[i] ?? ""}
                     placeholder={`Undesired for character ${i + 1}`}
+                    data-tags
                     onChange={(e) =>
                       setCharacterNegatives((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))
                     }
