@@ -43,3 +43,6 @@ CLAUDE.md
 # README explaining the folder is tracked.
 /wildcards/*
 !/wildcards/README.md
+
+# Character cards kept inside the project folder (personal)
+character-cards/
