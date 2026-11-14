@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -167,6 +167,33 @@ function ImportConfirmModal({
       </div>
     </div>
   );
+}
+
+// A textarea that grows with its text, from `minRows` up to `maxHeight`
+// pixels, then scrolls.
+function GrowingTextarea({
+  minRows,
+  maxHeight,
+  style,
+  ...props
+}: React.TextareaHTMLAttributes<HTMLTextAreaElement> & { minRows: number; maxHeight: number; "data-tags"?: boolean }) {
+  const ref = useRef<HTMLTextAreaElement>(null);
+  const [width, setWidth] = useState(0);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight + 2, maxHeight)}px`;
+  }, [props.value, minRows, maxHeight, width]);
+  // Rewrapping at a new width changes the height too.
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const ro = new ResizeObserver(([entry]) => setWidth(Math.round(entry.contentRect.width)));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return <textarea ref={ref} rows={minRows} {...props} style={{ ...style, resize: "none", overflowY: "auto" }} />;
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
@@ -458,6 +485,18 @@ export default function GenerateTab({
   const [showCardDialog, setShowCardDialog] = useState(false);
   // Prompt boxes marked data-tags get Danbooru tag suggestions.
   const rootRef = useRef<HTMLDivElement>(null);
+  // Two columns once the tab is wide enough.
+  const [wide, setWide] = useState(false);
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(([entry]) => setWide(entry.contentRect.width >= 1060));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  // Narrowing a long list of prompt files.
+  const [fileFilter, setFileFilter] = useState("");
+  const [usedOnly, setUsedOnly] = useState(false);
   const [steps, setSteps] = useState(DEFAULT_STEPS);
   const [scale, setScale] = useState(DEFAULT_SCALE);
   const [outputDir, setOutputDir] = useState<string | null>(null);
@@ -1158,189 +1197,83 @@ export default function GenerateTab({
     }
   }
 
-  return (
-    <div ref={rootRef} style={{ padding: 24, maxWidth: 720 }}>
-      <TagSuggestions root={rootRef} active={active} />
-      <div style={{ marginBottom: 18 }}>
-        <div style={{ fontSize: 21, fontWeight: 700, marginBottom: 4 }}>Generate</div>
-        <div
-          style={{
-            fontSize: 13,
-            color: "var(--muted)",
-            fontFamily: "system-ui, sans-serif",
-            lineHeight: 1.6,
-          }}
-        >
-          Text-to-image generation through your NovelAI account, limited to settings
-          that are free on Opus: up to 28 steps and 1024×1024 worth of pixels.
-        </div>
-      </div>
-
-      {error && (
-        <div
-          style={{
-            marginBottom: 14,
-            padding: "10px 14px",
-            borderRadius: 8,
-            background: "rgba(200,60,50,.12)",
-            border: "1px solid rgba(200,60,50,.35)",
-            fontSize: 13,
-            display: "flex",
-            justifyContent: "space-between",
-            gap: 12,
-          }}
-        >
-          <span>{error}</span>
-          <a
-            href="#"
-            onClick={(e) => {
-              e.preventDefault();
-              setError(null);
-            }}
-            style={{ whiteSpace: "nowrap" }}
-          >
-            Dismiss
-          </a>
-        </div>
-      )}
-
+  const lastCard = lastResult && (
+    <div style={cardStyle}>
+      <div style={cardTitleStyle}>LAST IMAGE</div>
+      <img
+        src={lastResult.src}
+        alt="Generated image"
+        style={{ display: "block", maxWidth: "100%", maxHeight: 560, borderRadius: 8 }}
+      />
       <div
         style={{
-          background: "var(--bg-card)",
-          border: "1px solid var(--border)",
-          borderRadius: 10,
-          padding: "14px 16px",
+          marginTop: 8,
+          fontSize: 12,
+          fontFamily: "'IBM Plex Mono', monospace",
+          color: "var(--muted)",
+          wordBreak: "break-all",
         }}
       >
-        <div style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", marginBottom: 10 }}>
-          NOVELAI ACCOUNT
-        </div>
-
-        {(phase === "unchecked" || phase === "checking") && (
-          <div style={{ fontSize: 13, color: "var(--muted)" }}>Checking saved token…</div>
-        )}
-
-        {phase === "loggedOut" && (
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (!busy && tokenInput.trim()) void logIn();
-            }}
-            style={{ display: "flex", gap: 10 }}
-          >
-            <input
-              type="password"
-              autoComplete="off"
-              spellCheck={false}
-              placeholder="Persistent API token (pst-…)"
-              value={tokenInput}
-              onChange={(e) => setTokenInput(e.target.value)}
-              disabled={busy}
-              style={{ ...inputStyle, flex: 1 }}
-            />
-            <button
-              type="submit"
-              disabled={busy || !tokenInput.trim()}
-              style={{
-                ...primaryButtonStyle,
-                opacity: busy || !tokenInput.trim() ? 0.5 : 1,
-                cursor: busy || !tokenInput.trim() ? "default" : "pointer",
-              }}
-            >
-              {busy ? "Checking…" : "Log in"}
-            </button>
-          </form>
-        )}
-
-        {phase === "loggedIn" && status && (
-          <>
-            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-              <div style={{ flex: 1, fontSize: 13.5 }}>
-                <span style={{ fontWeight: 700 }}>{status.tierName}</span>
-                {!status.active && <span style={{ color: "var(--muted)" }}> (inactive)</span>}
-                <span
-                  style={{
-                    marginLeft: 10,
-                    fontFamily: "'IBM Plex Mono', monospace",
-                    fontSize: 12,
-                    color: "var(--muted)",
-                  }}
-                >
-                  {status.anlas.toLocaleString()} ANLAS
-                </span>
-                {status.isOpus && status.usage && (
-                  <span
-                    title="Opus generations with V5 models draw from this refilling quota. V4 and V4.5 are unlimited."
-                    style={{
-                      marginLeft: 10,
-                      fontFamily: "'IBM Plex Mono', monospace",
-                      fontSize: 12,
-                      color: status.usage.isNegative ? "rgb(200,140,40)" : "var(--muted)",
-                    }}
-                  >
-                    V5 QUOTA{" "}
-                    {status.usage.isNegative
-                      ? "USED UP"
-                      : `${status.usage.percent + status.usage.purchasedPercent}%`}
-                  </span>
-                )}
-              </div>
-              <a
-                href="#"
-                onClick={(e) => {
-                  e.preventDefault();
-                  void refreshStatus();
-                }}
-                style={{ fontSize: 13, fontWeight: 600 }}
-              >
-                Refresh
-              </a>
-              <button
-                onClick={() => void logOut()}
-                disabled={busy}
-                style={{ ...secondaryButtonStyle, opacity: busy ? 0.5 : 1 }}
-              >
-                Log out
-              </button>
-            </div>
-
-            {!status.isOpus && (
-              <div style={warningBoxStyle}>
-                {status.active
-                  ? `Your ${status.tierName} subscription isn't Opus, so every image generated here will cost Anlas.`
-                  : "Your subscription is inactive, so every image generated here will cost Anlas."}
-              </div>
-            )}
-          </>
-        )}
-      </div>
-
-      {phase === "loggedIn" && (
-        <div
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.repeat) {
-              e.preventDefault();
-              requestGenerate();
-            }
+        Seed {lastResult.seed} · {lastResult.path}{" "}
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            void revealFilesInExplorer([lastResult.path]).catch((err) =>
+              setError(`Couldn't open Explorer: ${String(err)}`),
+            );
           }}
-          title="Ctrl+Enter to generate"
-          style={{ ...cardStyle, marginTop: 16, display: "flex", flexDirection: "column", gap: 14 }}
+          style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, whiteSpace: "nowrap" }}
         >
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <div style={{ ...cardTitleStyle, marginBottom: 0 }}>GENERATION</div>
-            <a
-              href="#"
-              onClick={(e) => {
-                e.preventDefault();
-                if (!generating) void chooseImportImage();
+          Show in Explorer
+        </a>
+      </div>
+      {batchImages.length > 1 && (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 12 }}>
+          {batchImages.map((img) => (
+            <img
+              key={img.path}
+              src={img.src}
+              alt=""
+              title={`Seed ${img.seed}`}
+              onClick={() => setLastResult(img)}
+              style={{
+                width: 64,
+                height: 64,
+                objectFit: "cover",
+                borderRadius: 6,
+                cursor: "pointer",
+                outline: img.path === lastResult.path ? "2px solid var(--accent)" : "none",
+                outlineOffset: 1,
               }}
-              title="Fill these settings from a NovelAI image (or drag one onto this tab)"
-              style={{ fontSize: 13, fontWeight: 600 }}
-            >
-              Import from image…
-            </a>
-          </div>
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
 
+  // The layout: everything scrolls except the bar at the bottom (output
+  // folder, image count, Generate). A wide window gets two columns, with the
+  // characters on the right.
+  const settingsCard = (
+    <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 14 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ ...cardTitleStyle, marginBottom: 0 }}>SETTINGS</div>
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            if (!generating) void chooseImportImage();
+          }}
+          title="Fill these settings from a NovelAI image (or drag one onto this tab)"
+          style={{ fontSize: 13, fontWeight: 600 }}
+        >
+          Import from image…
+        </a>
+      </div>
+      <div style={{ display: "flex", gap: "14px 28px", flexWrap: "wrap", alignItems: "flex-start" }}>
+        <div style={{ flex: "1 1 520px", minWidth: 0 }}>
           <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
             <div style={{ flex: "1 1 240px" }}>
               <Field label="Model">
@@ -1446,7 +1379,8 @@ export default function GenerateTab({
               )}
             </Field>
           </div>
-
+        </div>
+        <div style={{ flex: "1 1 360px", minWidth: 0 }}>
           <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
             <div style={{ flex: "1 1 220px" }}>
               <Field
@@ -1483,721 +1417,969 @@ export default function GenerateTab({
               </Field>
             </div>
           </div>
+        </div>
+      </div>
+    </div>
+  );
 
-          <Field label="Prompt">
-            <textarea
-              rows={4}
-              value={prompt}
-              data-tags
-              onChange={(e) => setPrompt(e.target.value)}
-              onFocus={(e) => (lastFieldRef.current = { field: "prompt", el: e.currentTarget })}
-              readOnly={generating}
-              style={textareaStyle}
-            />
-            {preview(prompt)}
-          </Field>
+  const promptCard = (
+    <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 14 }}>
+      <Field label="Prompt">
+        <GrowingTextarea
+          minRows={wide ? 9 : 6}
+          maxHeight={560}
+          value={prompt}
+          data-tags
+          onChange={(e) => setPrompt(e.target.value)}
+          onFocus={(e) => (lastFieldRef.current = { field: "prompt", el: e.currentTarget })}
+          readOnly={generating}
+          style={textareaStyle}
+        />
+        {preview(prompt)}
+      </Field>
+      <Field label="Undesired content">
+        <GrowingTextarea
+          minRows={wide ? 5 : 3}
+          maxHeight={360}
+          value={negativePrompt}
+          data-tags
+          onChange={(e) => setNegativePrompt(e.target.value)}
+          onFocus={(e) => (lastFieldRef.current = { field: "negative", el: e.currentTarget })}
+          readOnly={generating}
+          style={textareaStyle}
+        />
+        {preview(negativePrompt)}
+      </Field>
+    </div>
+  );
 
-          <Field label="Undesired content">
-            <textarea
-              rows={2}
-              value={negativePrompt}
-              data-tags
-              onChange={(e) => setNegativePrompt(e.target.value)}
-              onFocus={(e) => (lastFieldRef.current = { field: "negative", el: e.currentTarget })}
-              readOnly={generating}
-              style={textareaStyle}
-            />
-            {preview(negativePrompt)}
-          </Field>
-
-          <Field label={`Characters (${characters.length}/${MAX_CHARACTERS})`}>
-            {characters.length > 0 && (
-              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", fontSize: 12.5 }}>
-                <span style={{ color: "var(--muted)", fontWeight: 600, fontSize: 12 }}>Placement</span>
-                <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: 7, overflow: "hidden" }}>
-                  {([false, true] as const).map((custom) => (
-                    <button
-                      key={String(custom)}
-                      onClick={() => setUseCoords(custom)}
-                      disabled={generating}
-                      style={{
-                        padding: "3px 10px",
-                        border: "none",
-                        background: useCoords === custom ? "var(--accent)" : "transparent",
-                        color: useCoords === custom ? "var(--accent-contrast)" : "var(--text)",
-                        fontFamily: "'Space Grotesk', sans-serif",
-                        fontWeight: 600,
-                        fontSize: 12,
-                        cursor: "pointer",
-                      }}
-                    >
-                      {custom ? "Custom" : "AI's choice"}
-                    </button>
-                  ))}
-                </div>
-                {useCoords && !positionsApply(model, characters.filter((c) => c.trim() !== "").length) && (
-                  <span style={{ color: "rgb(200,140,40)", fontFamily: "system-ui, sans-serif" }}>
-                    V4 and V4.5 place characters only when there are two or more; until then the model decides.
-                  </span>
-                )}
-                {useCoords && positionsApply(model, characters.filter((c) => c.trim() !== "").length) && (
-                  <span style={{ color: "var(--muted)", fontFamily: "system-ui, sans-serif" }}>
-                    {freeCharacterPositions(model) ? "V5: place anywhere." : "V4/V4.5: snaps to NovelAI's 5×5 grid."}
-                  </span>
-                )}
-              </div>
-            )}
-            {characters.map((c, i) => (
-              <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-                <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 4 }}>
-                  <textarea
-                    rows={2}
-                    value={c}
-                    placeholder={`Character ${i + 1}`}
-                    data-tags
-                    onChange={(e) =>
-                      setCharacters((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))
-                    }
-                    onFocus={(e) =>
-                      (lastFieldRef.current = { field: { character: i, negative: false }, el: e.currentTarget })
-                    }
-                    readOnly={generating}
-                    style={textareaStyle}
-                  />
-                  {preview(c, true)}
-                  <textarea
-                    rows={1}
-                    value={characterNegatives[i] ?? ""}
-                    placeholder={`Undesired for character ${i + 1}`}
-                    data-tags
-                    onChange={(e) =>
-                      setCharacterNegatives((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))
-                    }
-                    onFocus={(e) =>
-                      (lastFieldRef.current = { field: { character: i, negative: true }, el: e.currentTarget })
-                    }
-                    readOnly={generating}
-                    style={{ ...textareaStyle, fontSize: 12.5, padding: "6px 10px" }}
-                  />
-                  {preview(characterNegatives[i] ?? "")}
-                </div>
-                {useCoords && (
-                  <PositionPicker
-                    index={i}
-                    positions={characterPositions}
-                    model={model}
-                    aspect={size.width / size.height}
-                    disabled={generating}
-                    onChange={(p) => setCharacterPositions((prev) => prev.map((q, j) => (j === i ? p : q)))}
-                  />
-                )}
-                <button
-                  onClick={() => removeCharacter(i)}
-                  disabled={generating}
-                  title="Remove character"
-                  style={{ ...secondaryButtonStyle, padding: "6px 12px" }}
-                >
-                  Remove
-                </button>
-              </div>
+  const charactersCard = (
+    <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+        <div style={{ ...cardTitleStyle, marginBottom: 0, flex: 1 }}>
+          CHARACTERS ({characters.length}/{MAX_CHARACTERS})
+        </div>
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            if (!generating) setShowCardDialog(true);
+          }}
+          title="Fill a character from one of your character cards"
+          style={{ fontSize: 13, fontWeight: 600 }}
+        >
+          Load character card…
+        </a>
+        {characters.length < MAX_CHARACTERS && (
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault();
+              if (!generating) addCharacter();
+            }}
+            style={{ fontSize: 13, fontWeight: 600 }}
+          >
+            + Add character
+          </a>
+        )}
+      </div>
+      {characters.length > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", fontSize: 12.5 }}>
+          <span style={{ color: "var(--muted)", fontWeight: 600, fontSize: 12 }}>Placement</span>
+          <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: 7, overflow: "hidden" }}>
+            {([false, true] as const).map((custom) => (
+              <button
+                key={String(custom)}
+                onClick={() => setUseCoords(custom)}
+                disabled={generating}
+                style={{
+                  padding: "3px 10px",
+                  border: "none",
+                  background: useCoords === custom ? "var(--accent)" : "transparent",
+                  color: useCoords === custom ? "var(--accent-contrast)" : "var(--text)",
+                  fontFamily: "'Space Grotesk', sans-serif",
+                  fontWeight: 600,
+                  fontSize: 12,
+                  cursor: "pointer",
+                }}
+              >
+                {custom ? "Custom" : "AI's choice"}
+              </button>
             ))}
-            <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
-              {characters.length < MAX_CHARACTERS && (
+          </div>
+          {useCoords && !positionsApply(model, characters.filter((c) => c.trim() !== "").length) && (
+            <span style={{ color: "rgb(200,140,40)", fontFamily: "system-ui, sans-serif" }}>
+              V4 and V4.5 place characters only when there are two or more; until then the model decides.
+            </span>
+          )}
+          {useCoords && positionsApply(model, characters.filter((c) => c.trim() !== "").length) && (
+            <span style={{ color: "var(--muted)", fontFamily: "system-ui, sans-serif" }}>
+              {freeCharacterPositions(model) ? "V5: place anywhere." : "V4/V4.5: snaps to NovelAI's 5×5 grid."}
+            </span>
+          )}
+        </div>
+      )}
+      {characters.length === 0 && (
+        <div style={{ fontSize: 12.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif", lineHeight: 1.5 }}>
+          No characters. Each character gets its own prompt and undesired content, and can be placed in the
+          picture. Add one, or load one of your character cards.
+        </div>
+      )}
+      {characters.map((c, i) => (
+        <div
+          key={i}
+          style={{
+            border: "1px solid var(--border)",
+            borderRadius: 8,
+            padding: "8px 10px 10px",
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center" }}>
+            <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", flex: 1 }}>Character {i + 1}</span>
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                if (!generating) removeCharacter(i);
+              }}
+              title="Remove character"
+              style={{ fontSize: 12.5, fontWeight: 600 }}
+            >
+              Remove
+            </a>
+          </div>
+          <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+            <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 6 }}>
+              <GrowingTextarea
+                minRows={wide ? 4 : 3}
+                maxHeight={360}
+                value={c}
+                placeholder={`Character ${i + 1}`}
+                data-tags
+                onChange={(e) => setCharacters((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))}
+                onFocus={(e) => (lastFieldRef.current = { field: { character: i, negative: false }, el: e.currentTarget })}
+                readOnly={generating}
+                style={textareaStyle}
+              />
+              {preview(c, true)}
+              <GrowingTextarea
+                minRows={1}
+                maxHeight={200}
+                value={characterNegatives[i] ?? ""}
+                placeholder={`Undesired for character ${i + 1}`}
+                data-tags
+                onChange={(e) =>
+                  setCharacterNegatives((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))
+                }
+                onFocus={(e) => (lastFieldRef.current = { field: { character: i, negative: true }, el: e.currentTarget })}
+                readOnly={generating}
+                style={{ ...textareaStyle, fontSize: 12.5, padding: "6px 10px" }}
+              />
+              {preview(characterNegatives[i] ?? "")}
+            </div>
+            {useCoords && (
+              <PositionPicker
+                index={i}
+                positions={characterPositions}
+                model={model}
+                aspect={size.width / size.height}
+                disabled={generating}
+                onChange={(p) => setCharacterPositions((prev) => prev.map((q, j) => (j === i ? p : q)))}
+              />
+            )}
+          </div>
+        </div>
+      ))}
+      {showCardDialog && (
+        <CharacterCardDialog
+          characterCount={characters.length}
+          maxCharacters={MAX_CHARACTERS}
+          onLoad={loadCharacterCard}
+          onClose={() => setShowCardDialog(false)}
+        />
+      )}
+    </div>
+  );
+
+  // Prompt files can number in the hundreds, so the list scrolls and can be filtered.
+  const filterText = fileFilter.trim().toLowerCase();
+  const shownFiles = promptFiles.filter(
+    (f) => (!usedOnly || usedNames.has(f.name)) && (filterText === "" || f.name.toLowerCase().includes(filterText)),
+  );
+  const unusedCount = promptFiles.filter((f) => !usedNames.has(f.name)).length;
+  const promptFilesCard = (
+    <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <span style={{ ...cardTitleStyle, marginBottom: 0, flex: 1 }}>
+          PROMPT FILES
+          {promptFiles.length > 0 && (
+            <span style={{ fontWeight: 500 }}>
+              {" "}
+              · {promptFiles.length} loaded, {promptFiles.length - unusedCount} in use
+            </span>
+          )}
+        </span>
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            void openWildcardsDir().catch((err) => setError(String(err)));
+          }}
+          title="Open the project's wildcards folder, where prompt files live by default"
+          style={{ fontSize: 13, fontWeight: 600 }}
+        >
+          Open folder
+        </a>
+        <button
+          onClick={() => void addPromptFiles()}
+          disabled={generating}
+          style={{ ...secondaryButtonStyle, padding: "5px 14px" }}
+        >
+          Add .txt files…
+        </button>
+      </div>
+
+      {promptFiles.length === 0 ? (
+        <div style={{ fontSize: 12.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif", lineHeight: 1.5 }}>
+          Text files with one prompt per line, kept in the project's <code>wildcards</code>{" "}
+          folder. Each file gets a token like <code>__hair__</code>; put it in any prompt,
+          undesired content or character, and every image fills it with a line from that file.
+        </div>
+      ) : (
+        <>
+          {promptFiles.length > 5 && (
+            <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", fontSize: 12.5 }}>
+              <input
+                value={fileFilter}
+                onChange={(e) => setFileFilter(e.target.value)}
+                placeholder="Filter files…"
+                spellCheck={false}
+                style={{ ...inputStyle, background: "var(--bg-page)", flex: "1 1 160px", padding: "5px 10px", fontSize: 12.5 }}
+              />
+              <label style={{ display: "flex", alignItems: "center", gap: 6, whiteSpace: "nowrap" }}>
+                <input
+                  type="checkbox"
+                  checked={usedOnly}
+                  onChange={(e) => setUsedOnly(e.target.checked)}
+                  style={{ accentColor: "var(--accent)" }}
+                />
+                In use only
+              </label>
+              {unusedCount > 0 && (
                 <a
                   href="#"
                   onClick={(e) => {
                     e.preventDefault();
-                    if (!generating) addCharacter();
+                    if (!generating) setPromptFiles((prev) => prev.filter((x) => usedNames.has(x.name)));
                   }}
-                  style={{ fontSize: 13, fontWeight: 600 }}
+                  title="Take every file whose token isn't in any prompt off this list (the files stay on disk)"
+                  style={{ fontWeight: 600, whiteSpace: "nowrap" }}
                 >
-                  + Add character
+                  Remove {unusedCount} unused
                 </a>
               )}
-              <a
-                href="#"
-                onClick={(e) => {
-                  e.preventDefault();
-                  if (!generating) setShowCardDialog(true);
-                }}
-                title="Fill a character from one of your character cards"
-                style={{ fontSize: 13, fontWeight: 600 }}
-              >
-                Load character card…
-              </a>
             </div>
-            {showCardDialog && (
-              <CharacterCardDialog
-                characterCount={characters.length}
-                maxCharacters={MAX_CHARACTERS}
-                onLoad={loadCharacterCard}
-                onClose={() => setShowCardDialog(false)}
-              />
-            )}
-          </Field>
-
+          )}
           <div
             style={{
-              border: "1px solid var(--border)",
-              borderRadius: 8,
-              padding: "10px 14px",
               display: "flex",
               flexDirection: "column",
               gap: 8,
+              maxHeight: 340,
+              overflowY: "auto",
+              paddingRight: 4,
             }}
           >
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", flex: 1 }}>
-                PROMPT FILES
-              </span>
-              <a
-                href="#"
-                onClick={(e) => {
-                  e.preventDefault();
-                  void openWildcardsDir().catch((err) => setError(String(err)));
-                }}
-                title="Open the project's wildcards folder, where prompt files live by default"
-                style={{ fontSize: 13, fontWeight: 600 }}
-              >
-                Open folder
-              </a>
-              <button
-                onClick={() => void addPromptFiles()}
-                disabled={generating}
-                style={{ ...secondaryButtonStyle, padding: "5px 14px" }}
-              >
-                Add .txt files…
-              </button>
-            </div>
-
-            {promptFiles.length === 0 ? (
-              <div style={{ fontSize: 12.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif", lineHeight: 1.5 }}>
-                Text files with one prompt per line, kept in the project's <code>wildcards</code>{" "}
-                folder. Each file gets a token like <code>__hair__</code>; put it in any prompt,
-                undesired content or character, and every image fills it with a line from that file.
-              </div>
-            ) : (
-              <>
-                {promptFiles.map((f) => (
-                  <div key={f.path} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12.5 }}>
-                    <button
-                      onClick={() => insertToken(f.name)}
-                      disabled={generating || f.lines.length === 0}
-                      title={`${f.path}\nClick to insert ${tokenFor(f.name)} where you're typing`}
-                      style={{
-                        padding: "3px 8px",
-                        borderRadius: 6,
-                        border: "1px solid var(--border)",
-                        background: "var(--bg-page)",
-                        color: "var(--text)",
-                        fontFamily: "'IBM Plex Mono', monospace",
-                        fontSize: 12,
-                        cursor: "pointer",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {tokenFor(f.name)}
-                    </button>
-                    <span
-                      style={{
-                        flex: 1,
-                        minWidth: 0,
-                        color: f.error ? "rgb(200,140,40)" : "var(--muted)",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                      }}
-                      title={f.error ?? f.path}
-                    >
-                      {f.error
-                        ? f.error
-                        : `${f.lines.length} ${f.partNames.length > 0 ? "entr" + (f.lines.length === 1 ? "y" : "ies") : "line" + (f.lines.length === 1 ? "" : "s")}${usedNames.has(f.name) ? "" : " · not used yet"}`}
-                    </span>
-                    {!f.error && (
-                      <>
-                        <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: 7, overflow: "hidden" }}>
-                          {(["random", "sequential"] as const).map((m: PromptFileMode) => (
-                            <button
-                              key={m}
-                              onClick={() => updatePromptFile(f.path, { mode: m })}
-                              disabled={generating}
-                              style={{
-                                padding: "3px 9px",
-                                border: "none",
-                                background: f.mode === m ? "var(--accent)" : "transparent",
-                                color: f.mode === m ? "var(--accent-contrast)" : "var(--text)",
-                                fontFamily: "'Space Grotesk', sans-serif",
-                                fontWeight: 600,
-                                fontSize: 12,
-                                cursor: "pointer",
-                              }}
-                            >
-                              {m === "random" ? "Random" : "Sequential"}
-                            </button>
-                          ))}
-                        </div>
-                        {f.mode === "sequential" && (
-                          <span style={{ whiteSpace: "nowrap", fontFamily: "'IBM Plex Mono', monospace", fontSize: 11.5 }}>
-                            next{" "}
-                            <input
-                              type="number"
-                              min={1}
-                              max={f.lines.length}
-                              value={f.position + 1}
-                              onChange={(e) => setPosition(f, Math.round(Number(e.target.value)))}
-                              disabled={generating}
-                              title={`Which ${f.partNames.length > 0 ? "entry" : "line"} the next image uses (1–${f.lines.length})`}
-                              style={{
-                                width: `${String(f.lines.length).length + 3}ch`,
-                                padding: "1px 4px",
-                                borderRadius: 5,
-                                border: "1px solid var(--border)",
-                                background: "var(--bg-page)",
-                                color: "var(--text)",
-                                fontFamily: "'IBM Plex Mono', monospace",
-                                fontSize: 11.5,
-                              }}
-                            />
-                            /{f.lines.length}
-                            {f.position > 0 && (
-                              <a
-                                href="#"
-                                onClick={(e) => {
-                                  e.preventDefault();
-                                  if (!generating) resetPosition(f);
-                                }}
-                                title="Start again from the first line"
-                                style={{ marginLeft: 6, fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600 }}
-                              >
-                                Reset
-                              </a>
-                            )}
-                          </span>
-                        )}
-                      </>
-                    )}
-                    <a
-                      href="#"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        if (!generating) setPromptFiles((prev) => prev.filter((x) => x.path !== f.path));
-                      }}
-                      title="Remove this file (its token is left in the prompt)"
-                      style={{ fontWeight: 600 }}
-                    >
-                      Remove
-                    </a>
-                  </div>
-                  {f.partNames.length > 0 && (
-                    <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", paddingLeft: 12, fontSize: 12 }}>
-                      <span style={{ color: "var(--muted)" }}>Parts</span>
-                      {f.partNames.map((p) => (
+            {shownFiles.length === 0 && <div style={{ fontSize: 12.5, color: "var(--muted)" }}>No files match.</div>}
+            {shownFiles.map((f) => (
+              <div key={f.path} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12.5 }}>
+                <button
+                  onClick={() => insertToken(f.name)}
+                  disabled={generating || f.lines.length === 0}
+                  title={`${f.path}\nClick to insert ${tokenFor(f.name)} where you're typing`}
+                  style={{
+                    padding: "3px 8px",
+                    borderRadius: 6,
+                    border: "1px solid var(--border)",
+                    background: "var(--bg-page)",
+                    color: "var(--text)",
+                    fontFamily: "'IBM Plex Mono', monospace",
+                    fontSize: 12,
+                    cursor: "pointer",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {tokenFor(f.name)}
+                </button>
+                <span
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    color: f.error ? "rgb(200,140,40)" : "var(--muted)",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                  title={f.error ?? f.path}
+                >
+                  {f.error
+                    ? f.error
+                    : `${f.lines.length} ${f.partNames.length > 0 ? "entr" + (f.lines.length === 1 ? "y" : "ies") : "line" + (f.lines.length === 1 ? "" : "s")}${usedNames.has(f.name) ? "" : " · not used yet"}`}
+                </span>
+                {!f.error && (
+                  <>
+                    <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: 7, overflow: "hidden" }}>
+                      {(["random", "sequential"] as const).map((m: PromptFileMode) => (
                         <button
-                          key={p}
-                          onClick={() => insertToken(`${f.name}:${p}`)}
+                          key={m}
+                          onClick={() => updatePromptFile(f.path, { mode: m })}
                           disabled={generating}
-                          title={`Click to insert ${tokenFor(f.name, p)}: each entry's "${p}:" line`}
                           style={{
-                            padding: "1px 7px",
-                            borderRadius: 6,
+                            padding: "3px 9px",
+                            border: "none",
+                            background: f.mode === m ? "var(--accent)" : "transparent",
+                            color: f.mode === m ? "var(--accent-contrast)" : "var(--text)",
+                            fontFamily: "'Space Grotesk', sans-serif",
+                            fontWeight: 600,
+                            fontSize: 12,
+                            cursor: "pointer",
+                          }}
+                        >
+                          {m === "random" ? "Random" : "Sequential"}
+                        </button>
+                      ))}
+                    </div>
+                    {f.mode === "sequential" && (
+                      <span style={{ whiteSpace: "nowrap", fontFamily: "'IBM Plex Mono', monospace", fontSize: 11.5 }}>
+                        next{" "}
+                        <input
+                          type="number"
+                          min={1}
+                          max={f.lines.length}
+                          value={f.position + 1}
+                          onChange={(e) => setPosition(f, Math.round(Number(e.target.value)))}
+                          disabled={generating}
+                          title={`Which ${f.partNames.length > 0 ? "entry" : "line"} the next image uses (1–${f.lines.length})`}
+                          style={{
+                            width: `${String(f.lines.length).length + 3}ch`,
+                            padding: "1px 4px",
+                            borderRadius: 5,
                             border: "1px solid var(--border)",
                             background: "var(--bg-page)",
                             color: "var(--text)",
                             fontFamily: "'IBM Plex Mono', monospace",
                             fontSize: 11.5,
-                            cursor: "pointer",
                           }}
-                        >
-                          :{p}
-                        </button>
-                      ))}
-                      <a
-                        href="#"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          if (!generating) usePairedFile(f);
-                        }}
-                        title="Put the main token in the prompt and each part in its character"
-                        style={{ fontWeight: 600, marginLeft: 4 }}
-                      >
-                        Use in prompts
-                      </a>
-                    </div>
-                  )}
-                  </div>
-                ))}
-                <div style={{ fontSize: 11.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif" }}>
-                  Click a token to insert it where you're typing. Each image uses one entry per file, so a
-                  paired file's parts always match its main line.
-                </div>
-              </>
-            )}
-            {tokenProblem && <div style={{ ...warningBoxStyle, marginTop: 0, fontSize: 12.5 }}>{tokenProblem}</div>}
-          </div>
-
-          <div
-            style={{
-              border: "1px solid var(--border)",
-              borderRadius: 8,
-              padding: "12px 14px",
-              display: "flex",
-              flexDirection: "column",
-              gap: 12,
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", flex: 1 }}>
-                VIBE TRANSFER
-                {vibes.length > 0 && modelInfo.vibes && (
-                  <span style={{ fontWeight: 500 }}>
-                    {" "}
-                    · {vibeRefs.length} of {MAX_VIBES} in use
-                  </span>
+                        />
+                        /{f.lines.length}
+                        {f.position > 0 && (
+                          <a
+                            href="#"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              if (!generating) resetPosition(f);
+                            }}
+                            title="Start again from the first line"
+                            style={{ marginLeft: 6, fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600 }}
+                          >
+                            Reset
+                          </a>
+                        )}
+                      </span>
+                    )}
+                  </>
                 )}
-              </span>
-              <button
-                onClick={() => void chooseVibeFiles()}
-                disabled={generating}
-                style={{ ...secondaryButtonStyle, padding: "6px 14px" }}
-              >
-                Add vibe file…
-              </button>
-            </div>
-
-            {vibes.length === 0 && (
-              <div style={{ fontSize: 12.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif" }}>
-                Use .naiv4vibe or .naiv4vibebundle files exported from NovelAI, or a NovelAI PNG
-                with vibes embedded. Only vibes already encoded for the selected model are used,
-                so they stay free — up to {MAX_VIBES} at a time.
+                <a
+                  href="#"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    if (!generating) setPromptFiles((prev) => prev.filter((x) => x.path !== f.path));
+                  }}
+                  title="Remove this file (its token is left in the prompt)"
+                  style={{ fontWeight: 600 }}
+                >
+                  Remove
+                </a>
               </div>
-            )}
-
-            {vibes.length > 0 && !modelInfo.vibes && (
-              <div style={{ ...warningBoxStyle, marginTop: 0 }}>
-                V5 models don't support Vibe Transfer yet, so these vibes are ignored. Switch to a
-                V4 or V4.5 model to use them.
-              </div>
-            )}
-
-            {vibes.map((v) => {
-              const options = v.info ? v.info.encodings.filter((e) => e.model === model) : [];
-              const encoding = v.info && vibeEncodingFor(v.info, model, v.informationExtracted);
-              const status = v.error
-                ? v.error
-                : !modelInfo.vibes
-                  ? null
-                  : encoding
-                    ? null
-                    : `Not encoded for ${modelInfo.label}, so it isn't used. Encoding it would cost Anlas.`;
-              return (
-                <div key={v.key} style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                  <input
-                    type="checkbox"
-                    checked={v.enabled}
-                    onChange={(e) => updateVibe(v.key, { enabled: e.target.checked })}
-                    disabled={generating || (!v.enabled && vibesOn >= MAX_VIBES)}
-                    title={
-                      !v.enabled && vibesOn >= MAX_VIBES
-                        ? `Up to ${MAX_VIBES} vibes at once; more would cost Anlas`
-                        : "Use this vibe"
-                    }
-                    style={{ accentColor: "var(--accent)" }}
-                  />
-                  {v.info?.thumbnail ? (
-                    <img
-                      src={v.info.thumbnail}
-                      alt=""
-                      style={{ width: 44, height: 44, objectFit: "cover", borderRadius: 6, flexShrink: 0 }}
-                    />
-                  ) : (
-                    <div
+              {f.partNames.length > 0 && (
+                <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", paddingLeft: 12, fontSize: 12 }}>
+                  <span style={{ color: "var(--muted)" }}>Parts</span>
+                  {f.partNames.map((p) => (
+                    <button
+                      key={p}
+                      onClick={() => insertToken(`${f.name}:${p}`)}
+                      disabled={generating}
+                      title={`Click to insert ${tokenFor(f.name, p)}: each entry's "${p}:" line`}
                       style={{
-                        width: 44,
-                        height: 44,
+                        padding: "1px 7px",
                         borderRadius: 6,
-                        flexShrink: 0,
-                        background: "var(--bg-page)",
                         border: "1px solid var(--border)",
-                      }}
-                    />
-                  )}
-                  <div
-                    style={{
-                      flex: 1,
-                      minWidth: 0,
-                      display: "flex",
-                      flexDirection: "column",
-                      gap: 4,
-                      opacity: v.enabled ? 1 : 0.6,
-                    }}
-                  >
-                    <div
-                      title={v.path}
-                      style={{
-                        fontSize: 13,
-                        fontWeight: 600,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
+                        background: "var(--bg-page)",
+                        color: "var(--text)",
+                        fontFamily: "'IBM Plex Mono', monospace",
+                        fontSize: 11.5,
+                        cursor: "pointer",
                       }}
                     >
-                      {v.info?.name ?? fileName(v.path)}
-                    </div>
-                    {status ? (
-                      <div style={{ fontSize: 12, color: "rgb(200,140,40)", fontFamily: "system-ui, sans-serif" }}>
-                        {status}
-                      </div>
-                    ) : (
-                      v.info && (
-                        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-                          <label
-                            style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, flex: "1 1 180px" }}
-                          >
-                            <span style={{ whiteSpace: "nowrap", minWidth: 86 }}>
-                              Strength {v.strength.toFixed(2)}
-                            </span>
-                            <input
-                              type="range"
-                              min={0}
-                              max={1}
-                              step={0.01}
-                              value={v.strength}
-                              onChange={(e) => updateVibe(v.key, { strength: Number(e.target.value) })}
-                              disabled={generating}
-                              style={{ flex: 1, minWidth: 80, accentColor: "var(--accent)" }}
-                            />
-                          </label>
-                          {encoding && options.length > 1 ? (
-                            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
-                              Info extracted
-                              <select
-                                value={options.indexOf(encoding)}
-                                onChange={(e) =>
-                                  updateVibe(v.key, {
-                                    informationExtracted:
-                                      options[Number(e.target.value)].informationExtracted,
-                                  })
-                                }
-                                disabled={generating}
-                                style={{ ...inputStyle, padding: "3px 6px", background: "var(--bg-page)" }}
-                              >
-                                {options.map((o, i) => (
-                                  <option key={i} value={i}>
-                                    {o.informationExtracted ?? "unknown"}
-                                  </option>
-                                ))}
-                              </select>
-                            </label>
-                          ) : (
-                            encoding?.informationExtracted != null && (
-                              <span style={{ fontSize: 12, color: "var(--muted)" }}>
-                                Info extracted {encoding.informationExtracted}
-                              </span>
-                            )
-                          )}
-                        </div>
-                      )
-                    )}
-                  </div>
+                      :{p}
+                    </button>
+                  ))}
                   <a
                     href="#"
                     onClick={(e) => {
                       e.preventDefault();
-                      if (!generating) setVibes((prev) => prev.filter((x) => x.key !== v.key));
+                      if (!generating) usePairedFile(f);
                     }}
-                    style={{ fontSize: 13, fontWeight: 600 }}
+                    title="Put the main token in the prompt and each part in its character"
+                    style={{ fontWeight: 600, marginLeft: 4 }}
                   >
-                    Remove
+                    Use in prompts
                   </a>
                 </div>
-              );
-            })}
+              )}
+              </div>
+            ))}
           </div>
+          <div style={{ fontSize: 11.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif" }}>
+            Click a token to insert it where you're typing. Each image uses one entry per file, so a
+            paired file's parts always match its main line.
+          </div>
+        </>
+      )}
+    </div>
+  );
 
-          <Field label="Output folder">
-            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-              <span
+  const vibesCard = (
+    <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <span style={{ ...cardTitleStyle, marginBottom: 0, flex: 1 }}>
+          VIBE TRANSFER
+          {vibes.length > 0 && modelInfo.vibes && (
+            <span style={{ fontWeight: 500 }}>
+              {" "}
+              · {vibeRefs.length} of {MAX_VIBES} in use
+            </span>
+          )}
+        </span>
+        <button
+          onClick={() => void chooseVibeFiles()}
+          disabled={generating}
+          style={{ ...secondaryButtonStyle, padding: "6px 14px" }}
+        >
+          Add vibe file…
+        </button>
+      </div>
+
+      {vibes.length === 0 && (
+        <div style={{ fontSize: 12.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif" }}>
+          Use .naiv4vibe or .naiv4vibebundle files exported from NovelAI, or a NovelAI PNG
+          with vibes embedded. Only vibes already encoded for the selected model are used,
+          so they stay free — up to {MAX_VIBES} at a time.
+        </div>
+      )}
+
+      {vibes.length > 0 && !modelInfo.vibes && (
+        <div style={{ ...warningBoxStyle, marginTop: 0 }}>
+          V5 models don't support Vibe Transfer yet, so these vibes are ignored. Switch to a
+          V4 or V4.5 model to use them.
+        </div>
+      )}
+
+      {vibes.map((v) => {
+        const options = v.info ? v.info.encodings.filter((e) => e.model === model) : [];
+        const encoding = v.info && vibeEncodingFor(v.info, model, v.informationExtracted);
+        const status = v.error
+          ? v.error
+          : !modelInfo.vibes
+            ? null
+            : encoding
+              ? null
+              : `Not encoded for ${modelInfo.label}, so it isn't used. Encoding it would cost Anlas.`;
+        return (
+          <div key={v.key} style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <input
+              type="checkbox"
+              checked={v.enabled}
+              onChange={(e) => updateVibe(v.key, { enabled: e.target.checked })}
+              disabled={generating || (!v.enabled && vibesOn >= MAX_VIBES)}
+              title={
+                !v.enabled && vibesOn >= MAX_VIBES
+                  ? `Up to ${MAX_VIBES} vibes at once; more would cost Anlas`
+                  : "Use this vibe"
+              }
+              style={{ accentColor: "var(--accent)" }}
+            />
+            {v.info?.thumbnail ? (
+              <img
+                src={v.info.thumbnail}
+                alt=""
+                style={{ width: 44, height: 44, objectFit: "cover", borderRadius: 6, flexShrink: 0 }}
+              />
+            ) : (
+              <div
                 style={{
-                  flex: 1,
-                  minWidth: 0,
-                  fontSize: 12.5,
-                  fontFamily: "'IBM Plex Mono', monospace",
-                  color: outputDir ? "var(--text)" : "var(--muted)",
+                  width: 44,
+                  height: 44,
+                  borderRadius: 6,
+                  flexShrink: 0,
+                  background: "var(--bg-page)",
+                  border: "1px solid var(--border)",
+                }}
+              />
+            )}
+            <div
+              style={{
+                flex: 1,
+                minWidth: 0,
+                display: "flex",
+                flexDirection: "column",
+                gap: 4,
+                opacity: v.enabled ? 1 : 0.6,
+              }}
+            >
+              <div
+                title={v.path}
+                style={{
+                  fontSize: 13,
+                  fontWeight: 600,
                   overflow: "hidden",
                   textOverflow: "ellipsis",
                   whiteSpace: "nowrap",
                 }}
-                title={outputDir ?? undefined}
               >
-                {outputDir ?? "No folder chosen"}
-              </span>
-              <button
-                onClick={() => void chooseOutputDir()}
-                disabled={generating}
-                style={secondaryButtonStyle}
-              >
-                Choose…
-              </button>
+                {v.info?.name ?? fileName(v.path)}
+              </div>
+              {status ? (
+                <div style={{ fontSize: 12, color: "rgb(200,140,40)", fontFamily: "system-ui, sans-serif" }}>
+                  {status}
+                </div>
+              ) : (
+                v.info && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                    <label
+                      style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, flex: "1 1 180px" }}
+                    >
+                      <span style={{ whiteSpace: "nowrap", minWidth: 86 }}>
+                        Strength {v.strength.toFixed(2)}
+                      </span>
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.01}
+                        value={v.strength}
+                        onChange={(e) => updateVibe(v.key, { strength: Number(e.target.value) })}
+                        disabled={generating}
+                        style={{ flex: 1, minWidth: 80, accentColor: "var(--accent)" }}
+                      />
+                    </label>
+                    {encoding && options.length > 1 ? (
+                      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+                        Info extracted
+                        <select
+                          value={options.indexOf(encoding)}
+                          onChange={(e) =>
+                            updateVibe(v.key, {
+                              informationExtracted:
+                                options[Number(e.target.value)].informationExtracted,
+                            })
+                          }
+                          disabled={generating}
+                          style={{ ...inputStyle, padding: "3px 6px", background: "var(--bg-page)" }}
+                        >
+                          {options.map((o, i) => (
+                            <option key={i} value={i}>
+                              {o.informationExtracted ?? "unknown"}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    ) : (
+                      encoding?.informationExtracted != null && (
+                        <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                          Info extracted {encoding.informationExtracted}
+                        </span>
+                      )
+                    )}
+                  </div>
+                )
+              )}
             </div>
-          </Field>
-
-          {remixQueue && (
-            <div style={{ ...warningBoxStyle, marginTop: 0, display: "flex", flexDirection: "column", gap: 10 }}>
-              <div>
-                <strong>Remix of {fileName(remixQueue.folder)}</strong>: {remixQueue.items.length} image
-                {remixQueue.items.length === 1 ? "" : "s"}
-                {remixQueue.next > 0 && `, ${remixQueue.next} done`}. Each image uses its remixed prompt
-                (and its own seed and size where the Remix tab kept them) with this tab's model, steps,
-                guidance, vibes and output folder.
-              </div>
-              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-                <button
-                  onClick={requestRemix}
-                  disabled={!canRemix}
-                  style={{ ...primaryButtonStyle, opacity: canRemix ? 1 : 0.5, cursor: canRemix ? "pointer" : "default" }}
-                >
-                  Generate {remixQueue.next + 1}–{remixQueue.next + remixBatch.length} of {remixQueue.items.length}
-                </button>
-                <button onClick={() => setRemixQueue(null)} disabled={generating} style={secondaryButtonStyle}>
-                  Cancel Remix
-                </button>
-              </div>
-            </div>
-          )}
-
-          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-            <label
-              style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, fontWeight: 600 }}
-              title={`Up to ${MAX_BATCH} per batch, generated at least 2 seconds apart`}
-            >
-              Images
-              <input
-                type="number"
-                min={1}
-                max={MAX_BATCH}
-                value={count}
-                onChange={(e) => {
-                  const n = Math.round(Number(e.target.value));
-                  setCount(Number.isFinite(n) ? Math.min(Math.max(n, 1), MAX_BATCH) : 1);
-                }}
-                disabled={generating}
-                style={{ ...inputStyle, width: 64, background: "var(--bg-page)" }}
-              />
-            </label>
-            {generating ? (
-              <button onClick={cancelGenerate} style={secondaryButtonStyle}>
-                Cancel
-              </button>
-            ) : (
-              <button
-                onClick={requestGenerate}
-                disabled={!canGenerate}
-                style={{
-                  ...primaryButtonStyle,
-                  opacity: canGenerate ? 1 : 0.5,
-                  cursor: canGenerate ? "pointer" : "default",
-                }}
-              >
-                {count === 1 ? "Generate" : `Generate ${count}`}
-              </button>
-            )}
-            {!outputDir && !generating && (
-              <span style={{ fontSize: 12.5, color: "var(--muted)" }}>
-                Choose an output folder first.
-              </span>
-            )}
-          </div>
-
-          {progress && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              <div style={{ fontSize: 12.5, color: "var(--muted)" }}>
-                {progress.done < progress.total
-                  ? `Generating ${progress.done + 1} of ${progress.total}…`
-                  : "Finishing…"}
-              </div>
-              <div
-                style={{
-                  height: 8,
-                  borderRadius: 999,
-                  background: "var(--bg-page)",
-                  border: "1px solid var(--border)",
-                  overflow: "hidden",
-                }}
-              >
-                <div
-                  style={{
-                    height: "100%",
-                    width: `${(progress.done / Math.max(1, progress.total)) * 100}%`,
-                    background: "var(--accent)",
-                    transition: "width .15s ease",
-                  }}
-                />
-              </div>
-            </div>
-          )}
-
-          {batchNotice && (
-            <div style={{ ...warningBoxStyle, marginTop: 0 }}>{batchNotice}</div>
-          )}
-        </div>
-      )}
-
-      {lastResult && (
-        <div style={{ ...cardStyle, marginTop: 16 }}>
-          <div style={cardTitleStyle}>LAST IMAGE</div>
-          <img
-            src={lastResult.src}
-            alt="Generated image"
-            style={{ display: "block", maxWidth: "100%", maxHeight: 520, borderRadius: 8 }}
-          />
-          <div
-            style={{
-              marginTop: 8,
-              fontSize: 12,
-              fontFamily: "'IBM Plex Mono', monospace",
-              color: "var(--muted)",
-              wordBreak: "break-all",
-            }}
-          >
-            Seed {lastResult.seed} · {lastResult.path}{" "}
             <a
               href="#"
               onClick={(e) => {
                 e.preventDefault();
-                void revealFilesInExplorer([lastResult.path]).catch((err) =>
-                  setError(`Couldn't open Explorer: ${String(err)}`),
-                );
+                if (!generating) setVibes((prev) => prev.filter((x) => x.key !== v.key));
               }}
-              style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, whiteSpace: "nowrap" }}
+              style={{ fontSize: 13, fontWeight: 600 }}
             >
-              Show in Explorer
+              Remove
             </a>
           </div>
-          {batchImages.length > 1 && (
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 12 }}>
-              {batchImages.map((img) => (
-                <img
-                  key={img.path}
-                  src={img.src}
-                  alt=""
-                  title={`Seed ${img.seed}`}
-                  onClick={() => setLastResult(img)}
-                  style={{
-                    width: 64,
-                    height: 64,
-                    objectFit: "cover",
-                    borderRadius: 6,
-                    cursor: "pointer",
-                    outline: img.path === lastResult.path ? "2px solid var(--accent)" : "none",
-                    outlineOffset: 1,
-                  }}
-                />
-              ))}
+        );
+      })}
+    </div>
+  );
+
+  // Pinned to the bottom of the window; the strip under it hides what scrolls past.
+  const bottomBar = (
+    <div
+      style={{
+        position: "sticky",
+        bottom: 0,
+        zIndex: 20,
+        marginTop: 16,
+        paddingBottom: 12,
+        background: "var(--bg-page)",
+      }}
+    >
+      <div
+        style={{
+          ...cardStyle,
+          padding: "10px 14px",
+          display: "flex",
+          flexDirection: "column",
+          gap: 10,
+          boxShadow: "0 -4px 24px rgba(0,0,0,.14)",
+        }}
+      >
+        {remixQueue && (
+          <div style={{ ...warningBoxStyle, marginTop: 0, display: "flex", flexDirection: "column", gap: 10 }}>
+            <div>
+              <strong>Remix of {fileName(remixQueue.folder)}</strong>: {remixQueue.items.length} image
+              {remixQueue.items.length === 1 ? "" : "s"}
+              {remixQueue.next > 0 && `, ${remixQueue.next} done`}. Each image uses its remixed prompt
+              (and its own seed and size where kept) with this tab's other settings.
             </div>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+              <button
+                onClick={requestRemix}
+                disabled={!canRemix}
+                style={{ ...primaryButtonStyle, opacity: canRemix ? 1 : 0.5, cursor: canRemix ? "pointer" : "default" }}
+              >
+                Generate {remixQueue.next + 1}–{remixQueue.next + remixBatch.length} of {remixQueue.items.length}
+              </button>
+              <button onClick={() => setRemixQueue(null)} disabled={generating} style={secondaryButtonStyle}>
+                Cancel Remix
+              </button>
+            </div>
+          </div>
+        )}
+        {batchNotice && <div style={{ ...warningBoxStyle, marginTop: 0 }}>{batchNotice}</div>}
+        {/* Why Generate is off, wherever on the page the problem is. */}
+        {!generating && (tokenProblem || (sizeIndex === CUSTOM_SIZE && sizeError)) && (
+          <div style={{ ...warningBoxStyle, marginTop: 0, fontSize: 12.5 }}>{tokenProblem ?? sizeError}</div>
+        )}
+        <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 260px", minWidth: 0, display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ ...cardTitleStyle, marginBottom: 0, whiteSpace: "nowrap" }}>SAVE TO</span>
+            <span
+              style={{
+                flex: 1,
+                minWidth: 0,
+                fontSize: 12.5,
+                fontFamily: "'IBM Plex Mono', monospace",
+                color: outputDir ? "var(--text)" : "rgb(200,140,40)",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                // keep the end of a long path (the folder's own name) in view
+                direction: outputDir ? "rtl" : undefined,
+                textAlign: "left",
+              }}
+              title={outputDir ?? undefined}
+            >
+              {outputDir ? <bdi>{outputDir}</bdi> : "Choose an output folder first"}
+            </span>
+            <button
+              onClick={() => void chooseOutputDir()}
+              disabled={generating}
+              style={{ ...secondaryButtonStyle, padding: "6px 14px" }}
+            >
+              Choose…
+            </button>
+          </div>
+          <label
+            style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, fontWeight: 600 }}
+            title={`Up to ${MAX_BATCH} per batch, generated at least 2 seconds apart`}
+          >
+            Images
+            <input
+              type="number"
+              min={1}
+              max={MAX_BATCH}
+              value={count}
+              onChange={(e) => {
+                const n = Math.round(Number(e.target.value));
+                setCount(Number.isFinite(n) ? Math.min(Math.max(n, 1), MAX_BATCH) : 1);
+              }}
+              disabled={generating}
+              style={{ ...inputStyle, width: 64, background: "var(--bg-page)" }}
+            />
+          </label>
+          {generating ? (
+            <button onClick={cancelGenerate} style={{ ...secondaryButtonStyle, minWidth: 130 }}>
+              Cancel
+            </button>
+          ) : (
+            <button
+              onClick={requestGenerate}
+              disabled={!canGenerate}
+              title="Ctrl+Enter"
+              style={{
+                ...primaryButtonStyle,
+                minWidth: 130,
+                opacity: canGenerate ? 1 : 0.5,
+                cursor: canGenerate ? "pointer" : "default",
+              }}
+            >
+              {count === 1 ? "Generate" : `Generate ${count}`}
+            </button>
           )}
         </div>
-      )}
+        {progress && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <div style={{ fontSize: 12.5, color: "var(--muted)" }}>
+              {progress.done < progress.total
+                ? `Generating ${progress.done + 1} of ${progress.total}…`
+                : "Finishing…"}
+            </div>
+            <div
+              style={{
+                height: 8,
+                borderRadius: 999,
+                background: "var(--bg-page)",
+                border: "1px solid var(--border)",
+                overflow: "hidden",
+              }}
+            >
+              <div
+                style={{
+                  height: "100%",
+                  width: `${(progress.done / Math.max(1, progress.total)) * 100}%`,
+                  background: "var(--accent)",
+                  transition: "width .15s ease",
+                }}
+              />
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  return (
+    <div
+      ref={rootRef}
+      onKeyDown={(e) => {
+        if (phase === "loggedIn" && e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.repeat) {
+          e.preventDefault();
+          requestGenerate();
+        }
+      }}
+      style={{ padding: "24px 24px 0" }}
+    >
+      <TagSuggestions root={rootRef} active={active} />
+      <div style={{ maxWidth: wide ? 1560 : 760 }}>
+        <div
+          style={{
+            display: "flex",
+            gap: 16,
+            alignItems: wide ? "flex-start" : "stretch",
+            flexDirection: wide ? "row" : "column",
+            marginBottom: 16,
+          }}
+        >
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 21, fontWeight: 700, marginBottom: 4 }}>Generate</div>
+            <div style={{ fontSize: 13, color: "var(--muted)", fontFamily: "system-ui, sans-serif", lineHeight: 1.6 }}>
+              Text-to-image generation through your NovelAI account, limited to settings that are free on Opus: up
+              to 28 steps and 1024×1024 worth of pixels.
+            </div>
+          </div>
+          <div style={{ flex: wide ? "0 1 600px" : undefined, minWidth: 0 }}>
+            <div
+              style={{
+                background: "var(--bg-card)",
+                border: "1px solid var(--border)",
+                borderRadius: 10,
+                padding: "14px 16px",
+              }}
+            >
+              <div style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", marginBottom: 10 }}>
+                NOVELAI ACCOUNT
+              </div>
+
+              {(phase === "unchecked" || phase === "checking") && (
+                <div style={{ fontSize: 13, color: "var(--muted)" }}>Checking saved token…</div>
+              )}
+
+              {phase === "loggedOut" && (
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    if (!busy && tokenInput.trim()) void logIn();
+                  }}
+                  style={{ display: "flex", gap: 10 }}
+                >
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    spellCheck={false}
+                    placeholder="Persistent API token (pst-…)"
+                    value={tokenInput}
+                    onChange={(e) => setTokenInput(e.target.value)}
+                    disabled={busy}
+                    style={{ ...inputStyle, flex: 1 }}
+                  />
+                  <button
+                    type="submit"
+                    disabled={busy || !tokenInput.trim()}
+                    style={{
+                      ...primaryButtonStyle,
+                      opacity: busy || !tokenInput.trim() ? 0.5 : 1,
+                      cursor: busy || !tokenInput.trim() ? "default" : "pointer",
+                    }}
+                  >
+                    {busy ? "Checking…" : "Log in"}
+                  </button>
+                </form>
+              )}
+
+              {phase === "loggedIn" && status && (
+                <>
+                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                    <div style={{ flex: 1, fontSize: 13.5 }}>
+                      <span style={{ fontWeight: 700 }}>{status.tierName}</span>
+                      {!status.active && <span style={{ color: "var(--muted)" }}> (inactive)</span>}
+                      <span
+                        style={{
+                          marginLeft: 10,
+                          fontFamily: "'IBM Plex Mono', monospace",
+                          fontSize: 12,
+                          color: "var(--muted)",
+                        }}
+                      >
+                        {status.anlas.toLocaleString()} ANLAS
+                      </span>
+                      {status.isOpus && status.usage && (
+                        <span
+                          title="Opus generations with V5 models draw from this refilling quota. V4 and V4.5 are unlimited."
+                          style={{
+                            marginLeft: 10,
+                            fontFamily: "'IBM Plex Mono', monospace",
+                            fontSize: 12,
+                            color: status.usage.isNegative ? "rgb(200,140,40)" : "var(--muted)",
+                          }}
+                        >
+                          V5 QUOTA{" "}
+                          {status.usage.isNegative
+                            ? "USED UP"
+                            : `${status.usage.percent + status.usage.purchasedPercent}%`}
+                        </span>
+                      )}
+                    </div>
+                    <a
+                      href="#"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        void refreshStatus();
+                      }}
+                      style={{ fontSize: 13, fontWeight: 600 }}
+                    >
+                      Refresh
+                    </a>
+                    <button
+                      onClick={() => void logOut()}
+                      disabled={busy}
+                      style={{ ...secondaryButtonStyle, opacity: busy ? 0.5 : 1 }}
+                    >
+                      Log out
+                    </button>
+                  </div>
+
+                  {!status.isOpus && (
+                    <div style={warningBoxStyle}>
+                      {status.active
+                        ? `Your ${status.tierName} subscription isn't Opus, so every image generated here will cost Anlas.`
+                        : "Your subscription is inactive, so every image generated here will cost Anlas."}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {error && (
+          <div
+            style={{
+              marginBottom: 14,
+              padding: "10px 14px",
+              borderRadius: 8,
+              background: "rgba(200,60,50,.12)",
+              border: "1px solid rgba(200,60,50,.35)",
+              fontSize: 13,
+              display: "flex",
+              justifyContent: "space-between",
+              gap: 12,
+            }}
+          >
+            <span>{error}</span>
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                setError(null);
+              }}
+              style={{ whiteSpace: "nowrap" }}
+            >
+              Dismiss
+            </a>
+          </div>
+        )}
+
+        {phase === "loggedIn" && (
+          <>
+            {settingsCard}
+            {wide ? (
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "minmax(0, 1.1fr) minmax(0, 1fr)",
+                  gap: 16,
+                  alignItems: "start",
+                  marginTop: 16,
+                }}
+              >
+                <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                  {promptCard}
+                  {promptFilesCard}
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                  {charactersCard}
+                  {vibesCard}
+                  {lastCard}
+                </div>
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 16, marginTop: 16 }}>
+                {promptCard}
+                {charactersCard}
+                {promptFilesCard}
+                {vibesCard}
+                {lastCard}
+              </div>
+            )}
+            {bottomBar}
+          </>
+        )}
+        {phase !== "loggedIn" && lastCard && <div style={{ marginTop: 16 }}>{lastCard}</div>}
+      </div>
 
       {confirmCost && status && (() => {
         const n = confirmCost === "remix" ? remixBatch.length : count;
