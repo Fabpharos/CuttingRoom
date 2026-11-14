@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import ConfirmModal from "./ConfirmModal";
+import TagSuggestions from "./TagSuggestions";
 import { readImageMetadata } from "../lib/novelai";
 import { moveFilesToTrash } from "../lib/nativeOps";
 import { guessName } from "../lib/characterTags";
@@ -103,6 +104,8 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
   const [dragging, setDragging] = useState(false);
   const [version, setVersion] = useState(0);
 
+  // Prompt boxes marked data-tags get Danbooru tag suggestions.
+  const rootRef = useRef<HTMLDivElement>(null);
   const activeRef = useRef(active);
   activeRef.current = active;
   const dirtyRef = useRef(dirty);
@@ -338,7 +341,8 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
     : null;
 
   return (
-    <div style={{ padding: 24, maxWidth: 1200 }}>
+    <div ref={rootRef} style={{ padding: 24, maxWidth: 1200 }}>
+      <TagSuggestions root={rootRef} active={active} />
       <div style={{ marginBottom: 18 }}>
         <div style={{ fontSize: 21, fontWeight: 700, marginBottom: 4 }}>Character Cards</div>
         <div style={{ fontSize: 13, color: "var(--muted)", fontFamily: "system-ui, sans-serif", lineHeight: 1.6 }}>
@@ -499,7 +503,13 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
 
             <label style={{ display: "flex", flexDirection: "column", gap: 5 }}>
               <span style={labelStyle}>Character prompt</span>
-              <textarea rows={4} value={draft.text} onChange={(e) => setText(e.target.value)} style={textareaStyle} />
+              <textarea
+                rows={4}
+                value={draft.text}
+                data-tags
+                onChange={(e) => setText(e.target.value)}
+                style={textareaStyle}
+              />
             </label>
 
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -583,6 +593,7 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
               <textarea
                 rows={2}
                 value={draft.negative}
+                data-tags
                 onChange={(e) => edit({ negative: e.target.value })}
                 style={textareaStyle}
               />
