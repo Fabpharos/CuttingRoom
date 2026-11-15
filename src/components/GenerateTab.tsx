@@ -20,6 +20,7 @@ import {
   SIZE_STEP,
   MAX_SIDE,
   sizeProblem,
+  fitFreeSize,
   MAX_CHARACTERS,
   DEFAULT_STEPS,
   MAX_STEPS,
@@ -43,6 +44,7 @@ import {
 } from "../lib/novelai";
 import ConfirmModal from "./ConfirmModal";
 import CharacterCardDialog from "./CharacterCardDialog";
+import { PARTS, adaptCardCharacter, type CardLink } from "../lib/characterCards";
 import TagSuggestions from "./TagSuggestions";
 import {
   openPromptFile,
@@ -167,6 +169,16 @@ function ImportConfirmModal({
       </div>
     </div>
   );
+}
+
+// An image file's pixel size, read through the webview.
+function imageSize(path: string): Promise<{ width: number; height: number }> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+    img.onerror = () => reject(new Error(`Couldn't read ${path}`));
+    img.src = convertFileSrc(path);
+  });
 }
 
 // A textarea that grows with its text, from `minRows` up to `maxHeight`
@@ -482,7 +494,14 @@ export default function GenerateTab({
   // "Custom" placement, and each character's position (kept the same length).
   const [useCoords, setUseCoords] = useState(false);
   const [characterPositions, setCharacterPositions] = useState<CharacterPosition[]>([]);
+  // The character card each character was loaded from, if any. Read through
+  // `cardLinks` below, which is always the same length as `characters`.
+  const [characterCardLinks, setCharacterCardLinks] = useState<(CardLink | null)[]>([]);
+  const cardLinks = characters.map((_, i) => characterCardLinks[i] ?? null);
   const [showCardDialog, setShowCardDialog] = useState(false);
+  // Image to image: the picture to start from (null is text to image).
+  const [sourceImage, setSourceImage] = useState<{ path: string; width: number; height: number } | null>(null);
+  const [img2imgStrength, setImg2imgStrength] = useState(0.7);
   // Prompt boxes marked data-tags get Danbooru tag suggestions.
   const rootRef = useRef<HTMLDivElement>(null);
   // Two columns once the tab is wide enough.
@@ -539,6 +558,13 @@ export default function GenerateTab({
         setCharacterNegatives(s.characterNegatives);
         setUseCoords(s.useCoords);
         setCharacterPositions(s.characterPositions);
+        setCharacterCardLinks(s.characterCardLinks);
+        setImg2imgStrength(s.img2imgStrength);
+        if (s.sourceImage) {
+          const path = s.sourceImage;
+          // A picture that's gone since last time is just dropped.
+          void imageSize(path).then((d) => setSourceImage({ path, ...d }), () => {});
+        }
         if (s.vibes.length > 0) setVibes(await loadVibeEntries(s.vibes));
         // A file that can't be read now stays listed with its error.
         setPromptFiles(await Promise.all(s.promptFiles.map((f) => openPromptFile(f.path, f.name, f.mode))));
@@ -566,6 +592,9 @@ export default function GenerateTab({
         characterNegatives,
         useCoords,
         characterPositions,
+        characterCardLinks: cardLinks,
+        sourceImage: sourceImage?.path ?? null,
+        img2imgStrength,
         steps,
         scale,
         count,
@@ -593,6 +622,9 @@ export default function GenerateTab({
     characterNegatives,
     useCoords,
     characterPositions,
+    characterCardLinks,
+    sourceImage,
+    img2imgStrength,
     steps,
     scale,
     count,
@@ -676,6 +708,35 @@ export default function GenerateTab({
     ) : (
       <TokenPreview text={fillTokens(text, present(nextValues))} />
     );
+  // Under a character loaded from a card: which card, and what the next image
+  // leaves out because of its view tags.
+  const cardNote = (i: number, text: string) => {
+    const link = cardLinks[i];
+    if (!link) return null;
+    const values = present(nextValues);
+    const next = adaptCardCharacter(fillTokens(text, values), link, fillTokens(prompt, values));
+    const parts = next.hidden.map((p) => PARTS.find((q) => q.key === p)!.label.toLowerCase());
+    return (
+      <div style={{ fontSize: 12, color: "var(--muted)", fontFamily: "system-ui, sans-serif", lineHeight: 1.5 }}>
+        From card <strong style={{ color: "var(--text)" }}>{link.name}</strong>
+        {parts.length > 0
+          ? ` · the next image leaves out its ${parts.join(", ")} tags (${next.views.join(", ")})`
+          : " · leaves out what an image's view tags hide (facing away, closed eyes, upper body, lower body, POV…)"}
+        {" · "}
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            if (!generating) unlinkCard(i);
+          }}
+          title="Stop adapting this character to view tags; its prompt stays as it is"
+          style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600 }}
+        >
+          Unlink
+        </a>
+      </div>
+    );
+  };
   const canGenerate =
     phase === "loggedIn" &&
     !generating &&
@@ -745,6 +806,36 @@ export default function GenerateTab({
     if (typeof file === "string") void startImport(file);
   }
 
+  // Image to image: picks the starting picture and sets the size to the
+  // nearest free size of the same shape (NovelAI resizes it to that).
+  async function chooseSourceImage() {
+    const file = await open({
+      directory: false,
+      multiple: false,
+      filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp"] }],
+    });
+    if (typeof file !== "string") return;
+    try {
+      const d = await imageSize(file);
+      setSourceImage({ path: file, ...d });
+      matchSourceSize(d);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  function matchSourceSize(d: { width: number; height: number }) {
+    const fit = fitFreeSize(d.width, d.height);
+    if (!fit) return;
+    const preset = SIZES.findIndex((s) => s.width === fit.width && s.height === fit.height);
+    if (preset >= 0) setSizeIndex(preset);
+    else {
+      setSizeIndex(CUSTOM_SIZE);
+      setCustomWidth(fit.width);
+      setCustomHeight(fit.height);
+    }
+  }
+
   async function startImport(path: string) {
     setError(null);
     try {
@@ -781,6 +872,7 @@ export default function GenerateTab({
     setNegativePrompt(v.negativePrompt);
     setCharacters(v.characters);
     setCharacterNegatives(v.characterNegatives);
+    setCharacterCardLinks([]);
     setUseCoords(v.characterPositions !== null);
     setCharacterPositions(v.characterPositions ?? v.characters.map(() => CENTER));
     setImportPlan(null);
@@ -910,11 +1002,17 @@ export default function GenerateTab({
       const seed = randomSeed();
       const entry = Object.fromEntries(files.flatMap((f, k) => entryValues(f, picks[k][i])));
       const values = present(entry);
+      const scene = fillTokens(prompt, values);
       return {
         model,
-        prompt: fillTokens(prompt, values),
+        prompt: scene,
         negativePrompt: fillTokens(negativePrompt, values),
-        characters: characters.map((c) => (missingPart(c, entry) ? "" : fillTokens(c, values))),
+        characters: characters.map((c, j) => {
+          if (missingPart(c, entry)) return "";
+          const filled = fillTokens(c, values);
+          const link = cardLinks[j];
+          return link ? adaptCardCharacter(filled, link, scene).text : filled;
+        }),
         characterNegatives: characterNegatives.map((c) => fillTokens(c, values)),
         characterPositions: useCoords ? characterPositions : null,
         width: size.width,
@@ -924,6 +1022,7 @@ export default function GenerateTab({
         seed,
         fileStem: fileStemFor(seed, i, batchStart),
         vibes: vibeRefs,
+        sourceImage: sourceImage ? { path: sourceImage.path, strength: img2imgStrength } : null,
       };
     });
 
@@ -1113,8 +1212,11 @@ export default function GenerateTab({
   }
 
   // Fills a character from a character card: a new one, or replaces one.
-  function loadCharacterCard(prompt: string, negative: string, slot: number | null) {
+  // The character keeps a link to the card, so each image can leave out the
+  // card's tags for whatever its view tags hide.
+  function loadCharacterCard(prompt: string, negative: string, slot: number | null, link: CardLink) {
     setShowCardDialog(false);
+    const index = slot ?? characters.length;
     if (slot === null) {
       if (characters.length >= MAX_CHARACTERS) return;
       setCharacters((prev) => [...prev, prompt]);
@@ -1124,6 +1226,11 @@ export default function GenerateTab({
       setCharacters((prev) => prev.map((c, j) => (j === slot ? prompt : c)));
       setCharacterNegatives((prev) => prev.map((c, j) => (j === slot ? negative : c)));
     }
+    setCharacterCardLinks(characters.map((_, i) => cardLinks[i]).concat([null]).map((l, i) => (i === index ? link : l)));
+  }
+
+  function unlinkCard(index: number) {
+    setCharacterCardLinks(cardLinks.map((l, i) => (i === index ? null : l)));
   }
 
   function addCharacter() {
@@ -1136,6 +1243,7 @@ export default function GenerateTab({
     setCharacters((prev) => prev.filter((_, j) => j !== index));
     setCharacterNegatives((prev) => prev.filter((_, j) => j !== index));
     setCharacterPositions((prev) => prev.filter((_, j) => j !== index));
+    setCharacterCardLinks(cardLinks.filter((_, j) => j !== index));
     if (typeof lastFieldRef.current?.field === "object") lastFieldRef.current = null;
   }
 
@@ -1538,7 +1646,10 @@ export default function GenerateTab({
           }}
         >
           <div style={{ display: "flex", alignItems: "center" }}>
-            <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", flex: 1 }}>Character {i + 1}</span>
+            <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", flex: 1 }}>
+              Character {i + 1}
+              {cardLinks[i] && <span style={{ fontWeight: 500 }}> · {cardLinks[i]!.name}</span>}
+            </span>
             <a
               href="#"
               onClick={(e) => {
@@ -1551,6 +1662,7 @@ export default function GenerateTab({
               Remove
             </a>
           </div>
+          {cardNote(i, c)}
           <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
             <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 6 }}>
               <GrowingTextarea
@@ -1853,6 +1965,97 @@ export default function GenerateTab({
     </div>
   );
 
+  // Image to image: a starting picture and how much of it may change.
+  const sourceShapeOff =
+    sourceImage !== null &&
+    Math.abs(sourceImage.width / sourceImage.height - size.width / size.height) > 0.03;
+  const img2imgCard = (
+    <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <span style={{ ...cardTitleStyle, marginBottom: 0, flex: 1 }}>IMAGE TO IMAGE</span>
+        {sourceImage && (
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault();
+              if (!generating) setSourceImage(null);
+            }}
+            title="Go back to text to image"
+            style={{ fontSize: 13, fontWeight: 600 }}
+          >
+            Remove
+          </a>
+        )}
+        <button
+          onClick={() => void chooseSourceImage()}
+          disabled={generating}
+          style={{ ...secondaryButtonStyle, padding: "6px 14px" }}
+        >
+          {sourceImage ? "Change image…" : "Choose image…"}
+        </button>
+      </div>
+      {!sourceImage ? (
+        <div style={{ fontSize: 12.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif", lineHeight: 1.5 }}>
+          Start from a picture instead of noise. The prompt, characters and settings above still apply; strength
+          sets how much of the picture may change.
+        </div>
+      ) : (
+        <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
+          <img
+            src={convertFileSrc(sourceImage.path)}
+            alt=""
+            style={{ width: 96, height: 96, objectFit: "contain", borderRadius: 6, flexShrink: 0, background: "var(--bg-page)" }}
+          />
+          <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 8 }}>
+            <div
+              title={sourceImage.path}
+              style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+            >
+              {fileName(sourceImage.path)}
+            </div>
+            <div style={{ fontSize: 12, fontFamily: "'IBM Plex Mono', monospace", color: "var(--muted)" }}>
+              {sourceImage.width}×{sourceImage.height} → sent at {size.width}×{size.height}
+              {sourceShapeOff && (
+                <>
+                  {" "}
+                  <span style={{ color: "rgb(200,140,40)" }}>(stretched)</span>{" "}
+                  <a
+                    href="#"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      if (!generating) matchSourceSize(sourceImage);
+                    }}
+                    title="Set the resolution to the nearest free size of the picture's shape"
+                    style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600 }}
+                  >
+                    Match shape
+                  </a>
+                </>
+              )}
+            </div>
+            <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12 }}>
+              <span style={{ fontWeight: 600, color: "var(--muted)" }}>Strength: {img2imgStrength.toFixed(2)}</span>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.01}
+                value={img2imgStrength}
+                onChange={(e) => setImg2imgStrength(Number(e.target.value))}
+                disabled={generating}
+                style={{ accentColor: "var(--accent)" }}
+              />
+              <span style={{ display: "flex", justifyContent: "space-between", color: "var(--muted)", fontSize: 11.5 }}>
+                <span>0 · keep the picture</span>
+                <span>1 · change everything</span>
+              </span>
+            </label>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
   const vibesCard = (
     <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 12 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -2137,7 +2340,7 @@ export default function GenerateTab({
                 cursor: canGenerate ? "pointer" : "default",
               }}
             >
-              {count === 1 ? "Generate" : `Generate ${count}`}
+              {(count === 1 ? "Generate" : `Generate ${count}`) + (sourceImage ? " from image" : "")}
             </button>
           )}
         </div>
@@ -2362,6 +2565,7 @@ export default function GenerateTab({
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                   {charactersCard}
+                  {img2imgCard}
                   {vibesCard}
                   {lastCard}
                 </div>
@@ -2370,6 +2574,7 @@ export default function GenerateTab({
               <div style={{ display: "flex", flexDirection: "column", gap: 16, marginTop: 16 }}>
                 {promptCard}
                 {charactersCard}
+                {img2imgCard}
                 {promptFilesCard}
                 {vibesCard}
                 {lastCard}

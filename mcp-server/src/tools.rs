@@ -934,6 +934,7 @@ impl NovelAiTools {
             seed,
             file_stem: format!("{}_mcp_{seed}", (self.timestamp)()),
             vibes: vibes.iter().map(|v| v.reference.clone()).collect(),
+            source_image: None,
         };
         self.pause_before_request();
         let summary = match self.runtime.block_on(generate_batch(

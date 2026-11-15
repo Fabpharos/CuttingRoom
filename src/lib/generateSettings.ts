@@ -16,6 +16,7 @@ import {
   type CharacterPosition,
 } from "./novelai";
 import type { PromptFileMode } from "./promptFile";
+import { parseCardLink, type CardLink } from "./characterCards";
 import { fileTokenName, isValidTokenName, tokenFor } from "./promptTokens";
 
 // One store for everything the Generate tab saves, shared with the prompt
@@ -54,6 +55,12 @@ export type GenerateSettings = {
   useCoords: boolean;
   /** Each character's position, the same length as `characters`. */
   characterPositions: CharacterPosition[];
+  /** The character card each character was loaded from (null if none), the same length as `characters`. */
+  characterCardLinks: (CardLink | null)[];
+  /** Image to image's starting picture, or null for text to image. */
+  sourceImage: string | null;
+  /** How much image to image may change the picture, 0–1. */
+  img2imgStrength: number;
   steps: number;
   scale: number;
   count: number;
@@ -73,6 +80,9 @@ export const DEFAULT_SETTINGS: GenerateSettings = {
   characterNegatives: [],
   useCoords: false,
   characterPositions: [],
+  characterCardLinks: [],
+  sourceImage: null,
+  img2imgStrength: 0.7,
   steps: DEFAULT_STEPS,
   scale: DEFAULT_SCALE,
   count: 1,
@@ -192,6 +202,11 @@ function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy
       const p = Array.isArray(raw.characterPositions) ? (raw.characterPositions[i] as Record<string, unknown> | null) : null;
       return p && typeof p === "object" ? { x: clamp(p.x, 0, 1, 0.5), y: clamp(p.y, 0, 1, 0.5) } : CENTER;
     }),
+    characterCardLinks: characters.map((_, i) =>
+      Array.isArray(raw.characterCardLinks) ? parseCardLink(raw.characterCardLinks[i]) : null,
+    ),
+    sourceImage: typeof raw.sourceImage === "string" ? raw.sourceImage : d.sourceImage,
+    img2imgStrength: clamp(raw.img2imgStrength, 0, 1, d.img2imgStrength),
     steps: Math.round(clamp(raw.steps, 1, MAX_STEPS, d.steps)),
     scale: clamp(raw.scale, 0, MAX_SCALE, d.scale),
     count: Math.round(clamp(raw.count, 1, MAX_BATCH, d.count)),

@@ -610,6 +610,7 @@ fn inpaint_body(plan: &InpaintPlan, s: &InpaintSettings, prepared: &Prepared) ->
         seed: s.seed,
         file_stem: "inpaint".into(),
         vibes: Vec::new(),
+        source_image: None,
     };
     // Checks steps, guidance, characters and the model like any generation.
     let mut body = request_body(&req, &[])?;

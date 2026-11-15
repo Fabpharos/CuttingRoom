@@ -152,3 +152,74 @@ export function buildCharacterPrompt(card: CharacterCard, hidden: Set<Part>, opt
   }
   return tags.join(", ");
 }
+
+// --- A card in Generate that adapts to each image's view tags
+
+/** The card a Generate character was filled from, kept so each image can drop what it won't show. */
+export type CardLink = { name: string; tags: CardTag[] };
+
+/**
+ * View tags that put parts of a carded character out of sight: the four
+ * options of the Load dialog, a few common equivalents, and POV (taken to mean
+ * the character is the one looking, so their own face and hair aren't seen).
+ */
+export const VIEW_TAGS: Record<string, Part[]> = {
+  ...Object.fromEntries(SHOW_OPTIONS.map((o) => [o.tag, o.hides])),
+  "from behind": ["eyes", "face"],
+  "eyes closed": ["eyes"],
+  portrait: ["lowerBody"],
+  "head out of frame": ["eyes", "face", "hair"],
+  pov: ["eyes", "face", "hair"],
+};
+
+/** The view tags in `text` (weighted ones too, but not negatively weighted ones). */
+export function viewTagsIn(text: string): string[] {
+  const found: string[] = [];
+  for (const tag of splitTags(text).flatMap(ungroup)) {
+    if (/^\s*-/.test(tag)) continue; // "-1::pov::" asks for less of it
+    const t = bareTag(tag);
+    if (t in VIEW_TAGS && !found.includes(t)) found.push(t);
+  }
+  return found;
+}
+
+/**
+ * A carded character's prompt for one image: the card's tags for every part
+ * the image's view tags hide (found in `scene`, the image's main prompt, and in
+ * the character's own prompt) are left out. Each image starts from the full
+ * prompt, so the tags come back as soon as an image doesn't hide them.
+ */
+export function adaptCardCharacter(
+  text: string,
+  link: CardLink,
+  scene: string,
+): { text: string; views: string[]; hidden: Part[] } {
+  const views = [...new Set([...viewTagsIn(scene), ...viewTagsIn(text)])];
+  const hidden = new Set(views.flatMap((v) => VIEW_TAGS[v]));
+  if (hidden.size === 0) return { text, views, hidden: [] };
+  // How many of each card tag belong to a hidden part.
+  const drop = new Map<string, number>();
+  for (const t of link.tags) {
+    if (t.part !== "other" && hidden.has(t.part)) drop.set(bareTag(t.text), (drop.get(bareTag(t.text)) ?? 0) + 1);
+  }
+  const kept = splitTags(text).flatMap(ungroup).filter((tag) => {
+    const k = bareTag(tag);
+    const n = drop.get(k) ?? 0;
+    if (n === 0) return true;
+    drop.set(k, n - 1);
+    return false;
+  });
+  return { text: kept.join(", "), views, hidden: PARTS.map((p) => p.key).filter((p) => hidden.has(p)) };
+}
+
+/** A link read back from saved settings, or null if it isn't one. */
+export function parseCardLink(raw: unknown): CardLink | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.name !== "string" || !Array.isArray(r.tags)) return null;
+  const tags = r.tags.flatMap((t) => {
+    const o = t as Record<string, unknown> | null;
+    return o && typeof o.text === "string" && isPart(o.part) ? [{ text: o.text, part: o.part }] : [];
+  });
+  return { name: r.name, tags };
+}
