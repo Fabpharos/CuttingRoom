@@ -210,6 +210,8 @@ export type GenerateRequest = {
   seed: number;
   fileStem: string;
   vibes: VibeRef[];
+  /** Image to image: the picture to start from and how much may change (0–1). */
+  sourceImage?: { path: string; strength: number } | null;
 };
 
 /** Settings read from a NovelAI image's metadata, before deciding what applies. */

@@ -222,7 +222,7 @@ pub fn is_usage_limited(model: &str) -> bool {
 pub const MEDIUM_MODEL: &str = "nai-diffusion-5-full-medium";
 pub const MEDIUM_STEPS: u32 = 14;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerateRequest {
     pub model: String,
@@ -244,6 +244,19 @@ pub struct GenerateRequest {
     pub file_stem: String,
     #[serde(default)]
     pub vibes: Vec<VibeRef>,
+    /// Image to image: the picture to start from. None is plain text to image.
+    #[serde(default)]
+    pub source_image: Option<SourceImage>,
+}
+
+/// The starting picture for image to image, read from disk when the batch
+/// starts and resized to the request's size.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceImage {
+    pub path: String,
+    /// How much may change, 0 (keep the picture) to 1 (ignore it).
+    pub strength: f64,
 }
 
 #[derive(Serialize, Clone)]
@@ -532,14 +545,67 @@ fn validate_batch(requests: &[GenerateRequest]) -> Result<Vec<serde_json::Value>
         return Err(format!("A batch can be at most {MAX_BATCH} images."));
     }
     let mut files = VibeFiles::new();
+    let mut sources: HashMap<(String, u32, u32), String> = HashMap::new();
     requests
         .iter()
         .map(|r| {
             validate_file_stem(&r.file_stem)?;
             let vibes = resolve_vibes(&r.model, &r.vibes, &mut files)?;
-            build_body(r, &vibes)
+            let mut body = build_body(r, &vibes)?;
+            if let Some(src) = &r.source_image {
+                let key = (src.path.clone(), r.width, r.height);
+                if !sources.contains_key(&key) {
+                    sources.insert(key.clone(), source_image_base64(&src.path, r.width, r.height)?);
+                }
+                add_source_image(&mut body, r, src, &sources[&key])?;
+            }
+            Ok(body)
         })
         .collect()
+}
+
+/// The picture at `path` as NovelAI takes it for image to image: resized to
+/// exactly the request's size (which the frontend picks to match its shape)
+/// and re-encoded as a plain RGB PNG, so none of the file's metadata is sent.
+fn source_image_base64(path: &str, width: u32, height: u32) -> Result<String, String> {
+    let img = image::ImageReader::open(path)
+        .map_err(|e| format!("couldn't open the source image ({path}): {e}"))?
+        .with_guessed_format()
+        .map_err(|e| format!("couldn't open the source image ({path}): {e}"))?
+        .decode()
+        .map_err(|e| format!("couldn't read the source image ({path}): {e}"))?;
+    let img = if (img.width(), img.height()) == (width, height) {
+        img
+    } else {
+        img.resize_exact(width, height, image::imageops::FilterType::Lanczos3)
+    };
+    let rgb = image::DynamicImage::ImageRgb8(img.to_rgb8());
+    let mut png = Vec::new();
+    rgb.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| format!("couldn't prepare the source image: {e}"))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(png))
+}
+
+/// Turns a text-to-image body into image to image, the way NovelAI's web
+/// client sends it: same model and size, `action: "img2img"`, the picture,
+/// its strength, no added noise.
+fn add_source_image(
+    body: &mut serde_json::Value,
+    req: &GenerateRequest,
+    src: &SourceImage,
+    image_b64: &str,
+) -> Result<(), String> {
+    if !(0.0..=1.0).contains(&src.strength) || src.strength.is_nan() {
+        return Err("Image to image strength must be between 0 and 1.".into());
+    }
+    body["action"] = json!("img2img");
+    let p = &mut body["parameters"];
+    p["image"] = json!(image_b64);
+    p["strength"] = json!(src.strength);
+    p["noise"] = json!(0);
+    // NovelAI's site sets this for every request with an input image.
+    p["extra_noise_seed"] = json!(req.seed.saturating_sub(1));
+    Ok(())
 }
 
 /// Generates each request in order, at least `MIN_INTERVAL` apart.
@@ -1487,7 +1553,45 @@ mod tests {
             seed: 42,
             file_stem: "out".into(),
             vibes: vec![],
+            source_image: None,
         }
+    }
+
+    #[test]
+    fn image_to_image_sends_the_source_at_the_request_size() {
+        let dir = std::env::temp_dir().join(format!("nai-img2img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("source.png");
+        image::RgbaImage::from_pixel(300, 450, image::Rgba([10, 20, 30, 255])).save(&path).unwrap();
+        let path = path.to_string_lossy().into_owned();
+
+        let mut req = request("nai-diffusion-4-5-full", 832, 1216, &[]);
+        req.source_image = Some(SourceImage { path: path.clone(), strength: 0.55 });
+        let bodies = validate_batch(&[req.clone(), req.clone()]).unwrap();
+        let body = &bodies[0];
+        assert_eq!(body["action"], "img2img");
+        assert_eq!(body["model"], "nai-diffusion-4-5-full");
+        let p = &body["parameters"];
+        assert_eq!(p["strength"], 0.55);
+        assert_eq!(p["noise"], 0);
+        assert_eq!(p["n_samples"], 1);
+        assert_eq!(p["extra_noise_seed"], 41);
+        let png = base64::engine::general_purpose::STANDARD.decode(p["image"].as_str().unwrap()).unwrap();
+        let sent = image::load_from_memory(&png).unwrap();
+        assert_eq!((sent.width(), sent.height()), (832, 1216));
+        assert!(png_text_chunks(&png).unwrap().is_empty(), "no metadata goes with the image");
+
+        // Still held to the free size, and strength must be 0–1.
+        let mut big = req.clone();
+        (big.width, big.height) = (1024, 1536);
+        assert!(validate_batch(&[big]).is_err());
+        let mut bad = req.clone();
+        bad.source_image = Some(SourceImage { path: path.clone(), strength: 1.5 });
+        assert!(validate_batch(&[bad]).is_err());
+        let mut missing = req;
+        missing.source_image = Some(SourceImage { path: dir.join("nope.png").to_string_lossy().into_owned(), strength: 0.5 });
+        assert!(validate_batch(&[missing]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn body_of(req: &GenerateRequest) -> Result<serde_json::Value, String> {

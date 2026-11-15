@@ -10,6 +10,7 @@ import {
   loadCardFolder,
   saveCardFolder,
   type CardFile,
+  type CardLink,
   type Part,
   type ShowOption,
 } from "../lib/characterCards";
@@ -62,7 +63,7 @@ export default function CharacterCardDialog({
   characterCount: number;
   maxCharacters: number;
   /** `slot` is the character to replace, or null to add a new one. */
-  onLoad: (prompt: string, negative: string, slot: number | null) => void;
+  onLoad: (prompt: string, negative: string, slot: number | null, link: CardLink) => void;
   onClose: () => void;
 }) {
   const [folder, setFolder] = useState<string | null>(null);
@@ -314,7 +315,7 @@ export default function CharacterCardDialog({
           <button
             style={{ ...primaryButtonStyle, opacity: card && (canAdd || slot !== null) ? 1 : 0.5 }}
             disabled={!card || (!canAdd && slot === null)}
-            onClick={() => card && onLoad(prompt, card.negative, slot)}
+            onClick={() => card && onLoad(prompt, card.negative, slot, { name: card.name, tags: card.tags })}
           >
             Load
           </button>
