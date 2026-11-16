@@ -1,6 +1,7 @@
 import { useRef } from "react";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import TrashIcon, { DELETE_RED } from "./TrashIcon";
 
 const HEART_PATH =
   "M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35Z";
@@ -11,10 +12,12 @@ export default function Thumbnail({
   name,
   needsEdit,
   favorite,
+  marked,
   selected,
   dimmed,
   onToggleTag,
   onToggleFavorite,
+  onToggleMarked,
   onSelect,
   onOpen,
   onContextMenu,
@@ -24,10 +27,12 @@ export default function Thumbnail({
   name: string;
   needsEdit: boolean;
   favorite: boolean;
+  marked: boolean;
   selected: boolean;
   dimmed?: boolean;
   onToggleTag: () => void;
   onToggleFavorite: () => void;
+  onToggleMarked: () => void;
   onSelect: (shiftKey: boolean, ctrlKey: boolean) => void;
   onOpen: () => void;
   onContextMenu: (x: number, y: number) => void;
@@ -86,7 +91,49 @@ export default function Thumbnail({
           }}
         />
       )}
+      {marked && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            borderRadius: 10,
+            border: `3px solid ${DELETE_RED}`,
+            background: "rgba(201,72,47,.18)",
+            pointerEvents: "none",
+          }}
+        />
+      )}
       <div className="thumb-label">{name}</div>
+
+      <div
+        data-no-dnd="true"
+        onPointerDown={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        }}
+        onClick={(e) => {
+          e.stopPropagation();
+          onToggleMarked();
+        }}
+        title={marked ? "Marked for deletion (D)" : "Mark for deletion (D)"}
+        style={{
+          position: "absolute",
+          top: 6,
+          left: 6,
+          width: 24,
+          height: 24,
+          borderRadius: "50%",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          cursor: "pointer",
+          background: marked ? DELETE_RED : "rgba(0,0,0,.4)",
+          border: marked ? "none" : "1px solid rgba(255,255,255,.5)",
+          boxShadow: marked ? "0 1px 4px rgba(0,0,0,.35)" : "none",
+        }}
+      >
+        <TrashIcon color="#fff" />
+      </div>
 
       <div
         data-no-dnd="true"
