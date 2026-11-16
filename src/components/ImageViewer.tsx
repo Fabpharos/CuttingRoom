@@ -3,6 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { join } from "@tauri-apps/api/path";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { ImageEntry } from "./ImageGrid";
+import TrashIcon, { DELETE_RED } from "./TrashIcon";
 
 const HEART_PATH =
   "M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35Z";
@@ -13,20 +14,24 @@ export default function ImageViewer({
   index,
   tags,
   favorites,
+  deletions,
   onClose,
   onNavigate,
   onToggleTag,
   onToggleFavorite,
+  onToggleMarked,
 }: {
   images: ImageEntry[];
   folderPath: string;
   index: number;
   tags: Record<string, boolean>;
   favorites: Record<string, boolean>;
+  deletions: Record<string, boolean>;
   onClose: () => void;
   onNavigate: (newIndex: number) => void;
   onToggleTag: (name: string) => void;
   onToggleFavorite: (name: string) => void;
+  onToggleMarked: (name: string) => void;
 }) {
   const [fullSrc, setFullSrc] = useState<string | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -90,6 +95,12 @@ export default function ImageViewer({
           e.preventDefault();
           onToggleFavorite(current.name);
           break;
+        case "d":
+        case "D":
+          if (e.ctrlKey || e.metaKey || e.altKey) break;
+          e.preventDefault();
+          onToggleMarked(current.name);
+          break;
         case "Escape":
           e.preventDefault();
           void closeAndRestore();
@@ -99,10 +110,11 @@ export default function ImageViewer({
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [index, images.length, isFullscreen, current.name, onNavigate, onToggleTag, onToggleFavorite, onClose]);
+  }, [index, images.length, isFullscreen, current.name, onNavigate, onToggleTag, onToggleFavorite, onToggleMarked, onClose]);
 
   const needsEdit = !!tags[current.name];
   const favorite = !!favorites[current.name];
+  const marked = !!deletions[current.name];
 
   return (
     <div
@@ -197,6 +209,26 @@ export default function ImageViewer({
               <path d="M12 20h9" />
               <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
             </svg>
+          </div>
+          <div
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleMarked(current.name);
+            }}
+            title={marked ? "Marked for deletion (D)" : "Mark for deletion (D)"}
+            style={{
+              width: 30,
+              height: 30,
+              borderRadius: "50%",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              cursor: "pointer",
+              background: marked ? DELETE_RED : "rgba(255,255,255,.12)",
+              border: marked ? "none" : "1px solid rgba(255,255,255,.4)",
+            }}
+          >
+            <TrashIcon size={14} color="#fff" />
           </div>
           <div
             onClick={(e) => {

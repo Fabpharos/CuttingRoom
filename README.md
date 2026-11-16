@@ -4,7 +4,7 @@ A local desktop app for organizing, comparing, and bulk-editing photo albums. Bu
 
 ## Features
 
-- **Album** — load a folder of photos, tag them (needs-editing / favorite), drag to reorder, rename the album (and optionally the photo files to match), single-click / Shift-click / Ctrl-click selection, copy selected photos to the clipboard for pasting into Explorer, delete to the Recycle Bin, and a full-screen image viewer with keyboard navigation.
+- **Album** — load a folder of photos, tag them (needs-editing / favorite / marked for deletion, then delete every marked photo to the Recycle Bin at once), drag to reorder, rename the album (and optionally the photo files to match), single-click / Shift-click / Ctrl-click selection, copy selected photos to the clipboard for pasting into Explorer, delete to the Recycle Bin, and a full-screen image viewer with keyboard navigation.
 - **Matching** — compare every photo in one folder against a second folder and find each one's closest visual match by perceptual hash, resolution-independent (useful for tracking down an original, un-upscaled file). Review the matches, then copy the ones you want into a destination folder.
 - **Detection** — run a YOLO (Ultralytics) model over a folder of photos, review the detected regions (toggle individual boxes or whole classes on/off), then pixelate the confirmed regions into an output folder. Originals are never modified.
 - **Strip Metadata** — recursively remove EXIF and other metadata from every image in a folder and its subfolders, including NovelAI's prompt and settings — both the PNG text chunks and the "stealth" copy hidden in the alpha channel.

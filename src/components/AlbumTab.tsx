@@ -61,6 +61,7 @@ export default function AlbumTab({ active }: { active: boolean }) {
   const [images, setImages] = useState<ImageEntry[]>([]);
   const [tags, setTags] = useState<Record<string, boolean>>({});
   const [favorites, setFavorites] = useState<Record<string, boolean>>({});
+  const [deletions, setDeletions] = useState<Record<string, boolean>>({});
   const [pendingRename, setPendingRename] = useState<PendingPhotoRename | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [nameRevertToken, setNameRevertToken] = useState(0);
@@ -70,9 +71,11 @@ export default function AlbumTab({ active }: { active: boolean }) {
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
   const [needsEditFilterOn, setNeedsEditFilterOn] = useState(false);
   const [favoritesFilterOn, setFavoritesFilterOn] = useState(false);
+  const [deletionFilterOn, setDeletionFilterOn] = useState(false);
   const [selectedNames, setSelectedNames] = useState<Set<string>>(new Set());
   const [selectionAnchor, setSelectionAnchor] = useState<number | null>(null);
-  const [pendingDelete, setPendingDelete] = useState(false);
+  // The photos the delete confirmation is asking about.
+  const [pendingDelete, setPendingDelete] = useState<Set<string> | null>(null);
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
@@ -87,12 +90,15 @@ export default function AlbumTab({ active }: { active: boolean }) {
   const loadTokenRef = useRef(0);
 
   const visibleImages = useMemo(() => {
-    if (!needsEditFilterOn && !favoritesFilterOn) return images;
+    if (!needsEditFilterOn && !favoritesFilterOn && !deletionFilterOn) return images;
     return images.filter(
       (img) =>
-        (needsEditFilterOn && tags[img.name]) || (favoritesFilterOn && favorites[img.name]),
+        (needsEditFilterOn && tags[img.name]) ||
+        (favoritesFilterOn && favorites[img.name]) ||
+        (deletionFilterOn && deletions[img.name]),
     );
-  }, [images, tags, favorites, needsEditFilterOn, favoritesFilterOn]);
+  }, [images, tags, favorites, deletions, needsEditFilterOn, favoritesFilterOn, deletionFilterOn]);
+  const markedCount = images.filter((img) => deletions[img.name]).length;
 
   // Read by keyboard-shortcut and window-close listeners below, which are
   // registered once and would otherwise close over stale state.
@@ -102,6 +108,7 @@ export default function AlbumTab({ active }: { active: boolean }) {
     images,
     tags,
     favorites,
+    deletions,
     folderPath,
     selectedNames,
     viewerOpen: viewerIndex !== null,
@@ -113,6 +120,7 @@ export default function AlbumTab({ active }: { active: boolean }) {
       images,
       tags,
       favorites,
+      deletions,
       folderPath,
       selectedNames,
       viewerOpen: viewerIndex !== null,
@@ -194,6 +202,7 @@ export default function AlbumTab({ active }: { active: boolean }) {
           images: imgs,
           tags: currentTags,
           favorites: currentFavorites,
+          deletions: currentDeletions,
         } = latestRef.current;
         if (fp && dirty) {
           void renamePhotosToMatch(
@@ -202,6 +211,7 @@ export default function AlbumTab({ active }: { active: boolean }) {
             imgs.map((i) => i.name),
             currentTags,
             currentFavorites,
+            currentDeletions,
           );
         }
         return;
@@ -228,11 +238,20 @@ export default function AlbumTab({ active }: { active: boolean }) {
         return;
       }
 
+      if (e.key.toLowerCase() === "d" && !e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        const { selectedNames: sel, viewerOpen } = latestRef.current;
+        if (sel.size > 0 && !viewerOpen) {
+          e.preventDefault();
+          void toggleSelectedMarkedRef.current();
+        }
+        return;
+      }
+
       if (e.key === "Delete" && !e.repeat) {
         const { selectedNames: sel, viewerOpen } = latestRef.current;
         if (sel.size > 0 && !viewerOpen) {
           e.preventDefault();
-          setPendingDelete(true);
+          setPendingDelete(new Set(sel));
         }
       }
     }
@@ -290,6 +309,7 @@ export default function AlbumTab({ active }: { active: boolean }) {
     const name = stored?.name ?? (await basename(dir));
     const albumTags = stored?.tags ?? {};
     const albumFavorites = stored?.favorites ?? {};
+    const albumDeletions = stored?.deletions ?? {};
 
     // Show the grid immediately with placeholders, then fill thumbnails in
     // as each one decodes — waiting for the whole folder to finish before
@@ -301,12 +321,14 @@ export default function AlbumTab({ active }: { active: boolean }) {
     setAlbumName(name);
     setTags(albumTags);
     setFavorites(albumFavorites);
+    setDeletions(albumDeletions);
     setPendingRename(null);
     setError(leftoverWarning(entries.map((e) => e.name)));
     setViewerIndex(null);
     setIsDirty(false);
     setNeedsEditFilterOn(false);
     setFavoritesFilterOn(false);
+    setDeletionFilterOn(false);
     setSelectedNames(new Set());
     setSelectionAnchor(null);
     await saveAlbum(dir, {
@@ -314,6 +336,7 @@ export default function AlbumTab({ active }: { active: boolean }) {
       order: finalOrder,
       tags: albumTags,
       favorites: albumFavorites,
+      deletions: albumDeletions,
     });
     setRecentFolders(await addRecentFolder(dir));
 
@@ -342,6 +365,7 @@ export default function AlbumTab({ active }: { active: boolean }) {
       order: images.map((i) => i.name),
       tags,
       favorites,
+      deletions,
       ...overrides,
     };
     await saveAlbum(folderPath, data);
@@ -361,7 +385,7 @@ export default function AlbumTab({ active }: { active: boolean }) {
     setImages(reordered);
     setIsDirty(true);
     if (folderPath) {
-      await saveAlbum(folderPath, { name: albumName, order: mergedOrder, tags, favorites });
+      await saveAlbum(folderPath, { name: albumName, order: mergedOrder, tags, favorites, deletions });
     }
   }
 
@@ -381,6 +405,7 @@ export default function AlbumTab({ active }: { active: boolean }) {
         order: shuffled.map((i) => i.name),
         tags,
         favorites,
+        deletions,
       });
     }
   }
@@ -410,6 +435,30 @@ export default function AlbumTab({ active }: { active: boolean }) {
   }
   const toggleSelectedFavoritesRef = useRef(toggleSelectedFavorites);
   toggleSelectedFavoritesRef.current = toggleSelectedFavorites;
+
+  // Marking only flags a photo; nothing leaves the folder until "Delete marked".
+  async function setMarked(names: string[], value: boolean) {
+    const newDeletions = { ...deletions };
+    for (const n of names) {
+      if (value) newDeletions[n] = true;
+      else delete newDeletions[n];
+    }
+    setDeletions(newDeletions);
+    await persist({ deletions: newDeletions });
+  }
+
+  async function handleToggleMarked(name: string) {
+    await setMarked([name], !deletions[name]);
+  }
+
+  // D in the grid, like F for favorites.
+  async function toggleSelectedMarked() {
+    const names = images.filter((img) => selectedNames.has(img.name)).map((img) => img.name);
+    if (names.length === 0) return;
+    await setMarked(names, !names.every((n) => deletions[n]));
+  }
+  const toggleSelectedMarkedRef = useRef(toggleSelectedMarked);
+  toggleSelectedMarkedRef.current = toggleSelectedMarked;
 
   function handleSelect(index: number, shiftKey: boolean, ctrlKey: boolean) {
     const name = visibleImages[index]?.name;
@@ -470,9 +519,11 @@ export default function AlbumTab({ active }: { active: boolean }) {
     const newImages = [...kept, ...newNames.map((name) => ({ name, src: "" }))];
     const newTags = Object.fromEntries(Object.entries(tags).filter(([n]) => onDisk.has(n)));
     const newFavorites = Object.fromEntries(Object.entries(favorites).filter(([n]) => onDisk.has(n)));
+    const newDeletions = Object.fromEntries(Object.entries(deletions).filter(([n]) => onDisk.has(n)));
     setImages(newImages);
     setTags(newTags);
     setFavorites(newFavorites);
+    setDeletions(newDeletions);
     if (removed > 0) {
       setSelectedNames((prev) => new Set([...prev].filter((n) => onDisk.has(n))));
       setSelectionAnchor(null);
@@ -484,6 +535,7 @@ export default function AlbumTab({ active }: { active: boolean }) {
       order: newImages.map((i) => i.name),
       tags: newTags,
       favorites: newFavorites,
+      deletions: newDeletions,
     });
 
     const myLoad = loadTokenRef.current;
@@ -507,10 +559,10 @@ export default function AlbumTab({ active }: { active: boolean }) {
     if (typeof dest === "string") setPdfExportTarget(dest);
   }
 
-  async function doDeleteSelected() {
-    setPendingDelete(false);
-    if (!folderPath || selectedNames.size === 0) return;
-    const toDelete = images.filter((img) => selectedNames.has(img.name));
+  async function doDelete(names: Set<string>) {
+    setPendingDelete(null);
+    if (!folderPath || names.size === 0) return;
+    const toDelete = images.filter((img) => names.has(img.name));
     const paths = await Promise.all(toDelete.map((img) => join(folderPath, img.name)));
     try {
       await moveFilesToTrash(paths);
@@ -518,23 +570,28 @@ export default function AlbumTab({ active }: { active: boolean }) {
       setError(`Couldn't delete photos: ${String(err)}`);
       return;
     }
-    const remaining = images.filter((img) => !selectedNames.has(img.name));
+    const remaining = images.filter((img) => !names.has(img.name));
     const newTags = { ...tags };
     const newFavorites = { ...favorites };
+    const newDeletions = { ...deletions };
     for (const img of toDelete) {
       delete newTags[img.name];
       delete newFavorites[img.name];
+      delete newDeletions[img.name];
     }
     setImages(remaining);
     setTags(newTags);
     setFavorites(newFavorites);
-    setSelectedNames(new Set());
+    setDeletions(newDeletions);
+    setSelectedNames((prev) => new Set([...prev].filter((n) => !names.has(n))));
     setSelectionAnchor(null);
+    setViewerIndex(null);
     await saveAlbum(folderPath, {
       name: albumName,
       order: remaining.map((i) => i.name),
       tags: newTags,
       favorites: newFavorites,
+      deletions: newDeletions,
     });
   }
 
@@ -568,6 +625,7 @@ export default function AlbumTab({ active }: { active: boolean }) {
         order: updatedImages.map((i) => i.name),
         tags,
         favorites,
+        deletions,
       });
 
       setPendingRename({
@@ -591,6 +649,7 @@ export default function AlbumTab({ active }: { active: boolean }) {
     order: string[],
     currentTags: Record<string, boolean>,
     currentFavorites: Record<string, boolean>,
+    currentDeletions: Record<string, boolean>,
   ): Promise<boolean> {
     const plan = buildRenamePlan(name, order);
     try {
@@ -610,19 +669,23 @@ export default function AlbumTab({ active }: { active: boolean }) {
       );
       const newTags: Record<string, boolean> = {};
       const newFavorites: Record<string, boolean> = {};
+      const newDeletions: Record<string, boolean> = {};
       for (const p of plan) {
         if (currentTags[p.oldName]) newTags[p.newName] = true;
         if (currentFavorites[p.oldName]) newFavorites[p.newName] = true;
+        if (currentDeletions[p.oldName]) newDeletions[p.newName] = true;
       }
       setImages(newImages);
       setTags(newTags);
       setFavorites(newFavorites);
+      setDeletions(newDeletions);
       setIsDirty(false);
       await saveAlbum(dir, {
         name,
         order: newImages.map((i) => i.name),
         tags: newTags,
         favorites: newFavorites,
+        deletions: newDeletions,
       });
       return true;
     } catch (err) {
@@ -634,7 +697,7 @@ export default function AlbumTab({ active }: { active: boolean }) {
   async function confirmPhotoRename() {
     if (!pendingRename) return;
     const { folderPath: dir, albumName: name, order } = pendingRename;
-    await renamePhotosToMatch(dir, name, order, tags, favorites);
+    await renamePhotosToMatch(dir, name, order, tags, favorites, deletions);
     setPendingRename(null);
   }
 
@@ -645,9 +708,17 @@ export default function AlbumTab({ active }: { active: boolean }) {
       images: imgs,
       tags: currentTags,
       favorites: currentFavorites,
+      deletions: currentDeletions,
     } = latestRef.current;
     const ok = fp
-      ? await renamePhotosToMatch(fp, name, imgs.map((i) => i.name), currentTags, currentFavorites)
+      ? await renamePhotosToMatch(
+          fp,
+          name,
+          imgs.map((i) => i.name),
+          currentTags,
+          currentFavorites,
+          currentDeletions,
+        )
       : true;
     setShowCloseConfirm(false);
     if (ok) {
@@ -695,9 +766,12 @@ export default function AlbumTab({ active }: { active: boolean }) {
           totalCount={images.length}
           tags={tags}
           favorites={favorites}
+          deletions={deletions}
           selectedNames={selectedNames}
           needsEditFilterOn={needsEditFilterOn}
           favoritesFilterOn={favoritesFilterOn}
+          deletionFilterOn={deletionFilterOn}
+          markedCount={markedCount}
           onChangeFolder={chooseFolder}
           onRefresh={() => void handleRefresh()}
           onRenameFiles={() => setShowRenamePreview(true)}
@@ -707,11 +781,16 @@ export default function AlbumTab({ active }: { active: boolean }) {
           onReorder={handleReorder}
           onToggleTag={handleToggleTag}
           onToggleFavorite={handleToggleFavorite}
+          onToggleMarked={(name) => void handleToggleMarked(name)}
+          onDeleteMarked={() =>
+            setPendingDelete(new Set(images.filter((img) => deletions[img.name]).map((img) => img.name)))
+          }
           onSelect={handleSelect}
           onClearSelection={() => setSelectedNames(new Set())}
           onOpenViewer={setViewerIndex}
           onToggleNeedsEditFilter={() => setNeedsEditFilterOn((v) => !v)}
           onToggleFavoritesFilter={() => setFavoritesFilterOn((v) => !v)}
+          onToggleDeletionFilter={() => setDeletionFilterOn((v) => !v)}
           onContextMenu={handleContextMenu}
           nameRevertToken={nameRevertToken}
         />
@@ -750,10 +829,12 @@ export default function AlbumTab({ active }: { active: boolean }) {
           index={viewerIndex}
           tags={tags}
           favorites={favorites}
+          deletions={deletions}
           onClose={() => setViewerIndex(null)}
           onNavigate={setViewerIndex}
           onToggleTag={handleToggleTag}
           onToggleFavorite={handleToggleFavorite}
+          onToggleMarked={handleToggleMarked}
         />
       )}
 
@@ -807,10 +888,18 @@ export default function AlbumTab({ active }: { active: boolean }) {
                 })();
               },
             },
+            (() => {
+              const names = [...contextMenu.targets];
+              const allMarked = names.every((n) => deletions[n]);
+              return {
+                label: allMarked ? "Unmark for deletion" : "Mark for deletion",
+                onClick: () => void setMarked(names, !allMarked),
+              };
+            })(),
             {
               label: contextMenu.targets.size === 1 ? "Delete" : "Delete photos",
               danger: true,
-              onClick: () => setPendingDelete(true),
+              onClick: () => setPendingDelete(new Set(contextMenu.targets)),
             },
           ]}
         />
@@ -819,11 +908,11 @@ export default function AlbumTab({ active }: { active: boolean }) {
       {pendingDelete && (
         <ConfirmModal
           title="Delete photos?"
-          message={`Move ${selectedNames.size} photo${selectedNames.size === 1 ? "" : "s"} to the Recycle Bin?`}
+          message={`Move ${pendingDelete.size} photo${pendingDelete.size === 1 ? "" : "s"} to the Recycle Bin?`}
           confirmLabel="Delete"
           cancelLabel="Cancel"
-          onConfirm={() => void doDeleteSelected()}
-          onCancel={() => setPendingDelete(false)}
+          onConfirm={() => void doDelete(pendingDelete)}
+          onCancel={() => setPendingDelete(null)}
         />
       )}
 
@@ -838,6 +927,7 @@ export default function AlbumTab({ active }: { active: boolean }) {
               images.map((i) => i.name),
               tags,
               favorites,
+              deletions,
             );
           }}
           onCancel={() => setShowRenamePreview(false)}

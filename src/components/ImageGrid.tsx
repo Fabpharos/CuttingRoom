@@ -11,6 +11,7 @@ import { SortableContext, arrayMove, rectSortingStrategy } from "@dnd-kit/sortab
 import AlbumHeader from "./AlbumHeader";
 import Thumbnail from "./Thumbnail";
 import { TagAwarePointerSensor } from "../lib/dndSensors";
+import TrashIcon, { DELETE_RED } from "./TrashIcon";
 
 export type ImageEntry = {
   name: string;
@@ -64,9 +65,12 @@ export default function ImageGrid({
   totalCount,
   tags,
   favorites,
+  deletions,
   selectedNames,
   needsEditFilterOn,
   favoritesFilterOn,
+  deletionFilterOn,
+  markedCount,
   onChangeFolder,
   onRefresh,
   onRenameFiles,
@@ -76,11 +80,14 @@ export default function ImageGrid({
   onReorder,
   onToggleTag,
   onToggleFavorite,
+  onToggleMarked,
+  onDeleteMarked,
   onSelect,
   onClearSelection,
   onOpenViewer,
   onToggleNeedsEditFilter,
   onToggleFavoritesFilter,
+  onToggleDeletionFilter,
   onContextMenu,
   nameRevertToken,
 }: {
@@ -90,9 +97,13 @@ export default function ImageGrid({
   totalCount: number;
   tags: Record<string, boolean>;
   favorites: Record<string, boolean>;
+  deletions: Record<string, boolean>;
   selectedNames: Set<string>;
   needsEditFilterOn: boolean;
   favoritesFilterOn: boolean;
+  deletionFilterOn: boolean;
+  /** Photos in the whole album marked for deletion, filtered or not. */
+  markedCount: number;
   onChangeFolder: () => void;
   onRefresh: () => void;
   onRenameFiles: () => void;
@@ -102,11 +113,14 @@ export default function ImageGrid({
   onReorder: (newOrder: string[]) => void;
   onToggleTag: (name: string) => void;
   onToggleFavorite: (name: string) => void;
+  onToggleMarked: (name: string) => void;
+  onDeleteMarked: () => void;
   onSelect: (index: number, shiftKey: boolean, ctrlKey: boolean) => void;
   onClearSelection: () => void;
   onOpenViewer: (index: number) => void;
   onToggleNeedsEditFilter: () => void;
   onToggleFavoritesFilter: () => void;
+  onToggleDeletionFilter: () => void;
   onContextMenu: (index: number, x: number, y: number) => void;
   nameRevertToken?: number;
 }) {
@@ -225,11 +239,43 @@ export default function ImageGrid({
             <path d={HEART_PATH} />
           </svg>
         </FilterChip>
+        <FilterChip
+          active={deletionFilterOn}
+          onClick={onToggleDeletionFilter}
+          label="Marked for deletion"
+        >
+          <TrashIcon color={deletionFilterOn ? "var(--accent-contrast)" : "var(--muted)"} />
+        </FilterChip>
+        {markedCount > 0 && (
+          <button
+            onClick={onDeleteMarked}
+            title="Move every photo marked for deletion to the Recycle Bin"
+            style={{
+              marginLeft: "auto",
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              padding: "5px 12px 5px 9px",
+              borderRadius: 999,
+              border: "none",
+              background: DELETE_RED,
+              color: "#fff",
+              fontFamily: "'Space Grotesk', sans-serif",
+              fontWeight: 600,
+              fontSize: 12.5,
+              cursor: "pointer",
+              whiteSpace: "nowrap",
+            }}
+          >
+            <TrashIcon color="#fff" />
+            Delete {markedCount} marked
+          </button>
+        )}
       </div>
 
       {images.length === 0 ? (
         <div style={{ fontSize: 13, color: "var(--muted)" }}>
-          {needsEditFilterOn || favoritesFilterOn
+          {needsEditFilterOn || favoritesFilterOn || deletionFilterOn
             ? "No photos match the active filter."
             : "No images found in this folder."}
         </div>
@@ -268,10 +314,12 @@ export default function ImageGrid({
                     name={img.name}
                     needsEdit={!!tags[img.name]}
                     favorite={!!favorites[img.name]}
+                    marked={!!deletions[img.name]}
                     selected={selectedNames.has(img.name)}
                     dimmed={isGroupDragging}
                     onToggleTag={() => onToggleTag(img.name)}
                     onToggleFavorite={() => onToggleFavorite(img.name)}
+                    onToggleMarked={() => onToggleMarked(img.name)}
                     onSelect={(shiftKey, ctrlKey) => onSelect(i, shiftKey, ctrlKey)}
                     onOpen={() => onOpenViewer(i)}
                     onContextMenu={(x, y) => onContextMenu(i, x, y)}

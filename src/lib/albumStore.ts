@@ -5,6 +5,8 @@ export type AlbumData = {
   order: string[];
   tags: Record<string, boolean>;
   favorites: Record<string, boolean>;
+  /** Photos marked for deletion; only "Delete marked" actually removes them. */
+  deletions?: Record<string, boolean>;
 };
 
 const store = new LazyStore("albums.json");
