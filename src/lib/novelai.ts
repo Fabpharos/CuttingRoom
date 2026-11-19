@@ -457,6 +457,8 @@ export type BatchProgress = {
   done: number;
   total: number;
   image: GeneratedImage | null;
+  /** The account after an image, when the Anlas guard checked it. */
+  account: AccountStatus | null;
 };
 
 export type BatchSummary = {

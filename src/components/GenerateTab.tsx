@@ -52,6 +52,7 @@ import {
 } from "../lib/novelai";
 import ConfirmModal from "./ConfirmModal";
 import HelpTip from "./HelpTip";
+import AccountBars from "./AccountBars";
 import CharacterSlots, { roughTokens, spreadPositions, tokenLimit, type SlotSummary } from "./CharacterSlots";
 import CharacterCardDialog from "./CharacterCardDialog";
 import { PARTS, adaptCardCharacter, type CardLink } from "../lib/characterCards";
@@ -1158,6 +1159,7 @@ export default function GenerateTab({
         // the user has already confirmed an open-ended spend.
         guardAnlas,
         (p) => {
+          if (p.account) setStatus(p.account);
           setProgress({ done: p.done, total: p.total });
           if (p.image) {
             const shown = { ...p.image, src: convertFileSrc(p.image.path) };
@@ -1458,6 +1460,17 @@ export default function GenerateTab({
     void refreshStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
+
+  // While the tab is showing, keep the balance and quota current.
+  useEffect(() => {
+    if (!active || phase !== "loggedIn" || generating) return;
+    const timer = setInterval(() => {
+      getAccountStatus()
+        .then((s) => s && setStatus(s))
+        .catch(() => {});
+    }, 60_000);
+    return () => clearInterval(timer);
+  }, [active, phase, generating]);
 
   async function refreshStatus() {
     setPhase((p) => (p === "loggedIn" ? p : "checking"));
@@ -2818,32 +2831,6 @@ export default function GenerateTab({
                     <div style={{ flex: 1, fontSize: 13.5 }}>
                       <span style={{ fontWeight: 700 }}>{status.tierName}</span>
                       {!status.active && <span style={{ color: "var(--muted)" }}> (inactive)</span>}
-                      <span
-                        style={{
-                          marginLeft: 10,
-                          fontFamily: "'IBM Plex Mono', monospace",
-                          fontSize: 12,
-                          color: "var(--muted)",
-                        }}
-                      >
-                        {status.anlas.toLocaleString()} ANLAS
-                      </span>
-                      {status.isOpus && status.usage && (
-                        <span
-                          title="Opus generations with V5 models draw from this refilling quota. V4 and V4.5 are unlimited."
-                          style={{
-                            marginLeft: 10,
-                            fontFamily: "'IBM Plex Mono', monospace",
-                            fontSize: 12,
-                            color: status.usage.isNegative ? "rgb(200,140,40)" : "var(--muted)",
-                          }}
-                        >
-                          V5 QUOTA{" "}
-                          {status.usage.isNegative
-                            ? "USED UP"
-                            : `${status.usage.percent + status.usage.purchasedPercent}%`}
-                        </span>
-                      )}
                     </div>
                     <a
                       href="#"
@@ -2864,6 +2851,7 @@ export default function GenerateTab({
                     </button>
                   </div>
 
+                  <AccountBars status={status} />
                   {!status.isOpus && (
                     <div style={warningBoxStyle}>
                       {status.active

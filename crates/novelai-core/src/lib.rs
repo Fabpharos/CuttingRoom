@@ -633,6 +633,8 @@ pub struct BatchProgress {
     pub done: usize,
     pub total: usize,
     pub image: Option<GeneratedImage>,
+    /// The account after an image, when the Anlas guard checked it.
+    pub account: Option<AccountStatus>,
 }
 
 #[derive(Serialize)]
@@ -766,7 +768,7 @@ pub async fn generate_batch(
     let mut images = Vec::new();
     let mut cancelled = false;
     let mut stopped_reason = None;
-    on_progress(BatchProgress { run_id: run_id.clone(), done: 0, total, image: None });
+    on_progress(BatchProgress { run_id: run_id.clone(), done: 0, total, image: None, account: None });
 
     for (req, body) in requests.iter().zip(&bodies) {
         let result = send_in_turn(&run_id, || post_for_image(&token, "/ai/generate-image", body)).await;
@@ -787,6 +789,7 @@ pub async fn generate_batch(
                     done: images.len(),
                     total,
                     image: Some(image),
+                    account: None,
                 });
             }
             Err(e) => {
@@ -799,7 +802,17 @@ pub async fn generate_batch(
             // A charge NovelAI is known to make (a Precise Reference, say)
             // is expected; anything beyond it stops the batch.
             let expected = known_charge(req);
-            match fetch_status(&token).await {
+            let checked = fetch_status(&token).await;
+            if let Ok(s) = &checked {
+                on_progress(BatchProgress {
+                    run_id: run_id.clone(),
+                    done: images.len(),
+                    total,
+                    image: None,
+                    account: Some(s.clone()),
+                });
+            }
+            match checked {
                 Ok(s) if before - s.anlas > expected => {
                     stopped_reason = Some(format!(
                         "NovelAI charged {} Anlas for that image{}, so the batch stopped. \
