@@ -4,6 +4,8 @@ import { readDir } from "@tauri-apps/plugin-fs";
 import { join } from "@tauri-apps/api/path";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { readImageMetadata } from "../lib/novelai";
+import HelpTip from "./HelpTip";
+import { helpFor } from "../lib/syntaxHelp";
 import {
   findShared,
   remixItems,
@@ -296,6 +298,7 @@ export default function RemixTab({
                 <label style={{ display: "flex", flexDirection: "column", gap: 5 }}>
                   <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)" }}>
                     Replace with (goes where the first swapped tag was)
+                    <HelpTip title="Replacement syntax" lines={helpFor("remix")} />
                   </span>
                   <textarea
                     rows={2}

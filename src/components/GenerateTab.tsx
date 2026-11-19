@@ -59,7 +59,7 @@ import HelpTip from "./HelpTip";
 import AccountBars from "./AccountBars";
 import CharacterSlots, { roughTokens, spreadPositions, tokenLimit, type SlotSummary } from "./CharacterSlots";
 import CharacterCardDialog from "./CharacterCardDialog";
-import { PARTS, adaptCardCharacter, listCards, loadCardFolder, type CardFile, type CardLink } from "../lib/characterCards";
+import { PARTS, adaptCardCharacter, linkFor, listCards, loadCardFolder, type CardFile, type CardLink } from "../lib/characterCards";
 import AutomationCard, { DEFAULT_AUTOMATION, type AutomationSettings } from "./AutomationCard";
 import BatchPreview, { type PreviewImage } from "./BatchPreview";
 import PromptFileEditor from "./PromptFileEditor";
@@ -2010,18 +2010,46 @@ export default function GenerateTab({
   }
 
   // Gender swap, written into the form (with Undo) instead of only per batch.
+  // A carded character's opposite-gender variant: a card with the same name
+  // and the other gender, or one labelled "variant-of:<name>".
+  function variantFor(link: CardLink | null): CardFile | null {
+    if (!link?.gender || link.gender === "other") return null;
+    const want = link.gender === "female" ? "male" : "female";
+    const name = link.name.toLowerCase();
+    return (
+      cards.find(
+        (c) =>
+          c.card.gender === want &&
+          (c.card.name.toLowerCase() === name || c.card.labels.includes(`variant-of:${name}`) ||
+            (link.labels ?? []).includes(`variant-of:${c.card.name.toLowerCase()}`)),
+      ) ?? null
+    );
+  }
+
   function applySwapToForm() {
     const gs = { ...automation.genderSwap, pairs: genderPairs };
     setSwapUndo({ prompt, negative: negativePrompt, characters, negatives: characterNegatives });
-    if (gs.mode === "slot") {
-      const i = gs.slot - 1;
-      setCharacters((prev) => prev.map((c, j) => (j === i ? swapGender(c, gs) : c)));
-      setCharacterNegatives((prev) => prev.map((c, j) => (j === i ? swapGender(c, gs) : c)));
-    } else {
+    const inScope = (j: number) => gs.mode !== "slot" || j === gs.slot - 1;
+    // A carded character with a variant card loads that card instead of
+    // having its tags rewritten.
+    const variants = characters.map((_, j) => (inScope(j) ? variantFor(cardLinks[j]) : null));
+    const swapChar = (c: string, j: number) => {
+      const v = variants[j];
+      return v ? v.card.tags.map((t) => t.text).join(", ") : inScope(j) ? swapGender(c, gs) : c;
+    };
+    const swapNeg = (c: string, j: number) => {
+      const v = variants[j];
+      return v ? v.card.negative : inScope(j) ? swapGender(c, gs) : c;
+    };
+    if (gs.mode !== "slot") {
       setPrompt(swapGender(prompt, gs));
       setNegativePrompt(swapGender(negativePrompt, gs));
-      setCharacters((prev) => prev.map((c) => swapGender(c, gs)));
-      setCharacterNegatives((prev) => prev.map((c) => swapGender(c, gs)));
+    }
+    setCharacters((prev) => prev.map(swapChar));
+    setCharacterNegatives((prev) => prev.map(swapNeg));
+    if (variants.some(Boolean)) {
+      setCharacterCardLinks(cardLinks.map((l, j) => (variants[j] ? linkFor(variants[j]!.card, variants[j]!.path) : l)));
+      setBatchNotice(`Loaded the variant card${variants.filter(Boolean).length === 1 ? "" : "s"} ${variants.filter(Boolean).map((v) => v!.card.name).join(", ")} instead of rewriting their tags.`);
     }
     // The form now says it, so the batch shouldn't swap it back.
     setAutomation((a) => ({ ...a, genderSwap: { ...a.genderSwap, mode: "off" } }));

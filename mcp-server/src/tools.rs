@@ -15,7 +15,7 @@ use novelai_core::{
     InpaintSettings, MaskSpec,
 };
 use novelai_core::{
-    account_status, generate_batch, is_usage_limited, read_vibe_file, vibe_encoding_for,
+    account_status, estimate_cost, generate_batch, is_usage_limited, read_vibe_file, vibe_encoding_for,
     vibe_encoding_key, AccountStatus, GenerateRequest, VibeInfo, VibeRef, DEFAULT_VIBE_STRENGTH,
     max_characters, model_family, MAX_CHARACTERS_ANY, MAX_FREE_VIBES, MAX_GUIDANCE, MAX_STEPS, MEDIUM_MODEL, MEDIUM_STEPS, MODELS,
 };
@@ -1062,6 +1062,12 @@ impl NovelAiTools {
             source_image: None,
             ..Default::default()
         };
+        // A second opinion from the shared estimate: anything it says costs
+        // Anlas, that the user wasn't asked about, is refused.
+        let estimate = estimate_cost(&request, Some(&status));
+        if !costs && !estimate.free {
+            return ToolResult::error(format!("This request would cost Anlas: {}", estimate.reasons.join(" ")));
+        }
         self.pause_before_request();
         let summary = match self.runtime.block_on(generate_batch(
             format!("mcp-{seed}"),
