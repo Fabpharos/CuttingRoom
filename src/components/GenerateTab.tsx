@@ -2658,7 +2658,7 @@ export default function GenerateTab({
                   {
                     text: VARIETY_PLUS_VERIFIED
                       ? `Sends skip_cfg_above_sigma ${varietyPlusSigma(model, size.width, size.height).toFixed(2)} at this size.`
-                      : `Sends skip_cfg_above_sigma ${varietyPlusSigma(model, size.width, size.height).toFixed(2)} at this size (NovelAI's V4 rule; not yet checked against a V5 image made on novelai.net).`,
+                      : `Sends skip_cfg_above_sigma ${varietyPlusSigma(model, size.width, size.height).toFixed(2)} at this size (matches a V4.5 image made on novelai.net, 58 at 832×1216; other sizes scale by NovelAI's rule, and V5 isn't checked yet).`,
                   },
                 ]}
               />

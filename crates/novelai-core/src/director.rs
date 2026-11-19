@@ -7,7 +7,8 @@
 // case NovelAI's rules have changed since.
 //
 // Request: { req_type, prompt, defry (0-5), width, height, image (base64) }.
-// Emotion's prompt is "<emotion>;;<extra tags>". Results are saved as new
+// Emotion's prompt is "<emotion>", or "<emotion>;;<extra tags>" (checked
+// against images made with NovelAI's Director tools, which record it). Results are saved as new
 // files (name_emotion-happy.png, name_colorized.png); nothing is overwritten.
 
 use super::*;
@@ -142,7 +143,16 @@ pub async fn plan_director_file(req: DirectorRequest) -> Result<DirectorPlan, St
 
 fn body(req: &DirectorRequest, plan: &DirectorPlan, image_b64: &str) -> serde_json::Value {
     let (req_type, prompt) = match req.tool {
-        DirectorTool::Emotion => ("emotion", format!("{};;{}", req.emotion, req.prompt.trim())),
+        DirectorTool::Emotion => (
+            "emotion",
+            // NovelAI records a plain emotion as just its name ("sad"); extra
+            // tags follow after ";;".
+            if req.prompt.trim().is_empty() {
+                req.emotion.clone()
+            } else {
+                format!("{};;{}", req.emotion, req.prompt.trim())
+            },
+        ),
         DirectorTool::Colorize => ("colorize", req.prompt.trim().to_string()),
     };
     json!({
@@ -309,6 +319,9 @@ mod tests {
         let b = body(&r, &p, "AAAA");
         assert_eq!(b["req_type"], "emotion");
         assert_eq!(b["prompt"], "happy;;blush");
+        let mut plain = r.clone();
+        plain.prompt = String::new();
+        assert_eq!(body(&plain, &p, "AAAA")["prompt"], "happy");
         assert_eq!(b["defry"], 0);
         assert_eq!(b["width"], 1024);
         let mut c = req(DirectorTool::Colorize);

@@ -254,8 +254,9 @@ pub const DEFAULT_NOISE_SCHEDULE: &str = "karras";
 
 /// The `skip_cfg_above_sigma` NovelAI's web client sends when Variety+ is
 /// on: 58 at 832x1216, scaled with the square root of the pixel count.
-/// UNVERIFIED for V5 and V4.5 until checked against images made on
-/// novelai.net with Variety+ on (see `VARIETY_PLUS_VERIFIED`).
+/// Checked against a V4.5 image made on novelai.net with Variety+ on (58 at
+/// 832x1216). Other sizes follow the V4 scaling rule and V5 isn't checked
+/// yet, so `VARIETY_PLUS_VERIFIED` stays false until those are confirmed.
 pub fn variety_plus_sigma(_model: &str, width: u32, height: u32) -> f64 {
     let latent = 4.0 * (width as f64 / 8.0) * (height as f64 / 8.0);
     let v = 58.0 * (latent / 63232.0).sqrt();
