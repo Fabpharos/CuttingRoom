@@ -7,10 +7,13 @@
 //   director_reference_images                    padded PNGs, base64
 //   director_reference_descriptions              {caption: {base_caption: type}}
 //   director_reference_information_extracted    always 1
-//   director_reference_strength_values           strength
-//   director_reference_secondary_strength_values from fidelity
-// UNVERIFIED until checked against a request captured from novelai.net: how
-// fidelity maps to the secondary strength (`FIDELITY_INVERTED`).
+//   director_reference_strengths                 strength
+//   director_reference_secondary_strengths       from fidelity
+// The names and the description's shape are checked against an image made on
+// novelai.net, which records them in its metadata. NovelAI's API spec names
+// the strengths `…_strength_values`, so both spellings are sent. How fidelity
+// maps to the secondary strength (`FIDELITY_INVERTED`) isn't settled yet: the
+// sample used 0.5, which reads the same either way.
 
 use super::*;
 
@@ -114,14 +117,25 @@ pub(crate) fn add_references(body: &mut serde_json::Value, refs: &[PreciseRefere
     p["director_reference_images"] = json!(images);
     p["director_reference_descriptions"] = json!(refs
         .iter()
-        .map(|r| json!({ "caption": { "base_caption": r.kind, "char_captions": [] }, "legacy_uc": false }))
+        .map(|r| {
+            json!({
+                "caption": { "base_caption": r.kind, "char_captions": [] },
+                "use_coords": false,
+                "use_order": false,
+                "legacy_uc": false
+            })
+        })
         .collect::<Vec<_>>());
     p["director_reference_information_extracted"] = json!(refs.iter().map(|_| 1).collect::<Vec<_>>());
-    p["director_reference_strength_values"] = json!(refs.iter().map(|r| r.strength).collect::<Vec<_>>());
-    p["director_reference_secondary_strength_values"] = json!(refs
+    let strengths = json!(refs.iter().map(|r| r.strength).collect::<Vec<_>>());
+    let secondary = json!(refs
         .iter()
         .map(|r| if FIDELITY_INVERTED { ((1.0 - r.fidelity) * 1000.0).round() / 1000.0 } else { r.fidelity })
         .collect::<Vec<_>>());
+    p["director_reference_strengths"] = strengths.clone();
+    p["director_reference_secondary_strengths"] = secondary.clone();
+    p["director_reference_strength_values"] = strengths;
+    p["director_reference_secondary_strength_values"] = secondary;
 }
 
 #[cfg(test)]
@@ -146,7 +160,10 @@ mod tests {
         assert_eq!(p["director_reference_images"][0], "AAAA");
         assert_eq!(p["director_reference_descriptions"][0]["caption"]["base_caption"], "character");
         assert_eq!(p["director_reference_information_extracted"][0], 1);
-        assert_eq!(p["director_reference_secondary_strength_values"][0], 0.25);
+        assert_eq!(p["director_reference_secondary_strengths"][0], 0.25);
+        assert_eq!(p["director_reference_strengths"][0], 1.0);
+        assert_eq!(p["director_reference_descriptions"][0]["use_coords"], false);
+        assert_eq!(p["director_reference_descriptions"][0]["use_order"], false);
 
         r.model = "nai-diffusion-5-full".into();
         assert!(check_references(&r).is_err());

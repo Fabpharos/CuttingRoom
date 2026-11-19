@@ -115,6 +115,11 @@ export function varietyPlusSigma(_model: string, width: number, height: number):
 }
 export const VARIETY_PLUS_VERIFIED = false;
 
+/** Whether a model takes Variety+. V5 doesn't; Rust refuses it there too. */
+export function supportsVarietyPlus(model: string): boolean {
+  return !model.startsWith("nai-diffusion-5");
+}
+
 export const DEFAULT_STEPS = 28;
 // More than 28 steps costs Anlas even on Opus.
 export const MAX_STEPS = 28;
@@ -448,8 +453,10 @@ export function buildImportPlan(s: ImportedSettings, currentModel?: string): Imp
     values.noiseSchedule = s.noiseSchedule;
     applied.push({ label: "Noise schedule", value: NOISE_SCHEDULES.find((x) => x.id === s.noiseSchedule)!.label });
   }
-  values.varietyPlus = s.skipCfgAboveSigma !== null && s.skipCfgAboveSigma > 0;
+  const usesVariety = s.skipCfgAboveSigma !== null && s.skipCfgAboveSigma > 0;
+  values.varietyPlus = usesVariety && supportsVarietyPlus(model?.id ?? currentModel ?? "");
   applied.push({ label: "Variety+", value: values.varietyPlus ? "On" : "Off" });
+  if (usesVariety && !values.varietyPlus) skipped.push("Variety+: V5 doesn't take it, so it's left off.");
 
   if (s.seed !== null) {
     skipped.push(`Seed ${s.seed}: not imported, since every generation here uses a random seed.`);
