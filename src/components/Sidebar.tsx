@@ -402,7 +402,7 @@ export default function Sidebar({
               fontFamily: "'IBM Plex Mono', monospace",
             }}
           >
-            v1.3
+            v1.4
           </span>
         )}
         <ThemeSwitch theme={theme} onToggle={onToggleTheme} />
