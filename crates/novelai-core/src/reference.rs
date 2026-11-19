@@ -11,9 +11,9 @@
 //   director_reference_secondary_strengths       from fidelity
 // The names and the description's shape are checked against an image made on
 // novelai.net, which records them in its metadata. NovelAI's API spec names
-// the strengths `…_strength_values`, so both spellings are sent. How fidelity
-// maps to the secondary strength (`FIDELITY_INVERTED`) isn't settled yet: the
-// sample used 0.5, which reads the same either way.
+// the strengths `…_strength_values`, so both spellings are sent. The
+// secondary strength is 1 - fidelity: a sample made at strength 0.8 and
+// fidelity 0.3 records 0.8 and 0.7.
 
 use super::*;
 
@@ -23,7 +23,7 @@ pub const PRECISE_REFERENCE_COST: i64 = 5;
 pub const MAX_PRECISE_REFERENCES: usize = 4;
 /// Whether the site sends `1 - fidelity` as the secondary strength.
 pub const FIDELITY_INVERTED: bool = true;
-pub const PRECISE_REFERENCE_VERIFIED: bool = false;
+pub const PRECISE_REFERENCE_VERIFIED: bool = true;
 
 /// Models that take Precise Reference. V5 will get it later (NovelAI's
 /// launch post); add it here when it does.
