@@ -277,6 +277,21 @@ async fn save_character_card(
 }
 
 #[tauri::command]
+async fn nai_plan_director(request: novelai::DirectorRequest) -> Result<novelai::DirectorPlan, String> {
+    novelai::plan_director_file(request).await
+}
+
+#[tauri::command]
+async fn nai_run_director(
+    run_id: String,
+    request: novelai::DirectorRequest,
+    output_dir: String,
+    guard_anlas: bool,
+) -> Result<novelai::DirectorOutcome, String> {
+    novelai::run_director(run_id, request, output_dir, guard_anlas).await
+}
+
+#[tauri::command]
 fn nai_estimate_costs(
     requests: Vec<novelai::GenerateRequest>,
     account: Option<novelai::AccountStatus>,
@@ -405,6 +420,8 @@ pub fn run() {
             nai_generate_batch,
             nai_cancel_batch,
             nai_estimate_costs,
+            nai_plan_director,
+            nai_run_director,
             nai_read_image_metadata,
             scan_image_prompt,
             list_character_cards,

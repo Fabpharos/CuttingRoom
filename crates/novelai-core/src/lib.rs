@@ -12,6 +12,8 @@ mod turns;
 use turns::*;
 mod reference;
 pub use reference::*;
+mod director;
+pub use director::*;
 
 const API_BASE: &str = "https://image.novelai.net";
 const KEYRING_SERVICE: &str = "CuttingRoom.NovelAI";
@@ -875,18 +877,41 @@ async fn post_for_image(token: &str, endpoint: &str, body: &serde_json::Value) -
         return Err(error_for_status(status, &message));
     }
 
-    let parsed: ImageGenerationJsonResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("unexpected response from NovelAI: {e}"))?;
-    let first = parsed
-        .images
-        .into_iter()
-        .next()
-        .ok_or("NovelAI returned no image.")?;
+    let raw = resp.bytes().await.map_err(|e| format!("couldn't read NovelAI's response: {e}"))?;
+    image_from_response(&raw)
+}
+
+/// The first image in a response: JSON `{images: [base64]}`, a zip of PNGs
+/// (some endpoints answer with one even when JSON is asked for), or a PNG.
+fn image_from_response(raw: &[u8]) -> Result<Vec<u8>, String> {
+    if raw.starts_with(&PNG_SIGNATURE) {
+        return Ok(raw.to_vec());
+    }
+    if raw.starts_with(b"PK\x03\x04") {
+        return first_zip_entry(raw);
+    }
+    let parsed: ImageGenerationJsonResponse =
+        serde_json::from_slice(raw).map_err(|e| format!("unexpected response from NovelAI: {e}"))?;
+    let first = parsed.images.into_iter().next().ok_or("NovelAI returned no image.")?;
     base64::engine::general_purpose::STANDARD
         .decode(first.image)
         .map_err(|e| format!("couldn't decode the returned image: {e}"))
+}
+
+/// The first file of a zip (stored or deflated), from its local header.
+fn first_zip_entry(zip: &[u8]) -> Result<Vec<u8>, String> {
+    let bad = || "NovelAI returned a damaged zip.".to_string();
+    let u16_at = |i: usize| zip.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize).ok_or_else(bad);
+    let u32_at = |i: usize| zip.get(i..i + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize).ok_or_else(bad);
+    let method = u16_at(8)?;
+    let size = u32_at(18)?;
+    let start = 30 + u16_at(26)? + u16_at(28)?;
+    let data = zip.get(start..start.checked_add(size).ok_or_else(bad)?).ok_or_else(bad)?;
+    match method {
+        0 => Ok(data.to_vec()),
+        8 => miniz_oxide::inflate::decompress_to_vec(data).map_err(|_| bad()),
+        _ => Err(bad()),
+    }
 }
 
 async fn save_generated(bytes: Vec<u8>, req: &GenerateRequest, dir: &Path) -> Result<GeneratedImage, String> {
@@ -2051,6 +2076,26 @@ mod tests {
         assert!(!estimate_cost(&r45, Some(&scroll)).free);
         let big = request("nai-diffusion-4-5-full", 1216, 1216, &[]);
         assert!(!estimate_cost(&big, None).free);
+    }
+
+    #[test]
+    fn reads_images_from_json_zip_or_png() {
+        let png = [&PNG_SIGNATURE[..], b"rest"].concat();
+        assert_eq!(image_from_response(&png).unwrap(), png);
+        let json = format!("{{\"images\":[{{\"image\":\"{}\"}}]}}", base64::engine::general_purpose::STANDARD.encode(&png));
+        assert_eq!(image_from_response(json.as_bytes()).unwrap(), png);
+        // A stored zip entry: local header, name "image_0.png", data.
+        let name = b"image_0.png";
+        let mut zip = b"PK\x03\x04".to_vec();
+        zip.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        zip.extend_from_slice(&(png.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(png.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(name);
+        zip.extend_from_slice(&png);
+        assert_eq!(image_from_response(&zip).unwrap(), png);
+        assert!(image_from_response(b"PK\x03\x04short").is_err());
     }
 
     // ---- prompt files ----

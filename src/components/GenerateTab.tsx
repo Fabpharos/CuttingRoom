@@ -63,6 +63,8 @@ import { PARTS, adaptCardCharacter, listCards, loadCardFolder, type CardFile, ty
 import AutomationCard, { DEFAULT_AUTOMATION, type AutomationSettings } from "./AutomationCard";
 import BatchPreview, { type PreviewImage } from "./BatchPreview";
 import PromptFileEditor from "./PromptFileEditor";
+import DirectorDialog from "./DirectorDialog";
+import type { DirectorTool } from "../lib/director";
 import { buildImage, findLoops, imageRng, seededRng, swapGender, type EngineFile, type EngineSettings, type Slot } from "../lib/promptEngine";
 import { helpFor } from "../lib/syntaxHelp";
 import { CONTROL_HELP } from "../lib/syntaxHelp";
@@ -608,6 +610,7 @@ export default function GenerateTab({
   // The batch's random picks come from this, so a preview matches the run.
   const [batchSeed, setBatchSeed] = useState(() => randomSeed());
   const [previewImages, setPreviewImages] = useState<PreviewImage[] | null>(null);
+  const [director, setDirector] = useState<{ path: string; tool: DirectorTool } | null>(null);
   // Precise Reference: a style reference here, plus each loaded card's own.
   const [styleReference, setStyleReference] = useState<PreciseReference | null>(null);
   const [useCardReferences, setUseCardReferences] = useState(true);
@@ -1900,6 +1903,26 @@ export default function GenerateTab({
           style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, whiteSpace: "nowrap" }}
         >
           Show in Explorer
+        </a>{" "}
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            setDirector({ path: lastResult.path, tool: "emotion" });
+          }}
+          style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, whiteSpace: "nowrap" }}
+        >
+          Change expression…
+        </a>{" "}
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            setDirector({ path: lastResult.path, tool: "colorize" });
+          }}
+          style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, whiteSpace: "nowrap" }}
+        >
+          Colorize…
         </a>
       </div>
       {batchImages.length > 1 && (
@@ -3729,6 +3752,20 @@ export default function GenerateTab({
         );
       })()}
 
+      {director && (
+        <DirectorDialog
+          path={director.path}
+          initialTool={director.tool}
+          outputDir={outputDir}
+          onDone={(out) => {
+            const shown = { path: out.path, seed: lastResult?.seed ?? 0, src: convertFileSrc(out.path) };
+            setLastResult(shown);
+            setBatchImages((prev) => [...prev, shown]);
+            getAccountStatus().then((s) => s && setStatus(s)).catch(() => {});
+          }}
+          onClose={() => setDirector(null)}
+        />
+      )}
       {previewImages && (
         <BatchPreview
           images={previewImages}
