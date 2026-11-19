@@ -4,7 +4,12 @@ import {
   SIZES,
   SIZE_STEP,
   MAX_SIDE,
-  MAX_CHARACTERS,
+  MAX_CHARACTERS_ANY,
+  maxCharactersFor,
+  SAMPLERS,
+  NOISE_SCHEDULES,
+  DEFAULT_SAMPLER,
+  DEFAULT_NOISE_SCHEDULE,
   MAX_STEPS,
   MAX_SCALE,
   MAX_BATCH,
@@ -63,6 +68,10 @@ export type GenerateSettings = {
   img2imgStrength: number;
   steps: number;
   scale: number;
+  sampler: string;
+  noiseSchedule: string;
+  /** Variety+: skip guidance at high noise levels for more varied images. */
+  varietyPlus: boolean;
   count: number;
   outputDir: string | null;
   promptFiles: SavedPromptFile[];
@@ -85,6 +94,9 @@ export const DEFAULT_SETTINGS: GenerateSettings = {
   img2imgStrength: 0.7,
   steps: DEFAULT_STEPS,
   scale: DEFAULT_SCALE,
+  sampler: DEFAULT_SAMPLER,
+  noiseSchedule: DEFAULT_NOISE_SCHEDULE,
+  varietyPlus: false,
   count: 1,
   outputDir: null,
   promptFiles: [],
@@ -160,7 +172,7 @@ function migrateLegacyFile(raw: Legacy, prompt: string, characters: string[]) {
   };
   const field = str(raw.fileBefore, "") + tokenFor(file.name) + str(raw.fileAfter, "");
   const t = raw.fileTarget;
-  if (typeof t === "number" && Number.isInteger(t) && t >= 0 && t < MAX_CHARACTERS) {
+  if (typeof t === "number" && Number.isInteger(t) && t >= 0 && t < MAX_CHARACTERS_ANY) {
     const chars = [...characters, ...Array(Math.max(0, t + 1 - characters.length)).fill("")];
     chars[t] = field;
     return { file, prompt, characters: chars };
@@ -173,8 +185,9 @@ function migrateLegacyFile(raw: Legacy, prompt: string, characters: string[]) {
 // trusted: anything unusable falls back to its default.
 function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy): GenerateSettings {
   const d = DEFAULT_SETTINGS;
+  const model = MODELS.some((m) => m.id === raw.model) ? (raw.model as string) : d.model;
   let characters = Array.isArray(raw.characters)
-    ? raw.characters.filter((c): c is string => typeof c === "string").slice(0, MAX_CHARACTERS)
+    ? raw.characters.filter((c): c is string => typeof c === "string").slice(0, maxCharactersFor(model))
     : d.characters;
   let prompt = str(raw.prompt, d.prompt);
   let promptFiles = sanitizePromptFiles(raw.promptFiles);
@@ -184,7 +197,7 @@ function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy
     promptFiles = [legacy.file];
   }
   return {
-    model: MODELS.some((m) => m.id === raw.model) ? (raw.model as string) : d.model,
+    model,
     sizeIndex: Math.round(clamp(raw.sizeIndex, 0, SIZES.length, d.sizeIndex)),
     customWidth: side(raw.customWidth, d.customWidth),
     customHeight: side(raw.customHeight, d.customHeight),
@@ -209,6 +222,9 @@ function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy
     img2imgStrength: clamp(raw.img2imgStrength, 0, 1, d.img2imgStrength),
     steps: Math.round(clamp(raw.steps, 1, MAX_STEPS, d.steps)),
     scale: clamp(raw.scale, 0, MAX_SCALE, d.scale),
+    sampler: SAMPLERS.some((x) => x.id === raw.sampler) ? (raw.sampler as string) : d.sampler,
+    noiseSchedule: NOISE_SCHEDULES.some((x) => x.id === raw.noiseSchedule) ? (raw.noiseSchedule as string) : d.noiseSchedule,
+    varietyPlus: raw.varietyPlus === true,
     count: Math.round(clamp(raw.count, 1, MAX_BATCH, d.count)),
     outputDir: typeof raw.outputDir === "string" ? raw.outputDir : d.outputDir,
     promptFiles,

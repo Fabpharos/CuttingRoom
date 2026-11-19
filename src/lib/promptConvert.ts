@@ -38,6 +38,9 @@ export function toImportedSettings(nai: NaiPrompt): ImportedSettings {
     scale: null,
     seed: null,
     model: null,
+    sampler: null,
+    noiseSchedule: null,
+    skipCfgAboveSigma: null,
     source: null,
   };
 }

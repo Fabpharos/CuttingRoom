@@ -21,7 +21,14 @@ import {
   MAX_SIDE,
   sizeProblem,
   fitFreeSize,
-  MAX_CHARACTERS,
+  modelFamily,
+  SAMPLERS,
+  NOISE_SCHEDULES,
+  DEFAULT_SAMPLER,
+  DEFAULT_NOISE_SCHEDULE,
+  varietyPlusSigma,
+  VARIETY_PLUS_VERIFIED,
+  estimateCosts,
   DEFAULT_STEPS,
   MAX_STEPS,
   DEFAULT_SCALE,
@@ -36,6 +43,7 @@ import {
   gridLabel,
   type CharacterPosition,
   type AccountStatus,
+  type CostEstimate,
   type GenerateRequest,
   type ImportPlan,
   type ImportedSettings,
@@ -43,6 +51,8 @@ import {
   type VibeRef,
 } from "../lib/novelai";
 import ConfirmModal from "./ConfirmModal";
+import HelpTip from "./HelpTip";
+import CharacterSlots, { roughTokens, spreadPositions, tokenLimit, type SlotSummary } from "./CharacterSlots";
 import CharacterCardDialog from "./CharacterCardDialog";
 import { PARTS, adaptCardCharacter, type CardLink } from "../lib/characterCards";
 import TagSuggestions from "./TagSuggestions";
@@ -246,6 +256,7 @@ function PositionPicker({
   model,
   aspect,
   disabled,
+  highlight = null,
   onChange,
 }: {
   index: number;
@@ -253,6 +264,8 @@ function PositionPicker({
   model: string;
   aspect: number;
   disabled: boolean;
+  /** A character whose row is hovered, shown outlined. */
+  highlight?: number | null;
   onChange: (p: CharacterPosition) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -300,6 +313,9 @@ function PositionPicker({
         {positions.map((p, j) => {
           const at = shown(p);
           const mine = j === index;
+          const lit = !mine && j === highlight;
+          // With many characters, the others shrink so the board stays readable.
+          const small = positions.length > 8;
           return (
             <span
               key={j}
@@ -308,15 +324,16 @@ function PositionPicker({
                 left: `${at.x * 100}%`,
                 top: `${at.y * 100}%`,
                 transform: "translate(-50%, -50%)",
-                width: mine ? 16 : 11,
-                height: mine ? 16 : 11,
+                width: mine ? 16 : small ? 8 : 11,
+                height: mine ? 16 : small ? 8 : 11,
                 borderRadius: "50%",
                 background: mine ? "var(--accent)" : "var(--muted)",
                 color: mine ? "var(--accent-contrast)" : "var(--bg-card)",
-                opacity: mine ? 1 : 0.45,
-                fontSize: mine ? 10 : 7,
+                opacity: mine || lit ? 1 : 0.45,
+                outline: lit ? "2px solid var(--accent)" : "none",
+                fontSize: mine ? 10 : small ? 0 : 7,
                 fontWeight: 700,
-                lineHeight: mine ? "16px" : "11px",
+                lineHeight: mine ? "16px" : small ? "8px" : "11px",
                 textAlign: "center",
                 pointerEvents: "none",
                 zIndex: mine ? 1 : 0,
@@ -518,6 +535,23 @@ export default function GenerateTab({
   const [usedOnly, setUsedOnly] = useState(false);
   const [steps, setSteps] = useState(DEFAULT_STEPS);
   const [scale, setScale] = useState(DEFAULT_SCALE);
+  const [sampler, setSampler] = useState(DEFAULT_SAMPLER);
+  const [noiseSchedule, setNoiseSchedule] = useState(DEFAULT_NOISE_SCHEDULE);
+  const [varietyPlus, setVarietyPlus] = useState(false);
+  // Stable ids for the character rows (kept the same length as `characters`),
+  // so a row keeps its expanded state and editor when rows are reordered.
+  const [characterKeys, setCharacterKeys] = useState<string[]>([]);
+  const [expandedChars, setExpandedChars] = useState<Set<string>>(new Set());
+  const [oneOpen, setOneOpen] = useState(false);
+  const [hoveredChar, setHoveredChar] = useState<number | null>(null);
+  // Switching to a model that takes fewer characters: asked before anything goes.
+  const [modelSwitch, setModelSwitch] = useState<{ to: string; choosing: boolean; keep: Set<number> } | null>(null);
+  // Characters a model switch removed, kept until the next generation so
+  // switching back restores them.
+  const [stashedChars, setStashedChars] = useState<
+    { from: string; items: { index: number; text: string; negative: string; position: CharacterPosition; link: CardLink | null }[] } | null
+  >(null);
+  const [runEstimate, setRunEstimate] = useState<CostEstimate | null>(null);
   const [outputDir, setOutputDir] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   // Which run a cost confirmation is for: the form's, or the next remix batch.
@@ -552,6 +586,9 @@ export default function GenerateTab({
         setNegativePrompt(s.negativePrompt);
         setSteps(s.steps);
         setScale(s.scale);
+        setSampler(s.sampler);
+        setNoiseSchedule(s.noiseSchedule);
+        setVarietyPlus(s.varietyPlus);
         setCount(s.count);
         setOutputDir(s.outputDir);
         setCharacters(s.characters);
@@ -597,6 +634,9 @@ export default function GenerateTab({
         img2imgStrength,
         steps,
         scale,
+        sampler,
+        noiseSchedule,
+        varietyPlus,
         count,
         outputDir,
         promptFiles: promptFiles.map(({ path, name, mode }) => ({ path, name, mode })),
@@ -627,15 +667,35 @@ export default function GenerateTab({
     img2imgStrength,
     steps,
     scale,
+    sampler,
+    noiseSchedule,
+    varietyPlus,
     count,
     outputDir,
     promptFiles,
     vibes,
   ]);
+
+  // Keep a row id per character; new characters open expanded.
+  useEffect(() => {
+    if (characterKeys.length === characters.length) return;
+    if (characterKeys.length > characters.length) {
+      setCharacterKeys((k) => k.slice(0, characters.length));
+      return;
+    }
+    const fresh = Array.from({ length: characters.length - characterKeys.length }, () => crypto.randomUUID());
+    setCharacterKeys((k) => [...k, ...fresh]);
+    // Opening every new row would bury a long list; open them while it's short.
+    if (characters.length <= 4 || fresh.length === 1) {
+      setExpandedChars((prev) => (oneOpen && fresh.length === 1 ? new Set(fresh) : new Set([...prev, ...fresh])));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [characters.length, characterKeys.length]);
   const [importPlan, setImportPlan] = useState<ImportPlan | null>(null);
   const [dragging, setDragging] = useState(false);
 
   const modelInfo = MODELS.find((m) => m.id === model) ?? MODELS[0];
+  const maxChars = modelInfo.maxCharacters;
   const effectiveSteps = modelInfo.fixedSteps ?? steps;
   const vibesOn = vibes.filter((v) => v.enabled).length;
   // Only vibes already encoded for this model are sent; anything else would
@@ -839,7 +899,7 @@ export default function GenerateTab({
   async function startImport(path: string) {
     setError(null);
     try {
-      setImportPlan(buildImportPlan(await readImageMetadata(path)));
+      setImportPlan(buildImportPlan(await readImageMetadata(path), model));
     } catch (err) {
       setError(String(err));
     }
@@ -854,7 +914,7 @@ export default function GenerateTab({
       return;
     }
     setError(null);
-    setImportPlan(buildImportPlan(incoming.settings));
+    setImportPlan(buildImportPlan(incoming.settings, model));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [incoming]);
 
@@ -868,6 +928,9 @@ export default function GenerateTab({
     }
     if (v.steps !== undefined) setSteps(v.steps);
     if (v.scale !== undefined) setScale(v.scale);
+    if (v.sampler !== undefined) setSampler(v.sampler);
+    if (v.noiseSchedule !== undefined) setNoiseSchedule(v.noiseSchedule);
+    if (v.varietyPlus !== undefined) setVarietyPlus(v.varietyPlus);
     setPrompt(v.prompt);
     setNegativePrompt(v.negativePrompt);
     setCharacters(v.characters);
@@ -937,9 +1000,46 @@ export default function GenerateTab({
     if (typeof dir === "string") setOutputDir(dir);
   }
 
+  // The cost of one image as the form stands. Prompts don't change the
+  // price, so a request without tokens filled is enough.
+  const sampleRequest = (): GenerateRequest => ({
+    model,
+    prompt,
+    negativePrompt,
+    characters,
+    characterNegatives,
+    characterPositions: useCoords ? characterPositions : null,
+    width: size.width,
+    height: size.height,
+    steps: effectiveSteps,
+    scale,
+    seed: 0,
+    fileStem: "estimate",
+    vibes: vibeRefs,
+    sampler,
+    noiseSchedule,
+    skipCfgAboveSigma: varietyPlus ? varietyPlusSigma(model, size.width, size.height) : null,
+  });
+  const estimateKey = JSON.stringify([model, size, effectiveSteps, vibeRefs.length, status?.isOpus, status?.usage?.isNegative]);
+  useEffect(() => {
+    if (phase !== "loggedIn") return;
+    let stale = false;
+    estimateCosts([sampleRequest()], status)
+      .then(([e]) => !stale && setRunEstimate(e ?? null))
+      .catch(() => !stale && setRunEstimate(null));
+    return () => {
+      stale = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [estimateKey, phase]);
+  // Anything not free is confirmed first; a known price (Precise Reference)
+  // keeps the Anlas guard on, expecting that much and no more.
+  const needsConfirm = costsAnlas || (runEstimate !== null && !runEstimate.free);
+  const guardAnlas = !costsAnlas && runEstimate?.anlas !== null;
+
   function requestGenerate() {
     if (!canGenerate || !status) return;
-    if (costsAnlas) setConfirmCost("form");
+    if (needsConfirm) setConfirmCost("form");
     else void runGenerate();
   }
 
@@ -954,7 +1054,7 @@ export default function GenerateTab({
 
   function requestRemix() {
     if (!canRemix || !status) return;
-    if (costsAnlas) setConfirmCost("remix");
+    if (needsConfirm) setConfirmCost("remix");
     else void runGenerate(true);
   }
 
@@ -980,15 +1080,24 @@ export default function GenerateTab({
     const picks = files.map((f) => pickLineIndices(f.lines.length, f.mode, f.position, count));
     // A remix image keeps its own prompt, and its seed and size when the
     // Remix tab kept them; the model, steps, guidance and vibes are this tab's.
+    const sendSettings = (w: number, h: number) => ({
+      sampler,
+      noiseSchedule,
+      skipCfgAboveSigma: varietyPlus ? varietyPlusSigma(model, w, h) : null,
+    });
     const remixRequests: GenerateRequest[] = remixBatch.map((item, i) => {
       const seed = item.seed ?? randomSeed();
+      const w = item.size?.width ?? size.width;
+      const h = item.size?.height ?? size.height;
       return {
+        ...sendSettings(w, h),
         model,
         prompt: item.prompt,
         negativePrompt: item.negativePrompt,
-        characters: item.characters,
-        characterNegatives: item.characterNegatives,
-        characterPositions: item.characterPositions,
+        // The Remix tab keeps up to 22; this model may take fewer.
+        characters: item.characters.slice(0, maxChars),
+        characterNegatives: item.characterNegatives.slice(0, maxChars),
+        characterPositions: item.characterPositions?.slice(0, maxChars) ?? null,
         width: item.size?.width ?? size.width,
         height: item.size?.height ?? size.height,
         steps: effectiveSteps,
@@ -1004,6 +1113,7 @@ export default function GenerateTab({
       const values = present(entry);
       const scene = fillTokens(prompt, values);
       return {
+        ...sendSettings(size.width, size.height),
         model,
         prompt: scene,
         negativePrompt: fillTokens(negativePrompt, values),
@@ -1026,11 +1136,17 @@ export default function GenerateTab({
       };
     });
 
+    // Characters a model switch set aside are let go once something is made.
+    setStashedChars(null);
     const runId = crypto.randomUUID();
     runIdRef.current = runId;
     setGenerating(true);
     setError(null);
-    setBatchNotice(null);
+    setBatchNotice(
+      fromRemix && remixBatch.some((item) => item.characters.length > maxChars)
+        ? `${modelFamily(model)} takes ${maxChars} characters, so images with more use only their first ${maxChars}.`
+        : null,
+    );
     setBatchImages([]);
     setProgress({ done: 0, total: requests.length });
     try {
@@ -1038,9 +1154,9 @@ export default function GenerateTab({
         runId,
         requests,
         outputDir,
-        // Only guard when every image should be free; otherwise the user has
-        // already confirmed the spend.
-        !costsAnlas,
+        // Guard whenever the cost is known (free, or a fixed price); otherwise
+        // the user has already confirmed an open-ended spend.
+        guardAnlas,
         (p) => {
           setProgress({ done: p.done, total: p.total });
           if (p.image) {
@@ -1154,7 +1270,7 @@ export default function GenerateTab({
       let i = chars.findIndex((c) => firstTag(c) === part && !usesFile(c));
       if (i < 0) i = chars.findIndex((c) => c.trim() === "");
       if (i < 0) {
-        if (chars.length >= MAX_CHARACTERS) {
+        if (chars.length >= maxChars) {
           noRoom.push(part);
           continue;
         }
@@ -1170,7 +1286,7 @@ export default function GenerateTab({
     setCharacterPositions(positions);
     if (noRoom.length > 0) {
       setError(
-        `There's room for ${MAX_CHARACTERS} characters, so ${noRoom.map((p) => tokenFor(f.name, p)).join(", ")} wasn't placed. Put it in a character yourself.`,
+        `There's room for ${maxChars} characters, so ${noRoom.map((p) => tokenFor(f.name, p)).join(", ")} wasn't placed. Put it in a character yourself.`,
       );
     }
   }
@@ -1218,7 +1334,7 @@ export default function GenerateTab({
     setShowCardDialog(false);
     const index = slot ?? characters.length;
     if (slot === null) {
-      if (characters.length >= MAX_CHARACTERS) return;
+      if (characters.length >= maxChars) return;
       setCharacters((prev) => [...prev, prompt]);
       setCharacterNegatives((prev) => [...prev, negative]);
       setCharacterPositions((prev) => [...prev, CENTER]);
@@ -1244,7 +1360,90 @@ export default function GenerateTab({
     setCharacterNegatives((prev) => prev.filter((_, j) => j !== index));
     setCharacterPositions((prev) => prev.filter((_, j) => j !== index));
     setCharacterCardLinks(cardLinks.filter((_, j) => j !== index));
+    setCharacterKeys((prev) => prev.filter((_, j) => j !== index));
     if (typeof lastFieldRef.current?.field === "object") lastFieldRef.current = null;
+  }
+
+  // Applies the same reordering (new index -> old index) to every per-character list.
+  function permuteCharacters(order: number[]) {
+    const pick = <T,>(list: T[], fill: T) => order.map((i) => list[i] ?? fill);
+    setCharacters((prev) => pick(prev, ""));
+    setCharacterNegatives((prev) => pick(prev, ""));
+    setCharacterPositions((prev) => pick(prev, CENTER));
+    setCharacterCardLinks(pick(cardLinks, null));
+    setCharacterKeys((prev) => pick(prev, ""));
+    if (typeof lastFieldRef.current?.field === "object") lastFieldRef.current = null;
+  }
+
+  function moveCharacter(from: number, to: number) {
+    const order = characters.map((_, i) => i);
+    const [moved] = order.splice(from, 1);
+    order.splice(to, 0, moved);
+    permuteCharacters(order);
+  }
+
+  function toggleExpanded(key: string) {
+    setExpandedChars((prev) => {
+      if (prev.has(key)) {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      }
+      return oneOpen ? new Set([key]) : new Set([...prev, key]);
+    });
+  }
+
+  // Switching models: one that takes fewer characters asks first.
+  function chooseModel(next: string) {
+    const max = MODELS.find((m) => m.id === next)?.maxCharacters ?? 6;
+    if (characters.length > max) {
+      setModelSwitch({ to: next, choosing: false, keep: new Set(characters.map((_, i) => i).slice(0, max)) });
+      return;
+    }
+    setModel(next);
+    // Characters an earlier switch set aside come back when there's room.
+    if (stashedChars && stashedChars.from === next) restoreStash(max);
+  }
+
+  function applyModelSwitch(keep: Set<number>) {
+    if (!modelSwitch) return;
+    const kept = characters.map((_, i) => i).filter((i) => keep.has(i));
+    const removed = characters.map((_, i) => i).filter((i) => !keep.has(i));
+    setStashedChars({
+      from: model,
+      items: removed.map((i) => ({
+        index: i,
+        text: characters[i],
+        negative: characterNegatives[i] ?? "",
+        position: characterPositions[i] ?? CENTER,
+        link: cardLinks[i],
+      })),
+    });
+    permuteCharacters(kept);
+    setModel(modelSwitch.to);
+    setModelSwitch(null);
+  }
+
+  function restoreStash(max: number) {
+    if (!stashedChars) return;
+    const rows = characters.map((text, i) => ({
+      text,
+      negative: characterNegatives[i] ?? "",
+      position: characterPositions[i] ?? CENTER,
+      link: cardLinks[i],
+      key: characterKeys[i] ?? crypto.randomUUID(),
+    }));
+    // Put each back where it was, as far as the list allows.
+    for (const item of [...stashedChars.items].sort((a, b) => a.index - b.index)) {
+      if (rows.length >= max) break;
+      rows.splice(Math.min(item.index, rows.length), 0, { ...item, key: crypto.randomUUID() });
+    }
+    setCharacters(rows.map((r) => r.text));
+    setCharacterNegatives(rows.map((r) => r.negative));
+    setCharacterPositions(rows.map((r) => r.position));
+    setCharacterCardLinks(rows.map((r) => r.link));
+    setCharacterKeys(rows.map((r) => r.key));
+    setStashedChars(null);
   }
 
   function cancelGenerate() {
@@ -1387,7 +1586,7 @@ export default function GenerateTab({
               <Field label="Model">
                 <select
                   value={model}
-                  onChange={(e) => setModel(e.target.value)}
+                  onChange={(e) => chooseModel(e.target.value)}
                   disabled={generating}
                   style={{ ...inputStyle, background: "var(--bg-page)" }}
                 >
@@ -1525,6 +1724,59 @@ export default function GenerateTab({
               </Field>
             </div>
           </div>
+          <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "flex-end", marginTop: 12 }}>
+            <Field label="Sampler">
+              <select
+                value={sampler}
+                onChange={(e) => setSampler(e.target.value)}
+                disabled={generating}
+                style={{ ...inputStyle, background: "var(--bg-page)", padding: "5px 8px" }}
+              >
+                {SAMPLERS.map((x) => (
+                  <option key={x.id} value={x.id}>
+                    {x.label}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field label="Noise schedule">
+              <select
+                value={noiseSchedule}
+                onChange={(e) => setNoiseSchedule(e.target.value)}
+                disabled={generating}
+                style={{ ...inputStyle, background: "var(--bg-page)", padding: "5px 8px" }}
+              >
+                {NOISE_SCHEDULES.map((x) => (
+                  <option key={x.id} value={x.id}>
+                    {x.label}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, fontWeight: 600, paddingBottom: 6 }}>
+              <input
+                type="checkbox"
+                checked={varietyPlus}
+                onChange={(e) => setVarietyPlus(e.target.checked)}
+                disabled={generating}
+                style={{ accentColor: "var(--accent)" }}
+              />
+              Variety+
+              <HelpTip
+                title="Variety+"
+                lines={[
+                  {
+                    text: "Skips guidance in the first, noisiest steps, so images vary more in composition. Free.",
+                  },
+                  {
+                    text: VARIETY_PLUS_VERIFIED
+                      ? `Sends skip_cfg_above_sigma ${varietyPlusSigma(model, size.width, size.height).toFixed(2)} at this size.`
+                      : `Sends skip_cfg_above_sigma ${varietyPlusSigma(model, size.width, size.height).toFixed(2)} at this size (NovelAI's V4 rule; not yet checked against a V5 image made on novelai.net).`,
+                  },
+                ]}
+              />
+            </label>
+          </div>
         </div>
       </div>
     </div>
@@ -1561,11 +1813,75 @@ export default function GenerateTab({
     </div>
   );
 
+  const slots: SlotSummary[] = characters.map((c, i) => ({
+    key: characterKeys[i] ?? String(i),
+    text: c,
+    negative: characterNegatives[i] ?? "",
+    position: characterPositions[i] ?? CENTER,
+    cardName: cardLinks[i]?.name ?? null,
+    hasReference: false,
+  }));
+  const tokensUsed = [prompt, ...characters].reduce((n, t) => n + roughTokens(t), 0);
+  const tokenMax = tokenLimit(model);
+  const characterBody = (i: number) => {
+    const c = characters[i];
+    return (
+      <>
+        {cardNote(i, c)}
+        <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+          <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 6 }}>
+            <GrowingTextarea
+              minRows={wide ? 4 : 3}
+              maxHeight={360}
+              value={c}
+              placeholder={`Character ${i + 1}`}
+              data-tags
+              onChange={(e) => setCharacters((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))}
+              onFocus={(e) => (lastFieldRef.current = { field: { character: i, negative: false }, el: e.currentTarget })}
+              readOnly={generating}
+              style={textareaStyle}
+            />
+            {preview(c, true)}
+            <GrowingTextarea
+              minRows={1}
+              maxHeight={200}
+              value={characterNegatives[i] ?? ""}
+              placeholder={`Undesired for character ${i + 1}`}
+              data-tags
+              onChange={(e) => setCharacterNegatives((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))}
+              onFocus={(e) => (lastFieldRef.current = { field: { character: i, negative: true }, el: e.currentTarget })}
+              readOnly={generating}
+              style={{ ...textareaStyle, fontSize: 12.5, padding: "6px 10px" }}
+            />
+            {preview(characterNegatives[i] ?? "")}
+          </div>
+          {useCoords && (
+            <PositionPicker
+              index={i}
+              positions={characterPositions}
+              model={model}
+              aspect={size.width / size.height}
+              disabled={generating}
+              highlight={hoveredChar}
+              onChange={(p) => setCharacterPositions((prev) => prev.map((q, j) => (j === i ? p : q)))}
+            />
+          )}
+        </div>
+      </>
+    );
+  };
   const charactersCard = (
     <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 12 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
         <div style={{ ...cardTitleStyle, marginBottom: 0, flex: 1 }}>
-          CHARACTERS ({characters.length}/{MAX_CHARACTERS})
+          CHARACTERS ({characters.length}/{maxChars})
+          <HelpTip
+            title="Characters"
+            lines={[
+              { text: `${modelFamily(model)} takes up to ${maxChars} character prompts (22 on V5, 6 on V4/V4.5).` },
+              { text: "Order matters to the model: top to bottom, left to right. Drag a row by its ⋮⋮ to move it." },
+            ]}
+          />
         </div>
         <a
           href="#"
@@ -1578,7 +1894,7 @@ export default function GenerateTab({
         >
           Load character card…
         </a>
-        {characters.length < MAX_CHARACTERS && (
+        {characters.length < maxChars && (
           <a
             href="#"
             onClick={(e) => {
@@ -1615,6 +1931,19 @@ export default function GenerateTab({
               </button>
             ))}
           </div>
+          {useCoords && (
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                if (!generating) setCharacterPositions(spreadPositions(characters.length, model));
+              }}
+              title="Place the characters evenly: a row, or a grid for many"
+              style={{ fontWeight: 600 }}
+            >
+              Spread evenly
+            </a>
+          )}
           {useCoords && !positionsApply(model, characters.filter((c) => c.trim() !== "").length) && (
             <span style={{ color: "rgb(200,140,40)", fontFamily: "system-ui, sans-serif" }}>
               V4 and V4.5 place characters only when there are two or more; until then the model decides.
@@ -1627,29 +1956,67 @@ export default function GenerateTab({
           )}
         </div>
       )}
+      {characters.length > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", fontSize: 12 }}>
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault();
+              setExpandedChars(new Set());
+            }}
+            style={{ fontWeight: 600 }}
+          >
+            Collapse all
+          </a>
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault();
+              setExpandedChars(new Set(characterKeys));
+            }}
+            style={{ fontWeight: 600 }}
+          >
+            Expand all
+          </a>
+          <label style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <input
+              type="checkbox"
+              checked={oneOpen}
+              onChange={(e) => setOneOpen(e.target.checked)}
+              style={{ accentColor: "var(--accent)" }}
+            />
+            One open at a time
+          </label>
+          <span
+            title={`A rough count. ${modelFamily(model)} reads about ${tokenMax} tokens of the prompt and all characters together; text past that is ignored.`}
+            style={{
+              marginLeft: "auto",
+              fontFamily: "'IBM Plex Mono', monospace",
+              color: tokensUsed > tokenMax * 0.9 ? "rgb(200,140,40)" : "var(--muted)",
+            }}
+          >
+            ≈{tokensUsed}/{tokenMax} tokens
+          </span>
+        </div>
+      )}
       {characters.length === 0 && (
         <div style={{ fontSize: 12.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif", lineHeight: 1.5 }}>
           No characters. Each character gets its own prompt and undesired content, and can be placed in the
           picture. Add one, or load one of your character cards.
         </div>
       )}
-      {characters.map((c, i) => (
-        <div
-          key={i}
-          style={{
-            border: "1px solid var(--border)",
-            borderRadius: 8,
-            padding: "8px 10px 10px",
-            display: "flex",
-            flexDirection: "column",
-            gap: 6,
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center" }}>
-            <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", flex: 1 }}>
-              Character {i + 1}
-              {cardLinks[i] && <span style={{ fontWeight: 500 }}> · {cardLinks[i]!.name}</span>}
-            </span>
+      {characters.length > 0 && (
+        <CharacterSlots
+          slots={slots}
+          model={model}
+          disabled={generating}
+          expanded={expandedChars}
+          onToggle={toggleExpanded}
+          onReorder={moveCharacter}
+          hovered={hoveredChar}
+          onHover={setHoveredChar}
+          renderBody={characterBody}
+          renderActions={(i) => (
             <a
               href="#"
               onClick={(e) => {
@@ -1661,54 +2028,29 @@ export default function GenerateTab({
             >
               Remove
             </a>
-          </div>
-          {cardNote(i, c)}
-          <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
-            <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 6 }}>
-              <GrowingTextarea
-                minRows={wide ? 4 : 3}
-                maxHeight={360}
-                value={c}
-                placeholder={`Character ${i + 1}`}
-                data-tags
-                onChange={(e) => setCharacters((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))}
-                onFocus={(e) => (lastFieldRef.current = { field: { character: i, negative: false }, el: e.currentTarget })}
-                readOnly={generating}
-                style={textareaStyle}
-              />
-              {preview(c, true)}
-              <GrowingTextarea
-                minRows={1}
-                maxHeight={200}
-                value={characterNegatives[i] ?? ""}
-                placeholder={`Undesired for character ${i + 1}`}
-                data-tags
-                onChange={(e) =>
-                  setCharacterNegatives((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))
-                }
-                onFocus={(e) => (lastFieldRef.current = { field: { character: i, negative: true }, el: e.currentTarget })}
-                readOnly={generating}
-                style={{ ...textareaStyle, fontSize: 12.5, padding: "6px 10px" }}
-              />
-              {preview(characterNegatives[i] ?? "")}
-            </div>
-            {useCoords && (
-              <PositionPicker
-                index={i}
-                positions={characterPositions}
-                model={model}
-                aspect={size.width / size.height}
-                disabled={generating}
-                onChange={(p) => setCharacterPositions((prev) => prev.map((q, j) => (j === i ? p : q)))}
-              />
-            )}
-          </div>
+          )}
+        />
+      )}
+      {stashedChars && (
+        <div style={{ fontSize: 12, color: "var(--muted)", fontFamily: "system-ui, sans-serif" }}>
+          {stashedChars.items.length} character{stashedChars.items.length === 1 ? "" : "s"} set aside by the model switch
+          {" · "}
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault();
+              if (!generating) chooseModel(stashedChars.from);
+            }}
+            style={{ fontWeight: 600 }}
+          >
+            Switch back to {modelFamily(stashedChars.from)} and restore
+          </a>
         </div>
-      ))}
+      )}
       {showCardDialog && (
         <CharacterCardDialog
           characterCount={characters.length}
-          maxCharacters={MAX_CHARACTERS}
+          maxCharacters={maxChars}
           onLoad={loadCharacterCard}
           onClose={() => setShowCardDialog(false)}
         />
@@ -2324,6 +2666,23 @@ export default function GenerateTab({
               style={{ ...inputStyle, width: 64, background: "var(--bg-page)" }}
             />
           </label>
+          {runEstimate && (
+            <span
+              title={runEstimate.reasons.join(" ") || "Every image in this run should be free."}
+              style={{
+                fontFamily: "'IBM Plex Mono', monospace",
+                fontSize: 12,
+                color: runEstimate.free ? "var(--muted)" : "rgb(200,140,40)",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {runEstimate.free
+                ? "Free"
+                : runEstimate.anlas !== null
+                  ? `~${(runEstimate.anlas * count).toLocaleString()} Anlas`
+                  : "Costs Anlas"}
+            </span>
+          )}
           {generating ? (
             <button onClick={cancelGenerate} style={{ ...secondaryButtonStyle, minWidth: 130 }}>
               Cancel
@@ -2592,9 +2951,16 @@ export default function GenerateTab({
         <ConfirmModal
           title={quotaExhausted ? "V5 quota used up" : "This will cost Anlas"}
           message={
-            quotaExhausted
-              ? `Your Opus quota for V5 models is used up, so this may cost Anlas. You have ${status.anlas.toLocaleString()} Anlas. V4.5 models stay free. Generate ${n === 1 ? "1 image" : `${n} images`}?`
-              : `Your ${status.tierName} subscription doesn't include free generations. You have ${status.anlas.toLocaleString()} Anlas. Generate ${n === 1 ? "1 image" : `${n} images`}?`
+            (quotaExhausted
+              ? `Your Opus quota for V5 models is used up, so this may cost Anlas. V4.5 models stay free. `
+              : !status.isOpus
+                ? `Your ${status.tierName} subscription doesn't include free generations. `
+                : "") +
+            (runEstimate && runEstimate.reasons.length > 0 ? runEstimate.reasons.join(" ") + " " : "") +
+            (runEstimate?.anlas
+              ? `${n} image${n === 1 ? "" : "s"} × ${runEstimate.anlas} = ${n * runEstimate.anlas} Anlas. `
+              : "") +
+            `You have ${status.anlas.toLocaleString()} Anlas. Generate ${n === 1 ? "1 image" : `${n} images`}?`
           }
           confirmLabel="Generate"
           cancelLabel="Cancel"
@@ -2604,6 +2970,64 @@ export default function GenerateTab({
           }}
           onCancel={() => setConfirmCost(null)}
         />
+        );
+      })()}
+
+      {modelSwitch && !modelSwitch.choosing && (
+        <ConfirmModal
+          title={`${modelFamily(modelSwitch.to)} takes ${MODELS.find((m) => m.id === modelSwitch.to)?.maxCharacters ?? 6} characters`}
+          message={`There are ${characters.length} characters. Which should stay? The others are set aside until the next generation, so switching back restores them.`}
+          confirmLabel={`Keep the first ${MODELS.find((m) => m.id === modelSwitch.to)?.maxCharacters ?? 6}`}
+          middleLabel="Choose which"
+          cancelLabel={`Stay on ${modelFamily(model)}`}
+          onConfirm={() => applyModelSwitch(modelSwitch.keep)}
+          onMiddle={() => setModelSwitch({ ...modelSwitch, choosing: true })}
+          onCancel={() => setModelSwitch(null)}
+        />
+      )}
+      {modelSwitch && modelSwitch.choosing && (() => {
+        const max = MODELS.find((m) => m.id === modelSwitch.to)?.maxCharacters ?? 6;
+        const n = modelSwitch.keep.size;
+        return (
+          <div
+            onClick={() => setModelSwitch(null)}
+            style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 300 }}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              style={{ ...cardStyle, width: 520, maxWidth: "90vw", maxHeight: "80vh", overflowY: "auto", display: "flex", flexDirection: "column", gap: 10 }}
+            >
+              <div style={{ fontSize: 16, fontWeight: 700 }}>Choose {max} characters to keep</div>
+              {characters.map((c, i) => (
+                <label key={i} style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 13 }}>
+                  <input
+                    type="checkbox"
+                    checked={modelSwitch.keep.has(i)}
+                    disabled={!modelSwitch.keep.has(i) && n >= max}
+                    onChange={(e) => {
+                      const keep = new Set(modelSwitch.keep);
+                      if (e.target.checked) keep.add(i);
+                      else keep.delete(i);
+                      setModelSwitch({ ...modelSwitch, keep });
+                    }}
+                    style={{ accentColor: "var(--accent)" }}
+                  />
+                  <span style={{ fontWeight: 600 }}>{i + 1}.</span>
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {cardLinks[i]?.name ?? (c || "(empty)")}
+                  </span>
+                </label>
+              ))}
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                <button onClick={() => setModelSwitch(null)} style={secondaryButtonStyle}>
+                  Stay on {modelFamily(model)}
+                </button>
+                <button onClick={() => applyModelSwitch(modelSwitch.keep)} style={primaryButtonStyle}>
+                  Keep {n}, switch
+                </button>
+              </div>
+            </div>
+          </div>
         );
       })()}
 

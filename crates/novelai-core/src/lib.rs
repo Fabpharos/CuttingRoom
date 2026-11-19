@@ -5,10 +5,11 @@ use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
 mod inpaint;
 pub use inpaint::*;
+mod turns;
+use turns::*;
 
 const API_BASE: &str = "https://image.novelai.net";
 const KEYRING_SERVICE: &str = "CuttingRoom.NovelAI";
@@ -72,7 +73,7 @@ struct TrainingStepsLeft {
 
 // Opus's quota for usage-limited models (V5): a refilling percentage
 // rather than a count. V4/V4.5 don't draw from it.
-#[derive(Deserialize, Serialize, Clone, Default)]
+#[derive(Deserialize, Serialize, Clone, Default, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct UsageStatus {
     /// True once the quota is used up.
@@ -99,14 +100,21 @@ struct ApiError {
     message: Option<String>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountStatus {
     pub tier: i64,
     pub tier_name: String,
     pub active: bool,
     pub is_opus: bool,
+    /// Subscription and purchased Anlas together.
     pub anlas: i64,
+    /// The subscription's Anlas left this month.
+    #[serde(default)]
+    pub subscription_anlas: i64,
+    /// Anlas bought separately.
+    #[serde(default)]
+    pub purchased_anlas: i64,
     pub usage: Option<UsageStatus>,
 }
 
@@ -154,6 +162,8 @@ async fn fetch_status(token: &str) -> Result<AccountStatus, String> {
         is_opus: sub.active && sub.tier == OPUS_TIER,
         anlas: sub.training_steps_left.fixed_training_steps_left
             + sub.training_steps_left.purchased_training_steps,
+        subscription_anlas: sub.training_steps_left.fixed_training_steps_left,
+        purchased_anlas: sub.training_steps_left.purchased_training_steps,
         usage: sub.usage,
     })
 }
@@ -200,7 +210,55 @@ pub const SIZE_STEP: u32 = 64;
 pub const MAX_SIDE: u32 = 2048;
 pub const MAX_STEPS: u32 = 28;
 pub const MAX_GUIDANCE: f64 = 10.0;
-pub const MAX_CHARACTERS: usize = 4;
+/// The most character prompts any model takes (V5); see `max_characters`.
+pub const MAX_CHARACTERS_ANY: usize = 22;
+
+/// NovelAI's limit on character prompts: 22 on V5, 6 on V4 and V4.5.
+pub fn max_characters(model: &str) -> usize {
+    if model.starts_with("nai-diffusion-5") {
+        22
+    } else {
+        6
+    }
+}
+
+/// A model's short name for messages ("V5", "V4.5", "V4").
+pub fn model_family(model: &str) -> &'static str {
+    if model.starts_with("nai-diffusion-5") {
+        "V5"
+    } else if model.starts_with("nai-diffusion-4-5") {
+        "V4.5"
+    } else {
+        "V4"
+    }
+}
+
+/// Samplers NovelAI's web client offers for V4-family and V5 models.
+pub const SAMPLERS: [&str; 6] = [
+    "k_euler_ancestral",
+    "k_euler",
+    "k_dpmpp_2s_ancestral",
+    "k_dpmpp_2m_sde",
+    "k_dpmpp_2m",
+    "k_dpmpp_sde",
+];
+pub const DEFAULT_SAMPLER: &str = "k_euler_ancestral";
+pub const NOISE_SCHEDULES: [&str; 3] = ["karras", "exponential", "polyexponential"];
+pub const DEFAULT_NOISE_SCHEDULE: &str = "karras";
+
+/// The `skip_cfg_above_sigma` NovelAI's web client sends when Variety+ is
+/// on: 58 at 832x1216, scaled with the square root of the pixel count.
+/// UNVERIFIED for V5 and V4.5 until checked against images made on
+/// novelai.net with Variety+ on (see `VARIETY_PLUS_VERIFIED`).
+pub fn variety_plus_sigma(_model: &str, width: u32, height: u32) -> f64 {
+    let latent = 4.0 * (width as f64 / 8.0) * (height as f64 / 8.0);
+    let v = 58.0 * (latent / 63232.0).sqrt();
+    (v * 1e6).round() / 1e6
+}
+/// Whether `variety_plus_sigma` has been confirmed against real images.
+pub const VARIETY_PLUS_VERIFIED: bool = false;
+/// Upper bound for a hand-set Variety+ sigma (creep can raise it).
+pub const MAX_VARIETY_SIGMA: f64 = 1000.0;
 
 // All supported models are V4-family: character prompts go through
 // `v4_prompt`.
@@ -222,7 +280,7 @@ pub fn is_usage_limited(model: &str) -> bool {
 pub const MEDIUM_MODEL: &str = "nai-diffusion-5-full-medium";
 pub const MEDIUM_STEPS: u32 = 14;
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerateRequest {
     pub model: String,
@@ -247,6 +305,15 @@ pub struct GenerateRequest {
     /// Image to image: the picture to start from. None is plain text to image.
     #[serde(default)]
     pub source_image: Option<SourceImage>,
+    /// One of `SAMPLERS`; None is `DEFAULT_SAMPLER`.
+    #[serde(default)]
+    pub sampler: Option<String>,
+    /// One of `NOISE_SCHEDULES`; None is `DEFAULT_NOISE_SCHEDULE`.
+    #[serde(default)]
+    pub noise_schedule: Option<String>,
+    /// Variety+: guidance is skipped above this noise level. None leaves it off.
+    #[serde(default)]
+    pub skip_cfg_above_sigma: Option<f64>,
 }
 
 /// The starting picture for image to image, read from disk when the batch
@@ -377,8 +444,22 @@ fn request_body(req: &GenerateRequest, vibes: &[ResolvedVibe]) -> Result<serde_j
         })
         .filter(|(c, _, _)| !c.is_empty())
         .collect();
-    if characters.len() > MAX_CHARACTERS {
-        return Err(format!("At most {MAX_CHARACTERS} character prompts are allowed."));
+    let max = max_characters(&req.model);
+    if characters.len() > max {
+        return Err(format!("{} allows at most {max} character prompts.", model_family(&req.model)));
+    }
+    let sampler = req.sampler.as_deref().unwrap_or(DEFAULT_SAMPLER);
+    if !SAMPLERS.contains(&sampler) {
+        return Err(format!("Unknown sampler: {sampler}"));
+    }
+    let noise_schedule = req.noise_schedule.as_deref().unwrap_or(DEFAULT_NOISE_SCHEDULE);
+    if !NOISE_SCHEDULES.contains(&noise_schedule) {
+        return Err(format!("Unknown noise schedule: {noise_schedule}"));
+    }
+    if let Some(sigma) = req.skip_cfg_above_sigma {
+        if !(0.0..=MAX_VARIETY_SIGMA).contains(&sigma) || sigma.is_nan() {
+            return Err(format!("The Variety+ value must be between 0 and {MAX_VARIETY_SIGMA}."));
+        }
     }
 
     // Without positions the model places everyone (use_coords: false); the
@@ -405,8 +486,8 @@ fn request_body(req: &GenerateRequest, vibes: &[ResolvedVibe]) -> Result<serde_j
         "scale": req.scale,
         "n_samples": 1,
         "seed": req.seed,
-        "sampler": "k_euler_ancestral",
-        "noise_schedule": "karras",
+        "sampler": sampler,
+        "noise_schedule": noise_schedule,
         "negative_prompt": req.negative_prompt,
         // NovelAI's web app appends its own quality tags when this is on;
         // keep it off so the prompt sent is exactly what was typed.
@@ -421,6 +502,9 @@ fn request_body(req: &GenerateRequest, vibes: &[ResolvedVibe]) -> Result<serde_j
             "legacy_uc": false,
         },
     });
+    if let Some(sigma) = req.skip_cfg_above_sigma {
+        parameters["skip_cfg_above_sigma"] = json!(sigma);
+    }
     // Pre-encoded vibes go in as-is, the way NovelAI's web client sends
     // them; there's nothing for NovelAI to encode (or charge for).
     if !vibes.is_empty() {
@@ -442,7 +526,7 @@ fn error_for_status(status: reqwest::StatusCode, message: &str) -> String {
     match status.as_u16() {
         401 => "NovelAI rejected the saved token. Log out and log in again.".into(),
         402 => "NovelAI says this would cost more Anlas than the account has.".into(),
-        429 => "NovelAI is rate-limiting requests. Wait a moment and try again.".into(),
+        429 => RATE_LIMITED.into(),
         _ if message.is_empty() => format!("NovelAI returned {status}."),
         _ => format!("NovelAI returned {status}: {message}"),
     }
@@ -462,14 +546,72 @@ fn save_png(dir: &Path, stem: &str, bytes: &[u8]) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+// ---- Cost ----
+
+/// What a request should cost: free, a known number of Anlas, or a charge
+/// NovelAI makes that can't be priced here (`anlas: None`).
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CostEstimate {
+    pub free: bool,
+    /// The known charge; None when something costs an amount we can't price.
+    pub anlas: Option<i64>,
+    /// Why it isn't free, one line each.
+    pub reasons: Vec<String>,
+}
+
+/// Anlas NovelAI is known to charge for a request no matter the account
+/// (Precise Reference). The Anlas guard expects this much and no more.
+/// Precise Reference's charge for one image: 5 Anlas per reference.
+fn precise_reference_cost(_req: &GenerateRequest) -> i64 {
+    0
+}
+
+pub fn known_charge(req: &GenerateRequest) -> i64 {
+    precise_reference_cost(req)
+}
+
+/// The cost of one request on `account` (None: not logged in, so the account
+/// rules can't be checked).
+pub fn estimate_cost(req: &GenerateRequest, account: Option<&AccountStatus>) -> CostEstimate {
+    let mut reasons = Vec::new();
+    let mut priced = 0i64;
+    let mut unpriced = false;
+    if let Err(e) = check_free_size(req.width, req.height) {
+        reasons.push(e);
+        unpriced = true;
+    }
+    let steps = if req.model == MEDIUM_MODEL { MEDIUM_STEPS } else { req.steps };
+    if steps > MAX_STEPS {
+        reasons.push(format!("More than {MAX_STEPS} steps."));
+        unpriced = true;
+    }
+    if req.vibes.len() > MAX_FREE_VIBES {
+        let extra = (req.vibes.len() - MAX_FREE_VIBES) as i64 * 2;
+        reasons.push(format!("{} vibes: each past the fourth costs 2 Anlas.", req.vibes.len()));
+        priced += extra;
+    }
+    let refs = precise_reference_cost(req);
+    if refs > 0 {
+        reasons.push(format!("Precise Reference: {refs} Anlas per image."));
+        priced += refs;
+    }
+    if let Some(a) = account {
+        if !a.is_opus {
+            reasons.push(format!("{} account: generations aren't free.", a.tier_name));
+            unpriced = true;
+        } else if is_usage_limited(&req.model) && a.usage.as_ref().is_some_and(|u| u.is_negative) {
+            reasons.push("The Opus V5 quota is used up, so V5 costs Anlas until it refills.".into());
+            unpriced = true;
+        }
+    }
+    CostEstimate { free: reasons.is_empty(), anlas: if unpriced { None } else { Some(priced) }, reasons }
+}
+
 // ---- Batches ----
 
 pub const MAX_BATCH: usize = 25;
-// Minimum gap between the end of one generation request and the start of the
-// next, across every batch and single generation, so nothing this app does
-// can hammer NovelAI's servers.
-const MIN_INTERVAL: Duration = Duration::from_secs(2);
-static LAST_GENERATION: Mutex<Option<Instant>> = Mutex::new(None);
+// Request spacing and the lock shared with other processes live in turns.rs.
 static CANCELLED_BATCHES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 fn cancelled_set() -> &'static Mutex<HashSet<String>> {
@@ -482,26 +624,6 @@ pub fn cancel_batch(run_id: &str) {
 
 fn is_cancelled(run_id: &str) -> bool {
     cancelled_set().lock().unwrap().contains(run_id)
-}
-
-/// Waits until the minimum interval since the last generation has passed.
-/// Returns false if the batch was cancelled while waiting.
-async fn wait_for_turn(run_id: &str) -> bool {
-    loop {
-        if is_cancelled(run_id) {
-            return false;
-        }
-        let remaining = LAST_GENERATION
-            .lock()
-            .unwrap()
-            .map(|t| MIN_INTERVAL.saturating_sub(t.elapsed()))
-            .unwrap_or(Duration::ZERO);
-        if remaining.is_zero() {
-            return true;
-        }
-        // Short naps so a cancel during the wait takes effect promptly.
-        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
-    }
 }
 
 #[derive(Serialize, Clone)]
@@ -647,12 +769,15 @@ pub async fn generate_batch(
     on_progress(BatchProgress { run_id: run_id.clone(), done: 0, total, image: None });
 
     for (req, body) in requests.iter().zip(&bodies) {
-        if !wait_for_turn(&run_id).await {
-            cancelled = true;
-            break;
-        }
-        let result = generate_one(&token, body, req, &dir).await;
-        *LAST_GENERATION.lock().unwrap() = Some(Instant::now());
+        let result = send_in_turn(&run_id, || post_for_image(&token, "/ai/generate-image", body)).await;
+        let result = match result {
+            Ok(None) => {
+                cancelled = true;
+                break;
+            }
+            Ok(Some(bytes)) => save_generated(bytes, req, &dir).await,
+            Err(e) => Err(e),
+        };
 
         match result {
             Ok(image) => {
@@ -671,12 +796,16 @@ pub async fn generate_batch(
         }
 
         if let Some(before) = anlas {
+            // A charge NovelAI is known to make (a Precise Reference, say)
+            // is expected; anything beyond it stops the batch.
+            let expected = known_charge(req);
             match fetch_status(&token).await {
-                Ok(s) if s.anlas < before => {
+                Ok(s) if before - s.anlas > expected => {
                     stopped_reason = Some(format!(
-                        "NovelAI charged {} Anlas for that image, so the batch stopped. \
+                        "NovelAI charged {} Anlas for that image{}, so the batch stopped. \
                          If you're using a V5 model, the Opus V5 quota may have run out.",
-                        before - s.anlas
+                        before - s.anlas,
+                        if expected > 0 { format!(" (expected {expected})") } else { String::new() }
                     ));
                     break;
                 }
@@ -732,13 +861,7 @@ async fn post_for_image(token: &str, endpoint: &str, body: &serde_json::Value) -
         .map_err(|e| format!("couldn't decode the returned image: {e}"))
 }
 
-async fn generate_one(
-    token: &str,
-    body: &serde_json::Value,
-    req: &GenerateRequest,
-    dir: &Path,
-) -> Result<GeneratedImage, String> {
-    let bytes = post_for_image(token, "/ai/generate-image", body).await?;
+async fn save_generated(bytes: Vec<u8>, req: &GenerateRequest, dir: &Path) -> Result<GeneratedImage, String> {
     let dir = dir.to_path_buf();
     let stem = req.file_stem.clone();
     let path = tokio::task::spawn_blocking(move || save_png(&dir, &stem, &bytes))
@@ -778,6 +901,10 @@ pub struct ImportedSettings {
     pub model: Option<String>,
     /// The image's own model description, e.g. "NovelAI Diffusion V5 DB276663".
     pub source: Option<String>,
+    pub sampler: Option<String>,
+    pub noise_schedule: Option<String>,
+    /// Set when the image was made with Variety+.
+    pub skip_cfg_above_sigma: Option<f64>,
 }
 
 const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
@@ -926,6 +1053,13 @@ pub fn parse_settings(chunks: &[(String, String)]) -> Result<ImportedSettings, S
         seed: c.get("seed").and_then(|v| v.as_u64()),
         model: source.as_deref().and_then(model_from_source).map(str::to_string),
         source,
+        sampler: c.get("sampler").and_then(|v| v.as_str()).filter(|v| SAMPLERS.contains(v)).map(str::to_string),
+        noise_schedule: c
+            .get("noise_schedule")
+            .and_then(|v| v.as_str())
+            .filter(|v| NOISE_SCHEDULES.contains(v))
+            .map(str::to_string),
+        skip_cfg_above_sigma: num("skip_cfg_above_sigma").filter(|v| *v > 0.0),
     })
 }
 
@@ -1477,14 +1611,13 @@ pub async fn upscale_batch(
     on_progress(UpscaleProgress { run_id: run_id.clone(), done: 0, total, image: None });
 
     for (source, image) in paths.iter().zip(&images) {
-        if !wait_for_turn(&run_id).await {
-            cancelled = true;
-            break;
-        }
-        let result = upscale_one(&token, image).await;
-        *LAST_GENERATION.lock().unwrap() = Some(Instant::now());
+        let result = send_in_turn(&run_id, || upscale_one(&token, image)).await;
         let bytes = match result {
-            Ok(b) => b,
+            Ok(None) => {
+                cancelled = true;
+                break;
+            }
+            Ok(Some(b)) => b,
             Err(e) => {
                 stopped_reason = Some(e);
                 break;
@@ -1554,6 +1687,7 @@ mod tests {
             file_stem: "out".into(),
             vibes: vec![],
             source_image: None,
+            ..Default::default()
         }
     }
 
@@ -1750,12 +1884,6 @@ mod tests {
         assert_eq!(snap_to_grid(0.19), 0.1);
     }
 
-    #[test]
-    fn caps_characters_at_four() {
-        let five = ["a", "b", "c", "d", "e"];
-        assert!(body_of(&request("nai-diffusion-4-5-full", 1024, 1024, &five)).is_err());
-    }
-
     // ---- batches ----
 
     #[test]
@@ -1789,21 +1917,112 @@ mod tests {
         }
     }
 
-    // One test, because both halves share the global last-generation time.
+    // One test, because both halves share the global last-generation time
+    // and the lock file.
     #[test]
     fn spaces_generations_and_cancels_promptly() {
+        use std::time::{Duration, Instant};
         tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(async {
             *LAST_GENERATION.lock().unwrap() = Some(Instant::now());
             let start = Instant::now();
-            assert!(wait_for_turn("spacing-test").await);
+            let turn = wait_for_turn("spacing-test").await.expect("a turn");
             assert!(start.elapsed() >= Duration::from_millis(1900), "waited {:?}", start.elapsed());
+            turn.finish();
+
+            // The lock file carries the time to other processes: forget this
+            // process's own clock and the gap is still kept.
+            *LAST_GENERATION.lock().unwrap() = None;
+            let start = Instant::now();
+            drop(wait_for_turn("shared-test").await.expect("a turn"));
+            assert!(start.elapsed() >= Duration::from_millis(1800), "waited {:?}", start.elapsed());
 
             *LAST_GENERATION.lock().unwrap() = Some(Instant::now());
             cancel_batch("cancel-test");
             let start = Instant::now();
-            assert!(!wait_for_turn("cancel-test").await);
+            assert!(wait_for_turn("cancel-test").await.is_none());
             assert!(start.elapsed() < Duration::from_millis(500));
         });
+    }
+
+    #[test]
+    fn character_limit_follows_the_model() {
+        assert_eq!(max_characters("nai-diffusion-5-full"), 22);
+        assert_eq!(max_characters("nai-diffusion-5-full-medium"), 22);
+        assert_eq!(max_characters("nai-diffusion-5-curated"), 22);
+        for m in ["nai-diffusion-4-5-full", "nai-diffusion-4-5-curated", "nai-diffusion-4-full", "nai-diffusion-4-curated-preview"] {
+            assert_eq!(max_characters(m), 6, "{m}");
+        }
+        let names: Vec<String> = (0..22).map(|i| format!("girl {i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        assert!(build_body(&request("nai-diffusion-5-full", 1024, 1024, &refs), &[]).is_ok());
+        let err = build_body(&request("nai-diffusion-4-5-full", 1024, 1024, &refs[..7]), &[]).unwrap_err();
+        assert!(err.contains("V4.5") && err.contains('6'), "{err}");
+        assert!(build_body(&request("nai-diffusion-4-5-full", 1024, 1024, &refs[..6]), &[]).is_ok());
+        let mut too_many = refs.clone();
+        too_many.push("one more");
+        assert!(build_body(&request("nai-diffusion-5-full", 1024, 1024, &too_many), &[]).is_err());
+    }
+
+    #[test]
+    fn sampler_schedule_and_variety_plus_are_sent() {
+        let r = request("nai-diffusion-4-5-full", 832, 1216, &[]);
+        let p = &build_body(&r, &[]).unwrap()["parameters"];
+        assert_eq!(p["sampler"], "k_euler_ancestral");
+        assert_eq!(p["noise_schedule"], "karras");
+        assert!(p.get("skip_cfg_above_sigma").is_none());
+
+        let mut r = r;
+        r.sampler = Some("k_dpmpp_2m_sde".into());
+        r.noise_schedule = Some("exponential".into());
+        r.skip_cfg_above_sigma = Some(variety_plus_sigma(&r.model, 832, 1216));
+        let p = &build_body(&r, &[]).unwrap()["parameters"];
+        assert_eq!(p["sampler"], "k_dpmpp_2m_sde");
+        assert_eq!(p["noise_schedule"], "exponential");
+        assert_eq!(p["skip_cfg_above_sigma"], 58.0);
+
+        r.sampler = Some("ddim".into());
+        assert!(build_body(&r, &[]).is_err());
+        r.sampler = None;
+        r.noise_schedule = Some("native".into());
+        assert!(build_body(&r, &[]).is_err());
+        r.noise_schedule = None;
+        r.skip_cfg_above_sigma = Some(-1.0);
+        assert!(build_body(&r, &[]).is_err());
+    }
+
+    #[test]
+    fn variety_plus_scales_with_size() {
+        assert_eq!(variety_plus_sigma("nai-diffusion-5-full", 832, 1216), 58.0);
+        let square = variety_plus_sigma("nai-diffusion-5-full", 1024, 1024);
+        assert!((square - 58.0 * (1_048_576f64 / 1_011_712f64).sqrt()).abs() < 1e-5, "{square}");
+    }
+
+    #[test]
+    fn estimates_cost() {
+        let opus = |negative: bool| AccountStatus {
+            tier: 3,
+            tier_name: "Opus".into(),
+            active: true,
+            is_opus: true,
+            anlas: 100,
+            subscription_anlas: 100,
+            purchased_anlas: 0,
+            usage: Some(UsageStatus { is_negative: negative, percent: 50, purchased_percent: 0 }),
+        };
+        let r = request("nai-diffusion-5-full", 1024, 1024, &[]);
+        let e = estimate_cost(&r, Some(&opus(false)));
+        assert!(e.free && e.anlas == Some(0) && e.reasons.is_empty(), "{e:?}");
+        let e = estimate_cost(&r, Some(&opus(true)));
+        assert!(!e.free && e.anlas.is_none(), "{e:?}");
+        // V4.5 doesn't draw from the V5 quota.
+        let r45 = request("nai-diffusion-4-5-full", 1024, 1024, &[]);
+        assert!(estimate_cost(&r45, Some(&opus(true))).free);
+        let mut scroll = opus(false);
+        scroll.is_opus = false;
+        scroll.tier_name = "Scroll".into();
+        assert!(!estimate_cost(&r45, Some(&scroll)).free);
+        let big = request("nai-diffusion-4-5-full", 1216, 1216, &[]);
+        assert!(!estimate_cost(&big, None).free);
     }
 
     // ---- prompt files ----

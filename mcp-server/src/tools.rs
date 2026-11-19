@@ -17,7 +17,7 @@ use novelai_core::{
 use novelai_core::{
     account_status, generate_batch, is_usage_limited, read_vibe_file, vibe_encoding_for,
     vibe_encoding_key, AccountStatus, GenerateRequest, VibeInfo, VibeRef, DEFAULT_VIBE_STRENGTH,
-    MAX_CHARACTERS, MAX_FREE_VIBES, MAX_GUIDANCE, MAX_STEPS, MEDIUM_MODEL, MEDIUM_STEPS, MODELS,
+    max_characters, model_family, MAX_CHARACTERS_ANY, MAX_FREE_VIBES, MAX_GUIDANCE, MAX_STEPS, MEDIUM_MODEL, MEDIUM_STEPS, MODELS,
 };
 use serde_json::{json, Value};
 
@@ -213,8 +213,9 @@ pub fn parse_generate_args(args: &Value) -> Result<GenerateArgs, String> {
         positions.push(at.unwrap_or(CharacterPosition { x: 0.5, y: 0.5 }));
     }
     let character_positions = raw_positions.map(|_| positions);
-    if characters.len() > MAX_CHARACTERS {
-        return Err(format!("At most {MAX_CHARACTERS} character prompts are allowed."));
+    let max = max_characters(&model);
+    if characters.len() > max {
+        return Err(format!("{} allows at most {max} character prompts.", model_family(&model)));
     }
 
     let seed = match args.get("seed") {
@@ -935,6 +936,7 @@ impl NovelAiTools {
             file_stem: format!("{}_mcp_{seed}", (self.timestamp)()),
             vibes: vibes.iter().map(|v| v.reference.clone()).collect(),
             source_image: None,
+            ..Default::default()
         };
         self.pause_before_request();
         let summary = match self.runtime.block_on(generate_batch(
@@ -1013,15 +1015,15 @@ impl Tools for NovelAiTools {
                         "prompt": { "type": "string", "description": "Main prompt (NovelAI tags and/or natural language)." },
                         "negative_prompt": { "type": "string", "description": "Undesired content." },
                         "characters": {
-                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS,
-                            "description": "Up to 4 character prompts."
+                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS_ANY,
+                            "description": "Up to 22 character prompts on V5 models, 6 on V4/V4.5."
                         },
                         "character_negatives": {
-                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS,
+                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS_ANY,
                             "description": "Undesired content for each character, in the same order as `characters` (use \"\" to skip one)."
                         },
                         "character_positions": {
-                            "type": "array", "maxItems": MAX_CHARACTERS,
+                            "type": "array", "maxItems": MAX_CHARACTERS_ANY,
                             "items": { "anyOf": [
                                 { "type": "object", "properties": { "x": { "type": "number", "minimum": 0, "maximum": 1 },
                                                                     "y": { "type": "number", "minimum": 0, "maximum": 1 } },
@@ -1162,15 +1164,15 @@ impl Tools for NovelAiTools {
                         "prompt": { "type": "string", "description": "Describe the whole crop as it should look, not only the masked part." },
                         "negative_prompt": { "type": "string", "description": "Undesired content." },
                         "characters": {
-                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS,
-                            "description": "Up to 4 character prompts."
+                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS_ANY,
+                            "description": "Up to 22 character prompts on V5 models, 6 on V4/V4.5."
                         },
                         "character_negatives": {
-                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS,
+                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS_ANY,
                             "description": "Undesired content for each character, in the same order as `characters` (use \"\" to skip one)."
                         },
                         "character_positions": {
-                            "type": "array", "maxItems": MAX_CHARACTERS,
+                            "type": "array", "maxItems": MAX_CHARACTERS_ANY,
                             "items": { "anyOf": [
                                 { "type": "object", "properties": { "x": { "type": "number", "minimum": 0, "maximum": 1 },
                                                                     "y": { "type": "number", "minimum": 0, "maximum": 1 } },
@@ -1267,7 +1269,8 @@ mod tests {
             json!({ "prompt": "x", "guidance": 11 }),
             json!({ "prompt": "x", "size": "huge" }),
             json!({ "prompt": "x", "model": "nai-diffusion-3" }),
-            json!({ "prompt": "x", "characters": ["a", "b", "c", "d", "e"] }),
+            json!({ "prompt": "x", "characters": ["a", "b", "c", "d", "e", "f", "g"] }),
+            json!({ "prompt": "x", "model": "nai-diffusion-5-full", "characters": vec!["a"; 23] }),
             json!({ "prompt": "x", "characters": "a" }),
             json!({ "prompt": "x", "seed": -1 }),
         ] {
@@ -1275,6 +1278,16 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn character_limit_follows_the_model() {
+        let ok = parse_generate_args(&json!({ "prompt": "x", "model": "nai-diffusion-5-full", "characters": vec!["a"; 22] }));
+        assert!(ok.is_ok());
+        let err = parse_generate_args(&json!({ "prompt": "x", "model": "nai-diffusion-4-5-full", "characters": vec!["a"; 7] }))
+            .err()
+            .unwrap();
+        assert!(err.contains("V4.5") && err.contains('6'), "{err}");
+    }
     #[test]
     fn medium_effort_ignores_requested_steps() {
         let a = parse_generate_args(&json!({ "prompt": "x", "model": MEDIUM_MODEL, "steps": 28 })).unwrap();
@@ -1345,6 +1358,8 @@ mod tests {
             active: true,
             is_opus,
             anlas: 500,
+            subscription_anlas: 500,
+            purchased_anlas: 0,
             usage,
         }
     }

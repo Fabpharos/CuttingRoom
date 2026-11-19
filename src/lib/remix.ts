@@ -3,7 +3,7 @@
 // the Generate tab. Pure helpers; the tab reads the images.
 
 import { splitTags } from "./promptConvert";
-import { MAX_CHARACTERS, fitFreeSize, type CharacterPosition, type ImportedSettings } from "./novelai";
+import { MAX_CHARACTERS_ANY, fitFreeSize, type CharacterPosition, type ImportedSettings } from "./novelai";
 
 export type RemixSource = { path: string; settings: ImportedSettings };
 
@@ -58,7 +58,7 @@ export function fieldText(s: ImportedSettings, key: FieldKey): string | null {
  * order the first image that has them writes them.
  */
 export function findShared(sources: RemixSource[], threshold: number): FieldBlock[] {
-  const slots = Math.min(MAX_CHARACTERS, Math.max(0, ...sources.map((s) => s.settings.characters.length)));
+  const slots = Math.min(MAX_CHARACTERS_ANY, Math.max(0, ...sources.map((s) => s.settings.characters.length)));
   const keys: FieldKey[] = ["prompt", "negative", ...Array.from({ length: slots }, (_, i) => `character-${i}` as FieldKey)];
   return keys.map((key) => {
     const texts = sources.map((s) => fieldText(s.settings, key)).filter((t): t is string => t !== null);
@@ -115,7 +115,7 @@ export function remixItems(
     return swap && (swap.remove.size > 0 || swap.replacement.trim()) ? swapTags(text, swap.remove, swap.replacement) : text;
   };
   return sources.map(({ path, settings: s }) => {
-    const characters = s.characters.slice(0, MAX_CHARACTERS);
+    const characters = s.characters.slice(0, MAX_CHARACTERS_ANY);
     const seedOk = s.seed !== null && Number.isInteger(s.seed) && s.seed >= 0 && s.seed <= 0xffff_ffff;
     return {
       source: path,

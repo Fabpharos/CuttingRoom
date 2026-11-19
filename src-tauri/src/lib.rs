@@ -276,6 +276,14 @@ async fn save_character_card(
 }
 
 #[tauri::command]
+fn nai_estimate_costs(
+    requests: Vec<novelai::GenerateRequest>,
+    account: Option<novelai::AccountStatus>,
+) -> Vec<novelai::CostEstimate> {
+    requests.iter().map(|r| novelai::estimate_cost(r, account.as_ref())).collect()
+}
+
+#[tauri::command]
 async fn nai_read_image_metadata(path: String) -> Result<novelai::ImportedSettings, String> {
     novelai::read_image_metadata(path).await
 }
@@ -360,6 +368,7 @@ pub fn run() {
             nai_clear_token,
             nai_generate_batch,
             nai_cancel_batch,
+            nai_estimate_costs,
             nai_read_image_metadata,
             scan_image_prompt,
             list_character_cards,

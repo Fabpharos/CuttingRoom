@@ -611,6 +611,7 @@ fn inpaint_body(plan: &InpaintPlan, s: &InpaintSettings, prepared: &Prepared) ->
         file_stem: "inpaint".into(),
         vibes: Vec::new(),
         source_image: None,
+        ..Default::default()
     };
     // Checks steps, guidance, characters and the model like any generation.
     let mut body = request_body(&req, &[])?;
@@ -691,14 +692,9 @@ pub async fn run_inpaint(
         .ok_or("Log in to NovelAI in Cutting Room's Generate tab first.")?;
     let before = if guard_anlas { Some(fetch_status(&token).await?.anlas) } else { None };
 
-    if !wait_for_turn(&run_id).await {
-        cancelled_set().lock().unwrap().remove(&run_id);
-        return Err("Cancelled.".into());
-    }
-    let result = post_for_image(&token, "/ai/generate-image", &body).await;
-    *LAST_GENERATION.lock().unwrap() = Some(Instant::now());
+    let result = send_in_turn(&run_id, || post_for_image(&token, "/ai/generate-image", &body)).await;
     cancelled_set().lock().unwrap().remove(&run_id);
-    let bytes = result?;
+    let bytes = result?.ok_or("Cancelled.")?;
 
     let (plan2, dir, stem) = (plan.clone(), PathBuf::from(output_dir), inpainted_stem(&plan.source_path));
     let (path, raw_path, crop_before, crop_after, result) = tokio::task::spawn_blocking(move || {
