@@ -67,6 +67,9 @@ import DirectorDialog from "./DirectorDialog";
 import CreepCard from "./CreepCard";
 import SavedPromptsDialog from "./SavedPromptsDialog";
 import ArtistLibraryCard from "./ArtistLibraryCard";
+import WorkflowCard, { DEFAULT_PLAN, chunkImages, type WorkflowPlan } from "./WorkflowCard";
+import { runDirector } from "../lib/director";
+import { upscaleBatch } from "../lib/upscale";
 import {
   DEFAULT_ARTISTS,
   artistsForImage,
@@ -639,6 +642,17 @@ export default function GenerateTab({
   // A saved prompt waiting on the import confirmation.
   const [pendingSnapshot, setPendingSnapshot] = useState<PromptSnapshot | null>(null);
   const [vibeRotation, setVibeRotation] = useState<VibeRotation>({ mode: "fixed", k: 2, every: 1 });
+  // A workflow plan, and the one being run (built up front, run a click at a time).
+  const [workflow, setWorkflow] = useState<WorkflowPlan>(DEFAULT_PLAN);
+  const [planRun, setPlanRun] = useState<{
+    images: PreviewImage[];
+    dirs: string[];
+    done: number;
+    plan: WorkflowPlan;
+    usedFiles: Set<string>;
+    advancing: { adv: SlotAdvance; key: string }[];
+  } | null>(null);
+  const [planConfirm, setPlanConfirm] = useState<{ start: boolean } | null>(null);
   const [vibeLibraryDir, setVibeLibraryDir] = useState<string | null>(null);
   const [vibeLibrary, setVibeLibrary] = useState<string[] | null>(null);
   // Encoding an image as a vibe (2 Anlas, once).
@@ -689,6 +703,7 @@ export default function GenerateTab({
         setCreep(s.creep);
         setVibeRotation(s.vibeRotation);
         setVibeLibraryDir(s.vibeLibraryDir);
+        setWorkflow(s.workflow);
         setPoolStates((await generateStore.get<Record<string, PoolState>>("poolStates")) ?? {});
         setCount(s.count);
         setOutputDir(s.outputDir);
@@ -747,6 +762,7 @@ export default function GenerateTab({
         creep,
         vibeRotation,
         vibeLibraryDir,
+        workflow,
         count,
         outputDir,
         promptFiles: promptFiles.map(({ path, name, mode }) => ({ path, name, mode })),
@@ -789,6 +805,7 @@ export default function GenerateTab({
     creep,
     vibeRotation,
     vibeLibraryDir,
+    workflow,
     count,
     outputDir,
     promptFiles,
@@ -1499,7 +1516,10 @@ export default function GenerateTab({
    * tags, random weights and scramble. The preview shows exactly this.
    */
   const family = modelFamily(model) as ModelFamily;
-  function buildBatch(fromRemix: boolean, seedBase = batchSeed) {
+  type BuildOptions = { total: number; setSize: number; perSet: WorkflowPlan["perSet"] };
+  function buildBatch(fromRemix: boolean, seedBase = batchSeed, opts?: BuildOptions) {
+    const setOf = (i: number) => (opts ? Math.floor(i / opts.setSize) : i);
+    const setRng = (i: number, salt: number) => seededRng((seedBase + Math.imul(setOf(i) + 1, 0x27d4eb2f) + salt) >>> 0);
     const sendSettings = (w: number, h: number) => ({
       sampler,
       noiseSchedule,
@@ -1523,7 +1543,7 @@ export default function GenerateTab({
           placed: item.characterPositions !== null,
           item,
         }))
-      : Array.from({ length: count }, () => ({
+      : Array.from({ length: opts?.total ?? count }, () => ({
           prompt,
           negative: negativePrompt,
           slots: characters.map(
@@ -1568,8 +1588,10 @@ export default function GenerateTab({
       const batchRandom = Math.floor(seededRng((seedBase ^ Math.imul(i + 1, 0x85ebca6b)) >>> 0)() * 0x1_0000_0000);
       const seed = row.item?.seed ?? (creep.enabled ? seedAt(creep.seed, i, batchRandom) : batchRandom);
       const slots = row.slots.map((s, j): Slot => {
-        const adv = fromRemix ? null : advanceOf(j);
-        if (!adv || adv.mode === "fixed") return s;
+        const own = fromRemix ? null : advanceOf(j);
+        if (!own || own.mode === "fixed") return s;
+        // In a plan, a character can move on once per set.
+        const adv = opts?.perSet.characters ? { ...own, every: opts.setSize } : own;
         const pool = poolCards(cards, adv.pool);
         const key = poolKey(adv.pool, adv.mode);
         const st = poolStates[key] ?? { position: 0, seed: 1 };
@@ -1591,10 +1613,22 @@ export default function GenerateTab({
         assocNext.set(key, k + 1);
         return linkOf(pool[((poolStates[key]?.position ?? 0) + k) % pool.length]);
       };
-      const artistLine = fromRemix ? "" : artistsForImage(artists, family, i, rng, poolStates["artists-next"]?.position ?? 0);
+      const artistLine = fromRemix
+        ? ""
+        : opts?.perSet.artists
+          ? artistsForImage({ ...artists, every: 1 }, family, setOf(i), setRng(i, 11), poolStates["artists-next"]?.position ?? 0)
+          : artistsForImage(artists, family, i, rng, poolStates["artists-next"]?.position ?? 0);
       const res = buildImage(
         { prompt: fromRemix ? row.prompt : insertArtists(row.prompt, artistLine), negative: row.negative, slots },
-        { index: i, rng, files: engineFiles, maxSlots: maxChars, settings, pickCard },
+        {
+          index: i,
+          rng,
+          files: engineFiles,
+          maxSlots: maxChars,
+          settings,
+          pickCard,
+          ...(opts?.perSet.files ? { fileIndex: setOf(i), fileRng: setRng(i, 23) } : {}),
+        },
       );
       res.usedFiles.forEach((f) => usedFiles.add(f));
       const w = row.item?.size?.width ?? size.width;
@@ -1623,9 +1657,10 @@ export default function GenerateTab({
         const k = Math.min(vibeRotation.k, MAX_VIBES, vibeRefs.length);
         if (vibeRotation.mode === "random") {
           const pool = [...vibeRefs];
-          request.vibes = Array.from({ length: k }, () => pool.splice(Math.floor(rng() * pool.length), 1)[0]);
+          const vr = opts?.perSet.vibes ? setRng(i, 37) : rng;
+          request.vibes = Array.from({ length: k }, () => pool.splice(Math.floor(vr() * pool.length), 1)[0]);
         } else {
-          const group = Math.floor(i / Math.max(1, vibeRotation.every));
+          const group = opts?.perSet.vibes ? setOf(i) : Math.floor(i / Math.max(1, vibeRotation.every));
           const start = ((poolStates["vibes-next"]?.position ?? 0) + group * k) % vibeRefs.length;
           request.vibes = Array.from({ length: k }, (_, n) => vibeRefs[(start + n) % vibeRefs.length]);
         }
@@ -1647,6 +1682,182 @@ export default function GenerateTab({
     } catch (err) {
       setError(String(err));
     }
+  }
+
+  /**
+   * After images were made: sequential files, character pools, artists,
+   * vibes and "next card" associations carry on from where they stopped.
+   * In a plan, things that moved once per set move by the sets made.
+   */
+  function advanceAfter(
+    usedFiles: Set<string>,
+    made: number,
+    planned: number,
+    assocNext: Map<string, number>,
+    advancing: { adv: SlotAdvance; key: string }[],
+    plan: { setSize: number; perSet: WorkflowPlan["perSet"] } | null,
+  ) {
+    const sets = plan ? Math.ceil(made / plan.setSize) : made;
+    const fileSteps = plan?.perSet.files ? sets : made;
+    const advanced = new Map(
+      allFiles
+        .filter((f) => f.mode === "sequential" && usedFiles.has(f.name) && f.lines.length > 0)
+        .map((f) => [f.path, (f.position + fileSteps) % f.lines.length]),
+    );
+    advanced.forEach((next, path) => void savePosition(path, next));
+    const move = (prev: PromptFile[]) => prev.map((f) => (advanced.has(f.path) ? { ...f, position: advanced.get(f.path)! } : f));
+    setPromptFiles(move);
+    setFolderFiles(move);
+    const states = { ...poolStates };
+    for (const { adv, key } of advancing) {
+      const a = plan?.perSet.characters ? { ...adv, every: plan.setSize } : adv;
+      states[key] = advancedState(a, states[key] ?? { position: 0, seed: randomSeed() }, made);
+    }
+    if (vibeRotation.mode === "next" && vibeRefs.length > 0) {
+      const st = states["vibes-next"] ?? { position: 0, seed: 1 };
+      const k = Math.min(vibeRotation.k, MAX_VIBES, vibeRefs.length);
+      const groups = plan?.perSet.vibes ? sets : Math.ceil(made / Math.max(1, vibeRotation.every));
+      states["vibes-next"] = { ...st, position: st.position + k * groups };
+    }
+    if (artists.enabled && artists.mode === "next" && usableArtists(artists, family).length > 0) {
+      const st = states["artists-next"] ?? { position: 0, seed: 1 };
+      const groups = plan?.perSet.artists ? sets : Math.ceil(made / Math.max(1, artists.every));
+      states["artists-next"] = { ...st, position: st.position + groups };
+    }
+    assocNext.forEach((k, key) => {
+      // Only the images actually made moved the association on.
+      const share = Math.round((k * made) / Math.max(1, planned));
+      states[key] = { position: (states[key]?.position ?? 0) + share, seed: 1 };
+    });
+    setPoolStates(states);
+    void generateStore.set("poolStates", states).catch(() => {});
+  }
+
+  // ---- Workflow plans ----
+
+  const advancingNow = () =>
+    characters.flatMap((_, j) => {
+      const adv = advanceOf(j);
+      return adv && adv.mode !== "fixed" ? [{ adv, key: poolKey(adv.pool, adv.mode) }] : [];
+    });
+
+  /** Builds the whole plan up front and asks before the first part runs. */
+  function startPlan() {
+    if (!outputDir || !canGenerate) return;
+    const p = workflow;
+    let built: ReturnType<typeof buildBatch>;
+    try {
+      built = buildBatch(false, batchSeed, { total: p.loops * p.sets, setSize: p.loops, perSet: p.perSet });
+    } catch (err) {
+      setError(String(err));
+      return;
+    }
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}-${pad(now.getMinutes())}`;
+    const clean = (t: string) => t.replace(/[\\/:*?"<>|]+/g, "").trim().slice(0, 60) || "untitled";
+    const base = p.subfolders === "none" ? outputDir : `${outputDir}\\${clean(p.name || "Plan")} ${stamp}`;
+    const dirs = built.images.map((img, i) =>
+      p.subfolders === "set"
+        ? `${base}\\set ${pad(Math.floor(i / p.loops) + 1)}`
+        : p.subfolders === "character"
+          ? `${base}\\${clean(img.cardNames.find((n) => n) ?? "no card")}`
+          : base,
+    );
+    setPlanRun({ images: built.images, dirs, done: 0, plan: p, usedFiles: built.usedFiles, advancing: advancingNow() });
+    setPlanConfirm({ start: true });
+  }
+
+  /** Runs the next part of the plan: at most 25 requests (10 upscales). */
+  async function runPlanChunk() {
+    setPlanConfirm(null);
+    if (!planRun) return;
+    const { plan, images, dirs } = planRun;
+    const start = planRun.done;
+    const end = Math.min(images.length, start + chunkImages(plan));
+    const batchStart = new Date();
+    const runId = crypto.randomUUID();
+    runIdRef.current = runId;
+    setGenerating(true);
+    setError(null);
+    setBatchNotice(null);
+    setBatchImages([]);
+    setProgress({ done: 0, total: end - start });
+    let made = 0;
+    let stop: string | null = null;
+    const show = (path: string, seed: number) => {
+      const shown = { path, seed, src: convertFileSrc(path) };
+      setLastResult(shown);
+      setBatchImages((prev) => [...prev, shown]);
+    };
+    try {
+      // Generate, one folder at a time.
+      const made_: { path: string; seed: number; dir: string }[] = [];
+      for (let a = start; a < end && !stop; ) {
+        let b = a;
+        while (b < end && dirs[b] === dirs[a]) b++;
+        const requests = images.slice(a, b).map((img, k) => ({ ...img.request, fileStem: fileStemFor(img.request.seed, a + k, batchStart) }));
+        const summary = await generateBatch(runId, requests, dirs[a], guardAnlas, (p) => {
+          if (p.account) setStatus(p.account);
+          if (p.image) {
+            setProgress((pr) => (pr ? { ...pr, done: Math.min(pr.total, made_.length + 1) } : pr));
+            show(p.image.path, p.image.seed);
+          }
+        });
+        summary.images.forEach((im) => made_.push({ ...im, dir: dirs[a] }));
+        if (summary.stoppedReason) stop = summary.stoppedReason;
+        else if (summary.cancelled) stop = "Cancelled.";
+        a = b;
+      }
+      made = made_.length;
+      // Then each image's steps, each on the previous step's result.
+      for (const im of made_) {
+        let path = im.path;
+        for (const step of plan.steps) {
+          if (stop || runIdRef.current !== runId) break;
+          if (step.kind === "emotion" || step.kind === "colorize") {
+            const out = await runDirector(
+              crypto.randomUUID(),
+              { path, tool: step.kind, emotion: step.kind === "emotion" ? step.emotion : "", prompt: step.prompt, defry: step.defry, area: null },
+              im.dir,
+              !!status?.isOpus,
+            );
+            if (out.anlasWarning) stop = out.anlasWarning;
+            path = out.path;
+          } else if (step.kind === "upscale") {
+            const up = await upscaleBatch(crypto.randomUUID(), [path], im.dir);
+            if (up.stoppedReason) stop = up.stoppedReason;
+            if (up.images[0]) path = up.images[0].path;
+          } else {
+            await invoke("strip_metadata_files", { paths: [path] });
+          }
+          show(path, im.seed);
+        }
+      }
+    } catch (err) {
+      stop = String(err);
+    } finally {
+      if (runIdRef.current === runId) {
+        runIdRef.current = null;
+        setGenerating(false);
+        setProgress(null);
+      }
+    }
+    const done = start + made;
+    const finished = done >= images.length || stop !== null;
+    if (made > 0) {
+      advanceAfter(planRun.usedFiles, made, images.length, new Map(), planRun.advancing, { setSize: plan.loops, perSet: plan.perSet });
+    }
+    setPlanRun(finished ? null : { ...planRun, done });
+    setBatchNotice(
+      stop
+        ? `The plan stopped after ${done} of ${images.length} images. ${stop}`
+        : finished
+          ? `The plan is done: ${images.length} image${images.length === 1 ? "" : "s"} in ${dirs[0].replace(/\\set \d+$/, "")}.`
+          : `${done} of ${images.length} done. Press Continue for the next part.`,
+    );
+    if (finished) setBatchSeed(randomSeed());
+    getAccountStatus().then((s) => s && setStatus(s)).catch(() => {});
   }
 
   async function runGenerate(fromRemix = false) {
@@ -1719,34 +1930,7 @@ export default function GenerateTab({
           return next >= q.items.length ? null : { ...q, next };
         });
       } else if (made > 0) {
-        const advanced = new Map(
-          allFiles
-            .filter((f) => f.mode === "sequential" && built.usedFiles.has(f.name) && f.lines.length > 0)
-            .map((f) => [f.path, (f.position + made) % f.lines.length]),
-        );
-        advanced.forEach((next, path) => void savePosition(path, next));
-        const move = (prev: PromptFile[]) => prev.map((f) => (advanced.has(f.path) ? { ...f, position: advanced.get(f.path)! } : f));
-        setPromptFiles(move);
-        setFolderFiles(move);
-        // Character pools and "next card" associations carry on next time.
-        const states = { ...poolStates };
-        for (const { adv, key } of advancing) states[key] = advancedState(adv, states[key] ?? { position: 0, seed: randomSeed() }, made);
-        if (vibeRotation.mode === "next" && vibeRefs.length > 0) {
-          const st = states["vibes-next"] ?? { position: 0, seed: 1 };
-          const k = Math.min(vibeRotation.k, MAX_VIBES, vibeRefs.length);
-          states["vibes-next"] = { ...st, position: st.position + k * Math.ceil(made / Math.max(1, vibeRotation.every)) };
-        }
-        if (artists.enabled && artists.mode === "next" && usableArtists(artists, family).length > 0) {
-          const st = states["artists-next"] ?? { position: 0, seed: 1 };
-          states["artists-next"] = { ...st, position: st.position + Math.ceil(made / Math.max(1, artists.every)) };
-        }
-        built.assocNext.forEach((k, key) => {
-          // Only the images actually made moved the association on.
-          const share = Math.round((k * made) / requests.length);
-          states[key] = { position: (states[key]?.position ?? 0) + share, seed: 1 };
-        });
-        setPoolStates(states);
-        void generateStore.set("poolStates", states).catch(() => {});
+        advanceAfter(built.usedFiles, made, requests.length, built.assocNext, advancing, null);
       }
       setBatchSeed(randomSeed());
       if (summary.stoppedReason) {
@@ -3709,6 +3893,24 @@ export default function GenerateTab({
     />
   );
 
+  const workflowCard = (
+    <WorkflowCard
+      value={workflow}
+      onChange={setWorkflow}
+      disabled={generating || (!canGenerate && !planRun)}
+      folder={cardFolder}
+      run={planRun ? { done: planRun.done, total: planRun.images.length } : null}
+      onStart={startPlan}
+      onContinue={() => setPlanConfirm({ start: false })}
+      onStop={() => {
+        setPlanRun(null);
+        setBatchNotice("The plan was ended.");
+      }}
+      cardStyle={cardStyle}
+      titleStyle={cardTitleStyle}
+    />
+  );
+
   const creepCard = (
     <CreepCard
       value={creep}
@@ -4086,6 +4288,7 @@ export default function GenerateTab({
                   {automationCard}
                   {artistCard}
                   {creepCard}
+                  {workflowCard}
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                   {charactersCard}
@@ -4105,6 +4308,7 @@ export default function GenerateTab({
                 {automationCard}
                 {artistCard}
                 {creepCard}
+                {workflowCard}
                 {vibesCard}
                 {lastCard}
               </div>
@@ -4255,6 +4459,36 @@ export default function GenerateTab({
           </div>
         </div>
       )}
+      {planConfirm && planRun && status && (() => {
+        const p = planRun.plan;
+        const chunk = chunkImages(p);
+        const n = Math.min(planRun.images.length - planRun.done, chunk);
+        const upscales = p.steps.filter((x) => x.kind === "upscale").length;
+        const directors = p.steps.filter((x) => x.kind === "emotion" || x.kind === "colorize").length;
+        const genCost = needsConfirm && runEstimate?.anlas ? runEstimate.anlas * n : 0;
+        const lines = [
+          planConfirm.start
+            ? `${planRun.images.length} images in ${p.sets} set${p.sets === 1 ? "" : "s"} of ${p.loops}, ${chunk} per click.`
+            : `Images ${planRun.done + 1}–${planRun.done + n} of ${planRun.images.length}.`,
+          `This part: ${n} generation${n === 1 ? "" : "s"}${directors ? `, ${n * directors} Director step${n * directors === 1 ? "" : "s"}` : ""}${upscales ? `, ${n * upscales} upscale${n * upscales === 1 ? "" : "s"} (${n * upscales} Anlas)` : ""}.`,
+          needsConfirm ? `Generations ${runEstimate?.anlas ? `cost ${genCost} Anlas` : "cost Anlas"}: ${(runEstimate?.reasons ?? []).join(" ")}` : "Generations are free.",
+          directors && !status.isOpus ? "Director steps cost Anlas on this account." : "",
+          `You have ${status.anlas.toLocaleString()} Anlas.`,
+        ].filter(Boolean);
+        return (
+          <ConfirmModal
+            title={planConfirm.start ? "Start the plan?" : "Run the next part?"}
+            message={lines.join(" ")}
+            confirmLabel={planConfirm.start ? "Start" : "Continue"}
+            cancelLabel="Not now"
+            onConfirm={() => void runPlanChunk()}
+            onCancel={() => {
+              setPlanConfirm(null);
+              if (planConfirm.start) setPlanRun(null);
+            }}
+          />
+        );
+      })()}
       {showSavedPrompts && cardFolder && (
         <SavedPromptsDialog
           folder={cardFolder}

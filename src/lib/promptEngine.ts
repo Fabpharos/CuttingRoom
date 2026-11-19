@@ -250,6 +250,12 @@ export type ImageContext = {
   /** Character slots the model takes (22 on V5, 6 on V4/V4.5). */
   maxSlots: number;
   settings: EngineSettings;
+  /**
+   * Prompt files pick by this index and random source instead, so a
+   * workflow plan can keep the same picks for a whole set.
+   */
+  fileIndex?: number;
+  fileRng?: Rng;
   /** Picks a card for an "add a character" association (null: none fits). */
   pickCard?: (choice: CardChoice) => CardLink | null;
 };
@@ -277,7 +283,10 @@ export function buildImage(input: ImageInput, ctx: ImageContext): ImageOutput {
   const pick = (f: EngineFile) => {
     let i = picks.get(f.name);
     if (i === undefined) {
-      i = f.mode === "sequential" ? (f.position + ctx.index) % f.lines.length : weightedIndex(f.lines.length, ctx.rng, f.weights);
+      i =
+        f.mode === "sequential"
+          ? (f.position + (ctx.fileIndex ?? ctx.index)) % f.lines.length
+          : weightedIndex(f.lines.length, ctx.fileRng ?? ctx.rng, f.weights);
       picks.set(f.name, i);
     }
     return i;

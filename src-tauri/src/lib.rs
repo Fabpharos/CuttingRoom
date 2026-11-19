@@ -309,6 +309,16 @@ async fn list_vibe_files(dir: String) -> Result<Vec<String>, String> {
         .map_err(|e| e.to_string())?
 }
 
+/// Strips metadata from the given files in place (a workflow plan's last step).
+#[tauri::command]
+async fn strip_metadata_files(paths: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        paths.iter().try_for_each(|p| strip_metadata::strip_one(std::path::Path::new(p)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 fn nai_estimate_costs(
     requests: Vec<novelai::GenerateRequest>,
@@ -438,6 +448,7 @@ pub fn run() {
             nai_generate_batch,
             nai_cancel_batch,
             nai_estimate_costs,
+            strip_metadata_files,
             nai_encode_vibe,
             list_vibe_files,
             nai_plan_director,

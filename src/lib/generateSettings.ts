@@ -27,6 +27,7 @@ import { fileTokenName, isValidTokenName, tokenFor } from "./promptTokens";
 import { parseAutomation, DEFAULT_AUTOMATION, type AutomationSettings } from "../components/AutomationCard";
 import { parseAdvance, type SlotAdvance } from "./characterPool";
 import { DEFAULT_CREEP, parseCreep, type CreepSettings } from "./creep";
+import { DEFAULT_PLAN, parsePlan, type WorkflowPlan } from "../components/WorkflowCard";
 
 // One store for everything the Generate tab saves, shared with the prompt
 // file's sequential positions. The API token is never stored here — it
@@ -96,6 +97,7 @@ export type GenerateSettings = {
   vibeRotation: VibeRotation;
   /** Where encoded vibes are saved and the library is read from (null: the card folder's "vibes"). */
   vibeLibraryDir: string | null;
+  workflow: WorkflowPlan;
 };
 
 export type VibeRotation = { mode: "fixed" | "random" | "next"; k: number; every: number };
@@ -132,6 +134,7 @@ export const DEFAULT_SETTINGS: GenerateSettings = {
   creep: DEFAULT_CREEP,
   vibeRotation: { mode: "fixed", k: 2, every: 1 },
   vibeLibraryDir: null,
+  workflow: DEFAULT_PLAN,
 };
 
 const SETTINGS_KEY = "form";
@@ -287,6 +290,7 @@ function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy
       } as VibeRotation;
     })(),
     vibeLibraryDir: typeof raw.vibeLibraryDir === "string" ? raw.vibeLibraryDir : null,
+    workflow: parsePlan(raw.workflow),
     folderModes: (() => {
       const m = raw.folderModes;
       if (typeof m !== "object" || m === null) return {};
