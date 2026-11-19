@@ -268,7 +268,15 @@ export type GenerateRequest = {
   noiseSchedule?: string | null;
   /** Variety+: set to `varietyPlusSigma(...)`; null leaves it off. */
   skipCfgAboveSigma?: number | null;
+  /** Precise Reference images (V4.5; NovelAI charges 5 Anlas each per image). */
+  preciseReferences?: PreciseReference[];
 };
+
+export type ReferenceKind = "character" | "style" | "character&style";
+export type PreciseReference = { path: string; kind: ReferenceKind; strength: number; fidelity: number };
+/** NovelAI's charge per reference per image. */
+export const PRECISE_REFERENCE_COST = 5;
+export const MAX_PRECISE_REFERENCES = 4;
 
 /** What a request should cost; `anlas` is null when it can't be priced. */
 export type CostEstimate = { free: boolean; anlas: number | null; reasons: string[] };

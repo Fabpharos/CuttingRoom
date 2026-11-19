@@ -45,6 +45,10 @@ import {
   type AccountStatus,
   type CostEstimate,
   type GenerateRequest,
+  type PreciseReference,
+  type ReferenceKind,
+  PRECISE_REFERENCE_COST,
+  MAX_PRECISE_REFERENCES,
   type ImportPlan,
   type ImportedSettings,
   type VibeInfo,
@@ -604,6 +608,9 @@ export default function GenerateTab({
   // The batch's random picks come from this, so a preview matches the run.
   const [batchSeed, setBatchSeed] = useState(() => randomSeed());
   const [previewImages, setPreviewImages] = useState<PreviewImage[] | null>(null);
+  // Precise Reference: a style reference here, plus each loaded card's own.
+  const [styleReference, setStyleReference] = useState<PreciseReference | null>(null);
+  const [useCardReferences, setUseCardReferences] = useState(true);
   const [outputDir, setOutputDir] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   // Which run a cost confirmation is for: the form's, or the next remix batch.
@@ -645,6 +652,8 @@ export default function GenerateTab({
         setCharacterAdvance(s.characterAdvance);
         setWildcardFolder(s.wildcardFolder);
         setFolderModes(s.folderModes);
+        setStyleReference(s.styleReference);
+        setUseCardReferences(s.useCardReferences);
         setPoolStates((await generateStore.get<Record<string, PoolState>>("poolStates")) ?? {});
         setCount(s.count);
         setOutputDir(s.outputDir);
@@ -698,6 +707,8 @@ export default function GenerateTab({
         characterAdvance: characters.map((_, i) => advanceOf(i)),
         wildcardFolder,
         folderModes,
+        styleReference,
+        useCardReferences,
         count,
         outputDir,
         promptFiles: promptFiles.map(({ path, name, mode }) => ({ path, name, mode })),
@@ -735,6 +746,8 @@ export default function GenerateTab({
     characterAdvance,
     wildcardFolder,
     folderModes,
+    styleReference,
+    useCardReferences,
     count,
     outputDir,
     promptFiles,
@@ -1166,6 +1179,21 @@ export default function GenerateTab({
     if (typeof dir === "string") setOutputDir(dir);
   }
 
+  // The references an image sends: the style reference, then each present
+  // carded character's own, up to the limit. None on models without it.
+  const referencesFor = (links: (CardLink | null)[]): PreciseReference[] => {
+    if (!modelInfo.preciseReference) return [];
+    const refs: PreciseReference[] = styleReference ? [styleReference] : [];
+    if (useCardReferences) {
+      for (const l of links) {
+        const r = l?.reference;
+        if (r) refs.push({ path: r.path, kind: r.type, strength: r.strength, fidelity: r.fidelity });
+      }
+    }
+    return refs.slice(0, MAX_PRECISE_REFERENCES);
+  };
+  const formReferences = referencesFor(cardLinks);
+
   // The cost of one image as the form stands. Prompts don't change the
   // price, so a request without tokens filled is enough.
   const sampleRequest = (): GenerateRequest => ({
@@ -1185,8 +1213,9 @@ export default function GenerateTab({
     sampler,
     noiseSchedule,
     skipCfgAboveSigma: varietyPlus ? varietyPlusSigma(model, size.width, size.height) : null,
+    preciseReferences: formReferences,
   });
-  const estimateKey = JSON.stringify([model, size, effectiveSteps, vibeRefs.length, status?.isOpus, status?.usage?.isNegative]);
+  const estimateKey = JSON.stringify([model, size, effectiveSteps, vibeRefs.length, formReferences.length, status?.isOpus, status?.usage?.isNegative]);
   useEffect(() => {
     if (phase !== "loggedIn") return;
     let stale = false;
@@ -1341,6 +1370,12 @@ export default function GenerateTab({
         vibes: vibeRefs,
         sourceImage: !fromRemix && sourceImage ? { path: sourceImage.path, strength: img2imgStrength } : null,
       };
+      const refs = referencesFor(res.slots.map((s) => (s.present ? s.link : null)));
+      if (refs.length > 0) {
+        // NovelAI won't take both; references win, and the card says so.
+        request.preciseReferences = refs;
+        request.vibes = [];
+      }
       return { request, log: res.log, warnings: res.warnings, cardNames: res.slots.map((s) => s.link?.name ?? null) };
     });
     return { images, usedFiles, assocNext };
@@ -2932,6 +2967,123 @@ export default function GenerateTab({
     </div>
   );
 
+  async function chooseStyleReference() {
+    const file = await open({
+      directory: false,
+      multiple: false,
+      filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp"] }],
+    });
+    if (typeof file !== "string") return;
+    setStyleReference((r) => ({ kind: "style", strength: 1, fidelity: 1, ...r, path: file }));
+  }
+  const cardRefCount = cardLinks.filter((l) => l?.reference).length;
+  const referenceCard = (
+    <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <span style={{ ...cardTitleStyle, marginBottom: 0, flex: 1 }}>
+          PRECISE REFERENCE
+          <HelpTip
+            lines={[
+              { text: "A reference image for a character's look, a style, or both. Character cards can carry their own (set in Character Cards)." },
+              { text: `NovelAI charges ${PRECISE_REFERENCE_COST} Anlas per image for each reference; Generate shows the run's price and asks first.` },
+              { text: "V4.5 only for now; it can't be used with Vibe Transfer, so vibes are left out while references are on." },
+            ]}
+          />
+          {formReferences.length > 0 && (
+            <span style={{ fontWeight: 500, color: "rgb(200,140,40)" }}>
+              {" "}
+              · {formReferences.length} × {PRECISE_REFERENCE_COST} Anlas per image
+            </span>
+          )}
+        </span>
+        <button onClick={() => void chooseStyleReference()} disabled={generating} style={{ ...secondaryButtonStyle, padding: "6px 14px" }}>
+          {styleReference ? "Change image…" : "Add reference…"}
+        </button>
+      </div>
+      {!modelInfo.preciseReference && (styleReference || cardRefCount > 0) && (
+        <div style={{ ...warningBoxStyle, marginTop: 0 }}>
+          {modelFamily(model)} doesn't support Precise Reference yet, so no references are sent. Switch to V4.5 to use them.
+        </div>
+      )}
+      {modelInfo.preciseReference && formReferences.length > 0 && vibeRefs.length > 0 && (
+        <div style={{ ...warningBoxStyle, marginTop: 0 }}>Vibe Transfer can't be used with Precise Reference, so the vibes are left out.</div>
+      )}
+      {styleReference && (
+        <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
+          <img
+            src={convertFileSrc(styleReference.path)}
+            alt=""
+            style={{ width: 80, height: 80, objectFit: "contain", borderRadius: 6, background: "var(--bg-page)", flexShrink: 0 }}
+          />
+          <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 6, fontSize: 12.5 }}>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {(["style", "character", "character&style"] as ReferenceKind[]).map((k) => (
+                <button
+                  key={k}
+                  disabled={generating}
+                  onClick={() => setStyleReference({ ...styleReference, kind: k })}
+                  style={{
+                    padding: "3px 10px",
+                    borderRadius: 999,
+                    border: `1px solid ${styleReference.kind === k ? "var(--accent)" : "var(--border)"}`,
+                    background: styleReference.kind === k ? "var(--accent)" : "transparent",
+                    color: styleReference.kind === k ? "var(--accent-contrast)" : "var(--text)",
+                    fontWeight: 600,
+                    fontSize: 12,
+                    cursor: "pointer",
+                  }}
+                >
+                  {k === "style" ? "Style" : k === "character" ? "Character" : "Character & Style"}
+                </button>
+              ))}
+              <a
+                href="#"
+                onClick={(e) => {
+                  e.preventDefault();
+                  if (!generating) setStyleReference(null);
+                }}
+                style={{ fontWeight: 600, marginLeft: "auto" }}
+              >
+                Remove
+              </a>
+            </div>
+            {(["strength", "fidelity"] as const).map((k) => (
+              <label key={k} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ minWidth: 92 }}>
+                  {k === "strength" ? "Strength" : "Fidelity"} {styleReference[k].toFixed(2)}
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={styleReference[k]}
+                  disabled={generating}
+                  onChange={(e) => setStyleReference({ ...styleReference, [k]: Number(e.target.value) })}
+                  style={{ flex: 1, accentColor: "var(--accent)" }}
+                />
+              </label>
+            ))}
+            <div style={{ fontSize: 11.5, color: "var(--muted)" }}>Sent padded to 1024×1536, 1536×1024 or 1472×1472, whichever fits its shape.</div>
+          </div>
+        </div>
+      )}
+      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5 }}>
+        <input
+          type="checkbox"
+          checked={useCardReferences}
+          disabled={generating}
+          onChange={(e) => setUseCardReferences(e.target.checked)}
+          style={{ accentColor: "var(--accent)" }}
+        />
+        Send the references that come with character cards
+        <span style={{ color: "var(--muted)" }}>
+          ({cardRefCount} loaded card{cardRefCount === 1 ? " has" : "s have"} one)
+        </span>
+      </label>
+    </div>
+  );
+
   const vibesCard = (
     <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 12 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -3468,6 +3620,7 @@ export default function GenerateTab({
                 <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                   {charactersCard}
                   {img2imgCard}
+                  {referenceCard}
                   {vibesCard}
                   {lastCard}
                 </div>
@@ -3477,6 +3630,7 @@ export default function GenerateTab({
                 {promptCard}
                 {charactersCard}
                 {img2imgCard}
+                {referenceCard}
                 {promptFilesCard}
                 {automationCard}
                 {vibesCard}

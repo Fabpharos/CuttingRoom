@@ -10,6 +10,8 @@ mod inpaint;
 pub use inpaint::*;
 mod turns;
 use turns::*;
+mod reference;
+pub use reference::*;
 
 const API_BASE: &str = "https://image.novelai.net";
 const KEYRING_SERVICE: &str = "CuttingRoom.NovelAI";
@@ -314,6 +316,9 @@ pub struct GenerateRequest {
     /// Variety+: guidance is skipped above this noise level. None leaves it off.
     #[serde(default)]
     pub skip_cfg_above_sigma: Option<f64>,
+    /// Precise Reference images (V4.5; 5 Anlas each per image).
+    #[serde(default)]
+    pub precise_references: Vec<PreciseReference>,
 }
 
 /// The starting picture for image to image, read from disk when the batch
@@ -563,8 +568,8 @@ pub struct CostEstimate {
 /// Anlas NovelAI is known to charge for a request no matter the account
 /// (Precise Reference). The Anlas guard expects this much and no more.
 /// Precise Reference's charge for one image: 5 Anlas per reference.
-fn precise_reference_cost(_req: &GenerateRequest) -> i64 {
-    0
+fn precise_reference_cost(req: &GenerateRequest) -> i64 {
+    req.precise_references.len() as i64 * PRECISE_REFERENCE_COST
 }
 
 pub fn known_charge(req: &GenerateRequest) -> i64 {
@@ -670,12 +675,22 @@ fn validate_batch(requests: &[GenerateRequest]) -> Result<Vec<serde_json::Value>
     }
     let mut files = VibeFiles::new();
     let mut sources: HashMap<(String, u32, u32), String> = HashMap::new();
+    let mut references: HashMap<String, String> = HashMap::new();
     requests
         .iter()
         .map(|r| {
             validate_file_stem(&r.file_stem)?;
+            check_references(r)?;
             let vibes = resolve_vibes(&r.model, &r.vibes, &mut files)?;
             let mut body = build_body(r, &vibes)?;
+            let mut images = Vec::new();
+            for pr in &r.precise_references {
+                if !references.contains_key(&pr.path) {
+                    references.insert(pr.path.clone(), reference_base64(&pr.path)?);
+                }
+                images.push(references[&pr.path].clone());
+            }
+            add_references(&mut body, &r.precise_references, &images);
             if let Some(src) = &r.source_image {
                 let key = (src.path.clone(), r.width, r.height);
                 if !sources.contains_key(&key) {

@@ -19,6 +19,7 @@ import {
   DEFAULT_SCALE,
   CENTER,
   type CharacterPosition,
+  type PreciseReference,
 } from "./novelai";
 import type { PromptFileMode } from "./promptFile";
 import { parseCardLink, type CardLink } from "./characterCards";
@@ -85,6 +86,10 @@ export type GenerateSettings = {
   wildcardFolder: { enabled: boolean; dir: string | null };
   /** Random or sequential, for files found in the wildcards folder (random when absent). */
   folderModes: Record<string, PromptFileMode>;
+  /** A free-standing Precise Reference (a style, usually). */
+  styleReference: PreciseReference | null;
+  /** Send the reference images that come with loaded character cards. */
+  useCardReferences: boolean;
 };
 
 export const DEFAULT_SETTINGS: GenerateSettings = {
@@ -114,6 +119,8 @@ export const DEFAULT_SETTINGS: GenerateSettings = {
   characterAdvance: [],
   wildcardFolder: { enabled: false, dir: null },
   folderModes: {},
+  styleReference: null,
+  useCardReferences: true,
 };
 
 const SETTINGS_KEY = "form";
@@ -250,6 +257,13 @@ function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy
       const w = (raw.wildcardFolder ?? {}) as Record<string, unknown>;
       return { enabled: w.enabled === true, dir: typeof w.dir === "string" ? w.dir : null };
     })(),
+    styleReference: (() => {
+      const r = raw.styleReference as Record<string, unknown> | null | undefined;
+      if (!r || typeof r !== "object" || typeof r.path !== "string") return null;
+      const kind = r.kind === "character" || r.kind === "character&style" ? r.kind : "style";
+      return { path: r.path, kind, strength: clamp(r.strength, 0, 1, 1), fidelity: clamp(r.fidelity, 0, 1, 1) };
+    })(),
+    useCardReferences: raw.useCardReferences !== false,
     folderModes: (() => {
       const m = raw.folderModes;
       if (typeof m !== "object" || m === null) return {};
