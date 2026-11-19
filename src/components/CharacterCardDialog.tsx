@@ -6,6 +6,7 @@ import {
   SHOW_OPTIONS,
   buildCharacterPrompt,
   hiddenParts,
+  linkFor,
   listCards,
   loadCardFolder,
   saveCardFolder,
@@ -58,18 +59,23 @@ export default function CharacterCardDialog({
   characterCount,
   maxCharacters,
   onLoad,
+  onLoadMany,
   onClose,
 }: {
   characterCount: number;
   maxCharacters: number;
   /** `slot` is the character to replace, or null to add a new one. */
   onLoad: (prompt: string, negative: string, slot: number | null, link: CardLink) => void;
+  /** Several cards (Ctrl+click) go into the next free slots. */
+  onLoadMany?: (items: { prompt: string; negative: string; link: CardLink }[]) => void;
   onClose: () => void;
 }) {
   const [folder, setFolder] = useState<string | null>(null);
   const [cards, setCards] = useState<CardFile[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [picked, setPicked] = useState<string | null>(null);
+  // Ctrl+click adds more cards to load at once.
+  const [extra, setExtra] = useState<string[]>([]);
   const [options, setOptions] = useState<Set<ShowOption>>(new Set());
   const [hidden, setHidden] = useState<Set<Part>>(new Set());
   const canAdd = characterCount < maxCharacters;
@@ -138,6 +144,8 @@ export default function CharacterCardDialog({
   }
 
   const card = cards?.find((c) => c.path === picked)?.card ?? null;
+  const many = extra.length > 0;
+  const room = maxCharacters - characterCount;
   const prompt = card ? buildCharacterPrompt(card, hidden, options) : "";
   const used = (part: Part) => card?.tags.some((t) => t.part === part) ?? false;
 
@@ -172,6 +180,11 @@ export default function CharacterCardDialog({
         }}
       >
         <div style={{ fontSize: 17, fontWeight: 700 }}>Load character card</div>
+        {onLoadMany && (
+          <div style={{ fontSize: 12, color: "var(--muted)", marginTop: -8 }}>
+            Ctrl+click to add several cards at once; they fill the next free slots ({Math.max(0, room)} free).
+          </div>
+        )}
 
         {error && <div style={{ fontSize: 13, color: "#c9482f" }}>{error}</div>}
 
@@ -192,11 +205,18 @@ export default function CharacterCardDialog({
           <>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(96px, 1fr))", gap: 8 }}>
               {cards.map((c) => {
-                const on = c.path === picked;
+                const on = c.path === picked || extra.includes(c.path);
                 return (
                   <button
                     key={c.path}
-                    onClick={() => setPicked(c.path)}
+                    onClick={(e) => {
+                      if ((e.ctrlKey || e.metaKey) && onLoadMany && picked && picked !== c.path) {
+                        setExtra((x) => (x.includes(c.path) ? x.filter((p) => p !== c.path) : [...x, c.path]));
+                      } else {
+                        setPicked(c.path);
+                        setExtra([]);
+                      }
+                    }}
                     style={{
                       display: "flex",
                       flexDirection: "column",
@@ -315,9 +335,21 @@ export default function CharacterCardDialog({
           <button
             style={{ ...primaryButtonStyle, opacity: card && (canAdd || slot !== null) ? 1 : 0.5 }}
             disabled={!card || (!canAdd && slot === null)}
-            onClick={() => card && onLoad(prompt, card.negative, slot, { name: card.name, tags: card.tags })}
+            onClick={() => {
+              if (!card || !picked) return;
+              if (many && onLoadMany) {
+                const files = [picked, ...extra].map((p) => cards!.find((c) => c.path === p)!).slice(0, room);
+                onLoadMany(
+                  files.map((f) => ({
+                    prompt: buildCharacterPrompt(f.card, hidden, options),
+                    negative: f.card.negative,
+                    link: linkFor(f.card, f.path),
+                  })),
+                );
+              } else onLoad(prompt, card.negative, slot, linkFor(card, picked));
+            }}
           >
-            Load
+            {many ? `Add ${Math.min(room, extra.length + 1)} characters` : "Load"}
           </button>
         </div>
       </div>

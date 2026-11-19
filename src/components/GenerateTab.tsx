@@ -21,7 +21,14 @@ import {
   MAX_SIDE,
   sizeProblem,
   fitFreeSize,
-  MAX_CHARACTERS,
+  modelFamily,
+  SAMPLERS,
+  NOISE_SCHEDULES,
+  DEFAULT_SAMPLER,
+  DEFAULT_NOISE_SCHEDULE,
+  varietyPlusSigma,
+  VARIETY_PLUS_VERIFIED,
+  estimateCosts,
   DEFAULT_STEPS,
   MAX_STEPS,
   DEFAULT_SCALE,
@@ -36,31 +43,88 @@ import {
   gridLabel,
   type CharacterPosition,
   type AccountStatus,
+  type CostEstimate,
   type GenerateRequest,
+  type PreciseReference,
+  type ReferenceKind,
+  PRECISE_REFERENCE_COST,
+  MAX_PRECISE_REFERENCES,
   type ImportPlan,
   type ImportedSettings,
   type VibeInfo,
   type VibeRef,
 } from "../lib/novelai";
 import ConfirmModal from "./ConfirmModal";
+import HelpTip from "./HelpTip";
+import AccountBars from "./AccountBars";
+import CharacterSlots, { roughTokens, spreadPositions, tokenLimit, type SlotSummary } from "./CharacterSlots";
 import CharacterCardDialog from "./CharacterCardDialog";
-import { PARTS, adaptCardCharacter, type CardLink } from "../lib/characterCards";
+import { PARTS, adaptCardCharacter, linkFor, listCards, loadCardFolder, type CardFile, type CardLink } from "../lib/characterCards";
+import AutomationCard, { DEFAULT_AUTOMATION, type AutomationSettings } from "./AutomationCard";
+import BatchPreview, { type PreviewImage } from "./BatchPreview";
+import PromptFileEditor from "./PromptFileEditor";
+import DirectorDialog from "./DirectorDialog";
+import CreepCard from "./CreepCard";
+import SavedPromptsDialog from "./SavedPromptsDialog";
+import ArtistLibraryCard from "./ArtistLibraryCard";
+import WorkflowCard, { DEFAULT_PLAN, chunkImages, type WorkflowPlan } from "./WorkflowCard";
+import { runDirector } from "../lib/director";
+import { upscaleBatch } from "../lib/upscale";
+import {
+  DEFAULT_ARTISTS,
+  artistsForImage,
+  insertArtists,
+  loadArtists,
+  saveArtists,
+  usableArtists,
+  type ArtistLibrary,
+  type ModelFamily,
+  type PromptSnapshot,
+  type SavedPrompt,
+} from "../lib/savedPrompts";
+import { DEFAULT_CREEP, listAt, numberAt, seedAt, type CreepSettings } from "../lib/creep";
+import type { DirectorTool } from "../lib/director";
+import { buildImage, findLoops, imageRng, seededRng, swapGender, type EngineFile, type EngineSettings, type Slot } from "../lib/promptEngine";
+import { helpFor } from "../lib/syntaxHelp";
+import { CONTROL_HELP } from "../lib/syntaxHelp";
+import {
+  DEFAULT_GENDER_PAIRS,
+  loadAssociations,
+  loadGenderPairs,
+  saveGenderPairs,
+  type Association,
+  type CardChoice,
+} from "../lib/library";
+import {
+  DEFAULT_ADVANCE,
+  advancedState,
+  cardForImage,
+  linkOf,
+  poolCards,
+  poolKey,
+  type PoolState,
+  type SlotAdvance,
+} from "../lib/characterPool";
 import TagSuggestions from "./TagSuggestions";
 import {
   openPromptFile,
   openWildcardsDir,
   wildcardsDir,
-  pickLineIndices,
+  listWildcardFiles,
+  readPromptFile,
   savePosition,
   type PromptFile,
   type PromptFileMode,
 } from "../lib/promptFile";
-import { fileTokenName, fillTokens, tokenFile, tokenFor, tokenPart, tokensIn } from "../lib/promptTokens";
+import { fileTokenName, fillTokens, folderTokenName, tokenFile, tokenFor, tokenPart, tokensIn } from "../lib/promptTokens";
 import {
+  generateStore,
   loadGenerateSettings,
   saveGenerateSettings,
   type SavedVibe,
+  type VibeRotation,
 } from "../lib/generateSettings";
+import { invoke } from "@tauri-apps/api/core";
 import { revealFilesInExplorer } from "../lib/nativeOps";
 import type { RemixItem } from "../lib/remix";
 
@@ -208,10 +272,13 @@ function GrowingTextarea({
   return <textarea ref={ref} rows={minRows} {...props} style={{ ...style, resize: "none", overflowY: "auto" }} />;
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({ label, children, help }: { label: string; children: React.ReactNode; help?: React.ReactNode }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-      <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)" }}>{label}</span>
+      <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)" }}>
+        {label}
+        {help}
+      </span>
       {children}
     </div>
   );
@@ -246,6 +313,7 @@ function PositionPicker({
   model,
   aspect,
   disabled,
+  highlight = null,
   onChange,
 }: {
   index: number;
@@ -253,6 +321,8 @@ function PositionPicker({
   model: string;
   aspect: number;
   disabled: boolean;
+  /** A character whose row is hovered, shown outlined. */
+  highlight?: number | null;
   onChange: (p: CharacterPosition) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -300,6 +370,9 @@ function PositionPicker({
         {positions.map((p, j) => {
           const at = shown(p);
           const mine = j === index;
+          const lit = !mine && j === highlight;
+          // With many characters, the others shrink so the board stays readable.
+          const small = positions.length > 8;
           return (
             <span
               key={j}
@@ -308,15 +381,16 @@ function PositionPicker({
                 left: `${at.x * 100}%`,
                 top: `${at.y * 100}%`,
                 transform: "translate(-50%, -50%)",
-                width: mine ? 16 : 11,
-                height: mine ? 16 : 11,
+                width: mine ? 16 : small ? 8 : 11,
+                height: mine ? 16 : small ? 8 : 11,
                 borderRadius: "50%",
                 background: mine ? "var(--accent)" : "var(--muted)",
                 color: mine ? "var(--accent-contrast)" : "var(--bg-card)",
-                opacity: mine ? 1 : 0.45,
-                fontSize: mine ? 10 : 7,
+                opacity: mine || lit ? 1 : 0.45,
+                outline: lit ? "2px solid var(--accent)" : "none",
+                fontSize: mine ? 10 : small ? 0 : 7,
                 fontWeight: 700,
-                lineHeight: mine ? "16px" : "11px",
+                lineHeight: mine ? "16px" : small ? "8px" : "11px",
                 textAlign: "center",
                 pointerEvents: "none",
                 zIndex: mine ? 1 : 0,
@@ -518,6 +592,71 @@ export default function GenerateTab({
   const [usedOnly, setUsedOnly] = useState(false);
   const [steps, setSteps] = useState(DEFAULT_STEPS);
   const [scale, setScale] = useState(DEFAULT_SCALE);
+  const [sampler, setSampler] = useState(DEFAULT_SAMPLER);
+  const [noiseSchedule, setNoiseSchedule] = useState(DEFAULT_NOISE_SCHEDULE);
+  const [varietyPlus, setVarietyPlus] = useState(false);
+  // Stable ids for the character rows (kept the same length as `characters`),
+  // so a row keeps its expanded state and editor when rows are reordered.
+  const [characterKeys, setCharacterKeys] = useState<string[]>([]);
+  const [expandedChars, setExpandedChars] = useState<Set<string>>(new Set());
+  const [oneOpen, setOneOpen] = useState(false);
+  const [hoveredChar, setHoveredChar] = useState<number | null>(null);
+  // Switching to a model that takes fewer characters: asked before anything goes.
+  const [modelSwitch, setModelSwitch] = useState<{ to: string; choosing: boolean; keep: Set<number> } | null>(null);
+  // Characters a model switch removed, kept until the next generation so
+  // switching back restores them.
+  const [stashedChars, setStashedChars] = useState<
+    { from: string; items: { index: number; text: string; negative: string; position: CharacterPosition; link: CardLink | null }[] } | null
+  >(null);
+  const [runEstimate, setRunEstimate] = useState<CostEstimate | null>(null);
+  // Prompt automation: scramble, gender swap, random weights, associations.
+  const [automation, setAutomation] = useState<AutomationSettings>(DEFAULT_AUTOMATION);
+  const [associations, setAssociations] = useState<Association[]>([]);
+  const [genderPairs, setGenderPairs] = useState<[string, string][]>(DEFAULT_GENDER_PAIRS);
+  const [cardFolder, setCardFolder] = useState<string | null>(null);
+  const [cards, setCards] = useState<CardFile[]>([]);
+  // The form before "Apply to the form" rewrote it, for Undo.
+  const [swapUndo, setSwapUndo] = useState<{ prompt: string; negative: string; characters: string[]; negatives: string[] } | null>(null);
+  // Each character's auto-advance (null: fixed), kept the same length as `characters`.
+  const [characterAdvance, setCharacterAdvance] = useState<(SlotAdvance | null)[]>([]);
+  const advanceOf = (i: number) => characterAdvance[i] ?? null;
+  const [poolStates, setPoolStates] = useState<Record<string, PoolState>>({});
+  // Every .txt in a wildcards folder, usable without adding it.
+  const [wildcardFolder, setWildcardFolder] = useState<{ enabled: boolean; dir: string | null }>({ enabled: false, dir: null });
+  const [folderFiles, setFolderFiles] = useState<PromptFile[]>([]);
+  const [folderModes, setFolderModes] = useState<Record<string, PromptFileMode>>({});
+  const [folderScanError, setFolderScanError] = useState<string | null>(null);
+  const [openGroups, setOpenGroups] = useState<Set<string>>(new Set());
+  const [editingFile, setEditingFile] = useState<{ file: PromptFile; raw: string[] } | null>(null);
+  // The batch's random picks come from this, so a preview matches the run.
+  const [batchSeed, setBatchSeed] = useState(() => randomSeed());
+  const [previewImages, setPreviewImages] = useState<PreviewImage[] | null>(null);
+  const [director, setDirector] = useState<{ path: string; tool: DirectorTool } | null>(null);
+  // Precise Reference: a style reference here, plus each loaded card's own.
+  const [styleReference, setStyleReference] = useState<PreciseReference | null>(null);
+  const [useCardReferences, setUseCardReferences] = useState(true);
+  const [creep, setCreep] = useState<CreepSettings>(DEFAULT_CREEP);
+  const [artists, setArtists] = useState<ArtistLibrary>(DEFAULT_ARTISTS);
+  const artistsLoadedRef = useRef(false);
+  const [showSavedPrompts, setShowSavedPrompts] = useState(false);
+  // A saved prompt waiting on the import confirmation.
+  const [pendingSnapshot, setPendingSnapshot] = useState<PromptSnapshot | null>(null);
+  const [vibeRotation, setVibeRotation] = useState<VibeRotation>({ mode: "fixed", k: 2, every: 1 });
+  // A workflow plan, and the one being run (built up front, run a click at a time).
+  const [workflow, setWorkflow] = useState<WorkflowPlan>(DEFAULT_PLAN);
+  const [planRun, setPlanRun] = useState<{
+    images: PreviewImage[];
+    dirs: string[];
+    done: number;
+    plan: WorkflowPlan;
+    usedFiles: Set<string>;
+    advancing: { adv: SlotAdvance; key: string }[];
+  } | null>(null);
+  const [planConfirm, setPlanConfirm] = useState<{ start: boolean } | null>(null);
+  const [vibeLibraryDir, setVibeLibraryDir] = useState<string | null>(null);
+  const [vibeLibrary, setVibeLibrary] = useState<string[] | null>(null);
+  // Encoding an image as a vibe (2 Anlas, once).
+  const [encoding, setEncoding] = useState<{ path: string; ie: number; busy: boolean; error: string | null } | null>(null);
   const [outputDir, setOutputDir] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   // Which run a cost confirmation is for: the form's, or the next remix batch.
@@ -552,6 +691,20 @@ export default function GenerateTab({
         setNegativePrompt(s.negativePrompt);
         setSteps(s.steps);
         setScale(s.scale);
+        setSampler(s.sampler);
+        setNoiseSchedule(s.noiseSchedule);
+        setVarietyPlus(s.varietyPlus);
+        setAutomation(s.automation);
+        setCharacterAdvance(s.characterAdvance);
+        setWildcardFolder(s.wildcardFolder);
+        setFolderModes(s.folderModes);
+        setStyleReference(s.styleReference);
+        setUseCardReferences(s.useCardReferences);
+        setCreep(s.creep);
+        setVibeRotation(s.vibeRotation);
+        setVibeLibraryDir(s.vibeLibraryDir);
+        setWorkflow(s.workflow);
+        setPoolStates((await generateStore.get<Record<string, PoolState>>("poolStates")) ?? {});
         setCount(s.count);
         setOutputDir(s.outputDir);
         setCharacters(s.characters);
@@ -597,6 +750,19 @@ export default function GenerateTab({
         img2imgStrength,
         steps,
         scale,
+        sampler,
+        noiseSchedule,
+        varietyPlus,
+        automation,
+        characterAdvance: characters.map((_, i) => advanceOf(i)),
+        wildcardFolder,
+        folderModes,
+        styleReference,
+        useCardReferences,
+        creep,
+        vibeRotation,
+        vibeLibraryDir,
+        workflow,
         count,
         outputDir,
         promptFiles: promptFiles.map(({ path, name, mode }) => ({ path, name, mode })),
@@ -627,17 +793,127 @@ export default function GenerateTab({
     img2imgStrength,
     steps,
     scale,
+    sampler,
+    noiseSchedule,
+    varietyPlus,
+    automation,
+    characterAdvance,
+    wildcardFolder,
+    folderModes,
+    styleReference,
+    useCardReferences,
+    creep,
+    vibeRotation,
+    vibeLibraryDir,
+    workflow,
     count,
     outputDir,
     promptFiles,
     vibes,
   ]);
+
+  // The card folder holds the cards (for auto-advance and associations), the
+  // tag associations and the gender swap table. All local files.
+  async function loadLibrary() {
+    const folder = await loadCardFolder().catch(() => null);
+    setCardFolder(folder);
+    setGenderPairs(await loadGenderPairs(folder).catch(() => DEFAULT_GENDER_PAIRS));
+    if (!folder) {
+      setAssociations([]);
+      setCards([]);
+      return;
+    }
+    const [rules, list] = await Promise.all([
+      loadAssociations(folder).catch((e) => {
+        setError(`Couldn't read the tag associations: ${String(e)}`);
+        return [] as Association[];
+      }),
+      listCards(folder).catch(() => [] as CardFile[]),
+    ]);
+    setAssociations(rules);
+    setCards(list);
+    setArtists(await loadArtists(folder).catch(() => DEFAULT_ARTISTS));
+    artistsLoadedRef.current = true;
+  }
+  // The artist library is saved in the card folder as it changes.
+  useEffect(() => {
+    if (!artistsLoadedRef.current || !cardFolder) return;
+    const timer = setTimeout(() => void saveArtists(cardFolder, artists).catch((e) => setError(String(e))), 500);
+    return () => clearTimeout(timer);
+  }, [artists, cardFolder]);
+  const libraryLoadedRef = useRef(false);
+  useEffect(() => {
+    if (!active || libraryLoadedRef.current) return;
+    libraryLoadedRef.current = true;
+    void loadLibrary();
+  }, [active]);
+
+  // ---- The wildcards folder ----
+  async function scanFolder(dir: string | null = wildcardFolder.dir) {
+    const d = dir ?? (await wildcardsDir().catch(() => null));
+    if (!d) return;
+    try {
+      const list = await listWildcardFiles(d);
+      const files = await Promise.all(
+        list.map(async (f) => ({ ...(await openPromptFile(f.path, folderTokenName(f.relative), folderModes[f.path] ?? "random")), fromFolder: true })),
+      );
+      setFolderFiles(files);
+      setFolderScanError(null);
+    } catch (e) {
+      setFolderFiles([]);
+      setFolderScanError(String(e));
+    }
+  }
+  useEffect(() => {
+    if (!settingsLoaded || !wildcardFolder.enabled) {
+      setFolderFiles([]);
+      return;
+    }
+    void scanFolder();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingsLoaded, wildcardFolder.enabled, wildcardFolder.dir]);
+  // Files edited elsewhere are picked up when the window comes back.
+  useEffect(() => {
+    if (!active || !wildcardFolder.enabled) return;
+    let last = 0;
+    const onFocus = () => {
+      if (Date.now() - last < 2000 || generating) return;
+      last = Date.now();
+      void scanFolder();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, wildcardFolder.enabled, wildcardFolder.dir, generating, folderModes]);
+
+  async function chooseWildcardFolder() {
+    const dir = await open({ directory: true, multiple: false, defaultPath: await wildcardsDir().catch(() => undefined) });
+    if (typeof dir === "string") setWildcardFolder({ enabled: true, dir });
+  }
+
+  // Keep a row id per character; new characters open expanded.
+  useEffect(() => {
+    if (characterKeys.length === characters.length) return;
+    if (characterKeys.length > characters.length) {
+      setCharacterKeys((k) => k.slice(0, characters.length));
+      return;
+    }
+    const fresh = Array.from({ length: characters.length - characterKeys.length }, () => crypto.randomUUID());
+    setCharacterKeys((k) => [...k, ...fresh]);
+    // Opening every new row would bury a long list; open them while it's short.
+    if (characters.length <= 4 || fresh.length === 1) {
+      setExpandedChars((prev) => (oneOpen && fresh.length === 1 ? new Set(fresh) : new Set([...prev, ...fresh])));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [characters.length, characterKeys.length]);
   const [importPlan, setImportPlan] = useState<ImportPlan | null>(null);
   const [dragging, setDragging] = useState(false);
 
   const modelInfo = MODELS.find((m) => m.id === model) ?? MODELS[0];
+  const maxChars = modelInfo.maxCharacters;
   const effectiveSteps = modelInfo.fixedSteps ?? steps;
   const vibesOn = vibes.filter((v) => v.enabled).length;
+  const rotating = vibeRotation.mode !== "fixed";
   // Only vibes already encoded for this model are sent; anything else would
   // need a paid encode. Rust checks this again against the files.
   const vibeRefs: VibeRef[] = modelInfo.vibes
@@ -655,14 +931,46 @@ export default function GenerateTab({
           : [];
       })
     : [];
-  // Prompt file tokens used anywhere in the form, and any that can't be filled.
-  const usedTokens = new Set([prompt, negativePrompt, ...characters, ...characterNegatives].flatMap(tokensIn));
+  // Files added by hand win over a folder file of the same name.
+  const handNames = new Set(promptFiles.map((f) => f.name));
+  const folderNameCounts = new Map<string, number>();
+  folderFiles.forEach((f) => folderNameCounts.set(f.name, (folderNameCounts.get(f.name) ?? 0) + 1));
+  const duplicateNames = [...folderNameCounts].filter(([n, c]) => c > 1 || handNames.has(n)).map(([n]) => n);
+  const allFiles: PromptFile[] = [
+    ...promptFiles,
+    ...folderFiles.filter((f, i) => !handNames.has(f.name) && folderFiles.findIndex((g) => g.name === f.name) === i),
+  ];
+  const engineFiles = new Map<string, EngineFile>(
+    allFiles
+      .filter((f) => f.lines.length > 0)
+      .map((f) => [f.name, { name: f.name, lines: f.lines, parts: f.parts, weights: f.weights, mode: f.mode, position: f.position }]),
+  );
+  const loops = findLoops([...engineFiles.values()]);
+  // Prompt file tokens used anywhere in the form (and inside the files they
+  // use), and any that can't be filled.
+  const formTokens = new Set([prompt, negativePrompt, ...characters, ...characterNegatives].flatMap(tokensIn));
+  const usedTokens = new Set(formTokens);
+  for (let changed = true; changed; ) {
+    changed = false;
+    for (const key of [...usedTokens]) {
+      const f = engineFiles.get(tokenFile(key));
+      if (!f) continue;
+      for (const t of [...f.lines, ...f.parts.flatMap((p) => Object.values(p))].flatMap(tokensIn)) {
+        if (!usedTokens.has(t)) {
+          usedTokens.add(t);
+          changed = true;
+        }
+      }
+    }
+  }
   const usedNames = new Set([...usedTokens].map(tokenFile));
-  const usedFiles = promptFiles.filter((f) => usedNames.has(f.name));
-  const unknownTokens = [...usedTokens].filter((key) => !promptFiles.some((f) => f.name === tokenFile(key)));
-  const missingParts = [...usedTokens].filter((key) => {
+  const usedFiles = allFiles.filter((f) => usedNames.has(f.name));
+  const unknownTokens = [...formTokens].filter(
+    (key) => !allFiles.some((f) => f.name === tokenFile(key)) && !(key === "artists" && artists.enabled),
+  );
+  const missingParts = [...formTokens].filter((key) => {
     const part = tokenPart(key);
-    const file = promptFiles.find((f) => f.name === tokenFile(key));
+    const file = allFiles.find((f) => f.name === tokenFile(key));
     return part !== null && file !== undefined && file.lines.length > 0 && !file.partNames.includes(part);
   });
   const unreadable = usedFiles.filter((f) => f.lines.length === 0);
@@ -690,7 +998,7 @@ export default function GenerateTab({
   // What each token becomes for the next image: the actual next line in
   // sequential mode, a placeholder in random mode.
   const nextValues = Object.fromEntries(
-    promptFiles
+    allFiles
       .filter((f) => f.lines.length > 0)
       .flatMap((f) =>
         f.mode === "sequential"
@@ -836,10 +1144,118 @@ export default function GenerateTab({
     }
   }
 
+  const snapshot = (): PromptSnapshot => ({
+    model,
+    sizeIndex,
+    customWidth,
+    customHeight,
+    prompt,
+    negativePrompt,
+    characters,
+    characterNegatives,
+    useCoords,
+    characterPositions,
+    characterCardLinks: cardLinks,
+    steps,
+    scale,
+    sampler,
+    noiseSchedule,
+    varietyPlus,
+    vibes: vibes.map(({ path, index, strength, informationExtracted, enabled }) => ({ path, index, strength, informationExtracted, enabled })),
+    styleReference,
+    seed: lastResult?.seed ?? null,
+  });
+
+  // A saved prompt goes through the same confirmation as an import.
+  function startLoadSaved(saved: SavedPrompt) {
+    const s = saved.snapshot;
+    const plan = buildImportPlan(
+      {
+        prompt: s.prompt,
+        negativePrompt: s.negativePrompt,
+        characters: s.characters,
+        characterNegatives: s.characterNegatives,
+        characterPositions: s.useCoords ? s.characterPositions : null,
+        width: null,
+        height: null,
+        steps: s.steps,
+        scale: s.scale,
+        seed: s.seed,
+        model: s.model,
+        source: null,
+        sampler: s.sampler,
+        noiseSchedule: s.noiseSchedule,
+        skipCfgAboveSigma: s.varietyPlus ? 1 : null,
+      },
+      model,
+    );
+    plan.applied.unshift({ label: "Saved prompt", value: saved.name });
+    plan.skipped = plan.skipped.filter((x) => !x.startsWith("Seed"));
+    if (s.seed !== null) plan.applied.push({ label: "Seed", value: `${s.seed} (shown in Preview; images still use random seeds unless creep fixes one)` });
+    setShowSavedPrompts(false);
+    setPendingSnapshot(s);
+    setImportPlan(plan);
+  }
+
+  function applySnapshot(s: PromptSnapshot) {
+    setModel(s.model);
+    setSizeIndex(s.sizeIndex);
+    setCustomWidth(s.customWidth);
+    setCustomHeight(s.customHeight);
+    setPrompt(s.prompt);
+    setNegativePrompt(s.negativePrompt);
+    setCharacters(s.characters);
+    setCharacterNegatives(s.characterNegatives);
+    setUseCoords(s.useCoords);
+    setCharacterPositions(s.characterPositions);
+    setCharacterCardLinks(s.characterCardLinks);
+    setCharacterAdvance([]);
+    setSteps(s.steps);
+    setScale(s.scale);
+    setSampler(s.sampler);
+    setNoiseSchedule(s.noiseSchedule);
+    setVarietyPlus(s.varietyPlus);
+    setStyleReference(s.styleReference);
+    if (s.vibes.length > 0) void loadVibeEntries(s.vibes).then(setVibes);
+    else setVibes([]);
+    setPendingSnapshot(null);
+    setImportPlan(null);
+  }
+
+  async function snapshotFromImage(): Promise<PromptSnapshot | null> {
+    const file = await open({ directory: false, multiple: false, filters: [{ name: "PNG image", extensions: ["png"] }] });
+    if (typeof file !== "string") return null;
+    const meta = await readImageMetadata(file);
+    const v = buildImportPlan(meta, model).values;
+    const custom = v.customSize;
+    return {
+      ...snapshot(),
+      model: v.model ?? model,
+      sizeIndex: v.sizeIndex ?? sizeIndex,
+      customWidth: custom?.width ?? customWidth,
+      customHeight: custom?.height ?? customHeight,
+      prompt: v.prompt,
+      negativePrompt: v.negativePrompt,
+      characters: v.characters,
+      characterNegatives: v.characterNegatives,
+      useCoords: v.characterPositions !== null,
+      characterPositions: v.characterPositions ?? v.characters.map(() => CENTER),
+      characterCardLinks: v.characters.map(() => null),
+      steps: v.steps ?? steps,
+      scale: v.scale ?? scale,
+      sampler: v.sampler ?? sampler,
+      noiseSchedule: v.noiseSchedule ?? noiseSchedule,
+      varietyPlus: v.varietyPlus ?? false,
+      vibes: [],
+      styleReference: null,
+      seed: meta.seed !== null && meta.seed <= 0xffff_ffff ? meta.seed : null,
+    };
+  }
+
   async function startImport(path: string) {
     setError(null);
     try {
-      setImportPlan(buildImportPlan(await readImageMetadata(path)));
+      setImportPlan(buildImportPlan(await readImageMetadata(path), model));
     } catch (err) {
       setError(String(err));
     }
@@ -854,7 +1270,7 @@ export default function GenerateTab({
       return;
     }
     setError(null);
-    setImportPlan(buildImportPlan(incoming.settings));
+    setImportPlan(buildImportPlan(incoming.settings, model));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [incoming]);
 
@@ -868,6 +1284,9 @@ export default function GenerateTab({
     }
     if (v.steps !== undefined) setSteps(v.steps);
     if (v.scale !== undefined) setScale(v.scale);
+    if (v.sampler !== undefined) setSampler(v.sampler);
+    if (v.noiseSchedule !== undefined) setNoiseSchedule(v.noiseSchedule);
+    if (v.varietyPlus !== undefined) setVarietyPlus(v.varietyPlus);
     setPrompt(v.prompt);
     setNegativePrompt(v.negativePrompt);
     setCharacters(v.characters);
@@ -928,6 +1347,67 @@ export default function GenerateTab({
     });
   }
 
+  // The vibe library: the chosen folder, else "vibes" in the card folder.
+  const vibeDir = () => vibeLibraryDir ?? (cardFolder ? `${cardFolder}\\vibes` : null);
+
+  async function openVibeLibrary() {
+    const dir = vibeDir();
+    if (!dir) {
+      await chooseVibeLibrary();
+      return;
+    }
+    try {
+      setVibeLibrary(await invoke<string[]>("list_vibe_files", { dir }));
+    } catch {
+      setVibeLibrary([]);
+    }
+  }
+
+  async function chooseVibeLibrary() {
+    const dir = await open({ directory: true, multiple: false });
+    if (typeof dir !== "string") return;
+    setVibeLibraryDir(dir);
+    try {
+      setVibeLibrary(await invoke<string[]>("list_vibe_files", { dir }));
+    } catch {
+      setVibeLibrary([]);
+    }
+  }
+
+  async function startEncode() {
+    const file = await open({
+      directory: false,
+      multiple: false,
+      filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp"] }],
+    });
+    if (typeof file === "string") setEncoding({ path: file, ie: 1, busy: false, error: null });
+  }
+
+  async function runEncode() {
+    if (!encoding) return;
+    const dir = vibeDir() ?? encoding.path.replace(/[\\/][^\\/]*$/, "");
+    setEncoding({ ...encoding, busy: true, error: null });
+    try {
+      const out = await invoke<{ path: string; reused: boolean; anlasWarning: string | null }>("nai_encode_vibe", {
+        runId: crypto.randomUUID(),
+        path: encoding.path,
+        model,
+        informationExtracted: encoding.ie,
+        outDir: dir,
+      });
+      setEncoding(null);
+      await addVibeFiles([out.path]);
+      setBatchNotice(
+        (out.reused ? `This image was already encoded for ${modelInfo.label} at ${encoding.ie}, so the saved file was reused (no Anlas). ` : `Encoded and saved ${fileName(out.path)}. `) +
+          (out.anlasWarning ?? ""),
+      );
+      getAccountStatus().then((s) => s && setStatus(s)).catch(() => {});
+      if (vibeLibrary) void openVibeLibrary();
+    } catch (err) {
+      setEncoding((e) => (e ? { ...e, busy: false, error: String(err) } : e));
+    }
+  }
+
   function updateVibe(key: string, change: Partial<SavedVibe>) {
     setVibes((prev) => prev.map((v) => (v.key === key ? { ...v, ...change } : v)));
   }
@@ -937,9 +1417,62 @@ export default function GenerateTab({
     if (typeof dir === "string") setOutputDir(dir);
   }
 
+  // The references an image sends: the style reference, then each present
+  // carded character's own, up to the limit. None on models without it.
+  const referencesFor = (links: (CardLink | null)[]): PreciseReference[] => {
+    if (!modelInfo.preciseReference) return [];
+    const refs: PreciseReference[] = styleReference ? [styleReference] : [];
+    if (useCardReferences) {
+      for (const l of links) {
+        const r = l?.reference;
+        if (r) refs.push({ path: r.path, kind: r.type, strength: r.strength, fidelity: r.fidelity });
+      }
+    }
+    return refs.slice(0, MAX_PRECISE_REFERENCES);
+  };
+  const formReferences = referencesFor(cardLinks);
+
+  // The cost of one image as the form stands. Prompts don't change the
+  // price, so a request without tokens filled is enough.
+  const sampleRequest = (): GenerateRequest => ({
+    model,
+    prompt,
+    negativePrompt,
+    characters,
+    characterNegatives,
+    characterPositions: useCoords ? characterPositions : null,
+    width: size.width,
+    height: size.height,
+    steps: effectiveSteps,
+    scale,
+    seed: 0,
+    fileStem: "estimate",
+    vibes: rotating ? vibeRefs.slice(0, Math.min(vibeRotation.k, MAX_VIBES)) : vibeRefs,
+    sampler,
+    noiseSchedule,
+    skipCfgAboveSigma: varietyPlus ? varietyPlusSigma(model, size.width, size.height) : null,
+    preciseReferences: formReferences,
+  });
+  const estimateKey = JSON.stringify([model, size, effectiveSteps, vibeRefs.length, vibeRotation.mode, vibeRotation.k, formReferences.length, status?.isOpus, status?.usage?.isNegative]);
+  useEffect(() => {
+    if (phase !== "loggedIn") return;
+    let stale = false;
+    estimateCosts([sampleRequest()], status)
+      .then(([e]) => !stale && setRunEstimate(e ?? null))
+      .catch(() => !stale && setRunEstimate(null));
+    return () => {
+      stale = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [estimateKey, phase]);
+  // Anything not free is confirmed first; a known price (Precise Reference)
+  // keeps the Anlas guard on, expecting that much and no more.
+  const needsConfirm = costsAnlas || (runEstimate !== null && !runEstimate.free);
+  const guardAnlas = !costsAnlas && runEstimate?.anlas !== null;
+
   function requestGenerate() {
     if (!canGenerate || !status) return;
-    if (costsAnlas) setConfirmCost("form");
+    if (needsConfirm) setConfirmCost("form");
     else void runGenerate();
   }
 
@@ -954,7 +1487,7 @@ export default function GenerateTab({
 
   function requestRemix() {
     if (!canRemix || !status) return;
-    if (costsAnlas) setConfirmCost("remix");
+    if (needsConfirm) setConfirmCost("remix");
     else void runGenerate(true);
   }
 
@@ -970,67 +1503,402 @@ export default function GenerateTab({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [remix]);
 
-  async function runGenerate(fromRemix = false) {
-    if (!outputDir) return;
-    const batchStart = new Date();
-    const remixStart = remixQueue?.next ?? 0;
-    // One line per file per image: a token used in several fields gets the
-    // same line in each, so they stay consistent within an image.
-    const files = usedFiles;
-    const picks = files.map((f) => pickLineIndices(f.lines.length, f.mode, f.position, count));
-    // A remix image keeps its own prompt, and its seed and size when the
-    // Remix tab kept them; the model, steps, guidance and vibes are this tab's.
-    const remixRequests: GenerateRequest[] = remixBatch.map((item, i) => {
-      const seed = item.seed ?? randomSeed();
-      return {
-        model,
-        prompt: item.prompt,
-        negativePrompt: item.negativePrompt,
-        characters: item.characters,
-        characterNegatives: item.characterNegatives,
-        characterPositions: item.characterPositions,
-        width: item.size?.width ?? size.width,
-        height: item.size?.height ?? size.height,
-        steps: effectiveSteps,
-        scale,
-        seed,
-        fileStem: fileStemFor(seed, i, batchStart),
-        vibes: vibeRefs,
-      };
+  const engineSettings = (): EngineSettings => ({
+    scramble: automation.scramble,
+    genderSwap: { ...automation.genderSwap, pairs: genderPairs },
+    weightStep: automation.weightStep,
+    associations: automation.useAssociations ? associations : [],
+  });
+
+  /**
+   * Every image of a run, decided up front from `batchSeed`: prompt files,
+   * slot syntax, gender swap, associations, auto-advanced characters, view
+   * tags, random weights and scramble. The preview shows exactly this.
+   */
+  const family = modelFamily(model) as ModelFamily;
+  type BuildOptions = { total: number; setSize: number; perSet: WorkflowPlan["perSet"] };
+  function buildBatch(fromRemix: boolean, seedBase = batchSeed, opts?: BuildOptions) {
+    const setOf = (i: number) => (opts ? Math.floor(i / opts.setSize) : i);
+    const setRng = (i: number, salt: number) => seededRng((seedBase + Math.imul(setOf(i) + 1, 0x27d4eb2f) + salt) >>> 0);
+    const sendSettings = (w: number, h: number) => ({
+      sampler,
+      noiseSchedule,
+      skipCfgAboveSigma: varietyPlus ? varietyPlusSigma(model, w, h) : null,
     });
-    const requests: GenerateRequest[] = fromRemix ? remixRequests : Array.from({ length: count }, (_, i) => {
-      const seed = randomSeed();
-      const entry = Object.fromEntries(files.flatMap((f, k) => entryValues(f, picks[k][i])));
-      const values = present(entry);
-      const scene = fillTokens(prompt, values);
+    const settings = engineSettings();
+    const rows = fromRemix
+      ? remixBatch.map((item) => ({
+          prompt: item.prompt,
+          negative: item.negativePrompt,
+          // The Remix tab keeps up to 22; this model may take fewer.
+          slots: item.characters.slice(0, maxChars).map(
+            (c, j): Slot => ({
+              text: c,
+              negative: item.characterNegatives[j] ?? "",
+              position: item.characterPositions?.[j] ?? CENTER,
+              link: null,
+              present: true,
+            }),
+          ),
+          placed: item.characterPositions !== null,
+          item,
+        }))
+      : Array.from({ length: opts?.total ?? count }, () => ({
+          prompt,
+          negative: negativePrompt,
+          slots: characters.map(
+            (c, j): Slot => ({
+              text: c,
+              negative: characterNegatives[j] ?? "",
+              position: characterPositions[j] ?? CENTER,
+              link: cardLinks[j],
+              present: true,
+            }),
+          ),
+          placed: useCoords,
+          item: null,
+        }));
+    const usedFiles = new Set<string>();
+    // "Next card with label" associations count through the batch.
+    const assocNext = new Map<string, number>();
+    // A step creep set to "stop" ends the batch at the first image past its end.
+    let stopAt = rows.length;
+    const creepRng = (i: number) => seededRng((seedBase ^ Math.imul(i + 1, 0xc2b2ae35)) >>> 0);
+    const creepFor = (i: number, w: number, h: number) => {
+      if (!creep.enabled) return null;
+      const r = creepRng(i);
+      const st = modelInfo.fixedSteps !== undefined
+        ? { value: effectiveSteps, stop: false, capped: false }
+        : numberAt(creep.steps, i, r, effectiveSteps, { min: 1, max: MAX_STEPS, decimals: 0 });
+      const gd = numberAt(creep.guidance, i, r, scale, { min: 0, max: MAX_SCALE, decimals: 1 });
+      const sg = varietyPlus
+        ? numberAt(creep.sigma, i, r, varietyPlusSigma(model, w, h), { min: 0, max: 1000, decimals: 2 })
+        : null;
+      if (st.stop || gd.stop || sg?.stop) stopAt = Math.min(stopAt, i);
       return {
-        model,
-        prompt: scene,
-        negativePrompt: fillTokens(negativePrompt, values),
-        characters: characters.map((c, j) => {
-          if (missingPart(c, entry)) return "";
-          const filled = fillTokens(c, values);
-          const link = cardLinks[j];
-          return link ? adaptCardCharacter(filled, link, scene).text : filled;
-        }),
-        characterNegatives: characterNegatives.map((c) => fillTokens(c, values)),
-        characterPositions: useCoords ? characterPositions : null,
-        width: size.width,
-        height: size.height,
-        steps: effectiveSteps,
-        scale,
-        seed,
-        fileStem: fileStemFor(seed, i, batchStart),
-        vibes: vibeRefs,
-        sourceImage: sourceImage ? { path: sourceImage.path, strength: img2imgStrength } : null,
+        steps: st.value,
+        scale: gd.value,
+        sigma: sg ? sg.value : null,
+        sampler: listAt(creep.sampler, i, r) ?? sampler,
+        noiseSchedule: listAt(creep.schedule, i, r) ?? noiseSchedule,
       };
+    };
+    const images: PreviewImage[] = rows.map((row, i) => {
+      const rng = imageRng(seedBase, i);
+      const batchRandom = Math.floor(seededRng((seedBase ^ Math.imul(i + 1, 0x85ebca6b)) >>> 0)() * 0x1_0000_0000);
+      const seed = row.item?.seed ?? (creep.enabled ? seedAt(creep.seed, i, batchRandom) : batchRandom);
+      const slots = row.slots.map((s, j): Slot => {
+        const own = fromRemix ? null : advanceOf(j);
+        if (!own || own.mode === "fixed") return s;
+        // In a plan, a character can move on once per set.
+        const adv = opts?.perSet.characters ? { ...own, every: opts.setSize } : own;
+        const pool = poolCards(cards, adv.pool);
+        const key = poolKey(adv.pool, adv.mode);
+        const st = poolStates[key] ?? { position: 0, seed: 1 };
+        const file = cardForImage(adv, pool, st, i, (g) => seededRng((seedBase + Math.imul(g + 1, 104729) + j * 31) >>> 0));
+        if (!file) return s;
+        const link = linkOf(file);
+        return { ...s, text: link.tags.map((t) => t.text).join(", "), negative: file.card.negative, link };
+      });
+      const pickCard = (choice: CardChoice): CardLink | null => {
+        if (choice.mode === "named") {
+          const f = cards.find((c) => c.card.name.toLowerCase() === choice.name.toLowerCase());
+          return f ? linkOf(f) : null;
+        }
+        const pool = poolCards(cards, { include: choice.label, exclude: "", matchAll: false, gender: null });
+        if (pool.length === 0) return null;
+        if (choice.mode === "random") return linkOf(pool[Math.floor(rng() * pool.length)]);
+        const key = `assoc-next:${choice.label.toLowerCase()}`;
+        const k = assocNext.get(key) ?? 0;
+        assocNext.set(key, k + 1);
+        return linkOf(pool[((poolStates[key]?.position ?? 0) + k) % pool.length]);
+      };
+      const artistLine = fromRemix
+        ? ""
+        : opts?.perSet.artists
+          ? artistsForImage({ ...artists, every: 1 }, family, setOf(i), setRng(i, 11), poolStates["artists-next"]?.position ?? 0)
+          : artistsForImage(artists, family, i, rng, poolStates["artists-next"]?.position ?? 0);
+      const res = buildImage(
+        { prompt: fromRemix ? row.prompt : insertArtists(row.prompt, artistLine), negative: row.negative, slots },
+        {
+          index: i,
+          rng,
+          files: engineFiles,
+          maxSlots: maxChars,
+          settings,
+          pickCard,
+          ...(opts?.perSet.files ? { fileIndex: setOf(i), fileRng: setRng(i, 23) } : {}),
+        },
+      );
+      res.usedFiles.forEach((f) => usedFiles.add(f));
+      const w = row.item?.size?.width ?? size.width;
+      const h = row.item?.size?.height ?? size.height;
+      const cv = creepFor(i, w, h);
+      const request: GenerateRequest = {
+        ...sendSettings(w, h),
+        ...(cv ? { sampler: cv.sampler, noiseSchedule: cv.noiseSchedule, skipCfgAboveSigma: cv.sigma } : {}),
+        model,
+        prompt: res.prompt,
+        negativePrompt: res.negative,
+        characters: res.slots.map((s) => (s.present ? s.text : "")),
+        characterNegatives: res.slots.map((s) => (s.present ? s.negative : "")),
+        characterPositions: row.placed ? res.slots.map((s) => s.position) : null,
+        width: w,
+        height: h,
+        steps: cv?.steps ?? effectiveSteps,
+        scale: cv?.scale ?? scale,
+        seed,
+        fileStem: "",
+        vibes: vibeRefs,
+        sourceImage: !fromRemix && sourceImage ? { path: sourceImage.path, strength: img2imgStrength } : null,
+      };
+      // Rotating vibes: K of the ticked ones per image, random or in turn.
+      if (rotating && vibeRefs.length > 0) {
+        const k = Math.min(vibeRotation.k, MAX_VIBES, vibeRefs.length);
+        if (vibeRotation.mode === "random") {
+          const pool = [...vibeRefs];
+          const vr = opts?.perSet.vibes ? setRng(i, 37) : rng;
+          request.vibes = Array.from({ length: k }, () => pool.splice(Math.floor(vr() * pool.length), 1)[0]);
+        } else {
+          const group = opts?.perSet.vibes ? setOf(i) : Math.floor(i / Math.max(1, vibeRotation.every));
+          const start = ((poolStates["vibes-next"]?.position ?? 0) + group * k) % vibeRefs.length;
+          request.vibes = Array.from({ length: k }, (_, n) => vibeRefs[(start + n) % vibeRefs.length]);
+        }
+      } else request.vibes = vibeRefs.slice(0, MAX_VIBES);
+      const refs = referencesFor(res.slots.map((s) => (s.present ? s.link : null)));
+      if (refs.length > 0) {
+        // NovelAI won't take both; references win, and the card says so.
+        request.preciseReferences = refs;
+        request.vibes = [];
+      }
+      return { request, log: res.log, warnings: res.warnings, cardNames: res.slots.map((s) => s.link?.name ?? null) };
+    });
+    return { images: images.slice(0, stopAt), usedFiles, assocNext, stopped: stopAt < rows.length };
+  }
+
+  function showPreview(seedBase = batchSeed) {
+    try {
+      setPreviewImages(buildBatch(remixQueue !== null && remixBatch.length > 0, seedBase).images);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  /**
+   * After images were made: sequential files, character pools, artists,
+   * vibes and "next card" associations carry on from where they stopped.
+   * In a plan, things that moved once per set move by the sets made.
+   */
+  function advanceAfter(
+    usedFiles: Set<string>,
+    made: number,
+    planned: number,
+    assocNext: Map<string, number>,
+    advancing: { adv: SlotAdvance; key: string }[],
+    plan: { setSize: number; perSet: WorkflowPlan["perSet"] } | null,
+  ) {
+    const sets = plan ? Math.ceil(made / plan.setSize) : made;
+    const fileSteps = plan?.perSet.files ? sets : made;
+    const advanced = new Map(
+      allFiles
+        .filter((f) => f.mode === "sequential" && usedFiles.has(f.name) && f.lines.length > 0)
+        .map((f) => [f.path, (f.position + fileSteps) % f.lines.length]),
+    );
+    advanced.forEach((next, path) => void savePosition(path, next));
+    const move = (prev: PromptFile[]) => prev.map((f) => (advanced.has(f.path) ? { ...f, position: advanced.get(f.path)! } : f));
+    setPromptFiles(move);
+    setFolderFiles(move);
+    const states = { ...poolStates };
+    for (const { adv, key } of advancing) {
+      const a = plan?.perSet.characters ? { ...adv, every: plan.setSize } : adv;
+      states[key] = advancedState(a, states[key] ?? { position: 0, seed: randomSeed() }, made);
+    }
+    if (vibeRotation.mode === "next" && vibeRefs.length > 0) {
+      const st = states["vibes-next"] ?? { position: 0, seed: 1 };
+      const k = Math.min(vibeRotation.k, MAX_VIBES, vibeRefs.length);
+      const groups = plan?.perSet.vibes ? sets : Math.ceil(made / Math.max(1, vibeRotation.every));
+      states["vibes-next"] = { ...st, position: st.position + k * groups };
+    }
+    if (artists.enabled && artists.mode === "next" && usableArtists(artists, family).length > 0) {
+      const st = states["artists-next"] ?? { position: 0, seed: 1 };
+      const groups = plan?.perSet.artists ? sets : Math.ceil(made / Math.max(1, artists.every));
+      states["artists-next"] = { ...st, position: st.position + groups };
+    }
+    assocNext.forEach((k, key) => {
+      // Only the images actually made moved the association on.
+      const share = Math.round((k * made) / Math.max(1, planned));
+      states[key] = { position: (states[key]?.position ?? 0) + share, seed: 1 };
+    });
+    setPoolStates(states);
+    void generateStore.set("poolStates", states).catch(() => {});
+  }
+
+  // ---- Workflow plans ----
+
+  const advancingNow = () =>
+    characters.flatMap((_, j) => {
+      const adv = advanceOf(j);
+      return adv && adv.mode !== "fixed" ? [{ adv, key: poolKey(adv.pool, adv.mode) }] : [];
     });
 
+  /** Builds the whole plan up front and asks before the first part runs. */
+  function startPlan() {
+    if (!outputDir || !canGenerate) return;
+    const p = workflow;
+    let built: ReturnType<typeof buildBatch>;
+    try {
+      built = buildBatch(false, batchSeed, { total: p.loops * p.sets, setSize: p.loops, perSet: p.perSet });
+    } catch (err) {
+      setError(String(err));
+      return;
+    }
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}-${pad(now.getMinutes())}`;
+    const clean = (t: string) => t.replace(/[\\/:*?"<>|]+/g, "").trim().slice(0, 60) || "untitled";
+    const base = p.subfolders === "none" ? outputDir : `${outputDir}\\${clean(p.name || "Plan")} ${stamp}`;
+    const dirs = built.images.map((img, i) =>
+      p.subfolders === "set"
+        ? `${base}\\set ${pad(Math.floor(i / p.loops) + 1)}`
+        : p.subfolders === "character"
+          ? `${base}\\${clean(img.cardNames.find((n) => n) ?? "no card")}`
+          : base,
+    );
+    setPlanRun({ images: built.images, dirs, done: 0, plan: p, usedFiles: built.usedFiles, advancing: advancingNow() });
+    setPlanConfirm({ start: true });
+  }
+
+  /** Runs the next part of the plan: at most 25 requests (10 upscales). */
+  async function runPlanChunk() {
+    setPlanConfirm(null);
+    if (!planRun) return;
+    const { plan, images, dirs } = planRun;
+    const start = planRun.done;
+    const end = Math.min(images.length, start + chunkImages(plan));
+    const batchStart = new Date();
     const runId = crypto.randomUUID();
     runIdRef.current = runId;
     setGenerating(true);
     setError(null);
     setBatchNotice(null);
+    setBatchImages([]);
+    setProgress({ done: 0, total: end - start });
+    let made = 0;
+    let stop: string | null = null;
+    const show = (path: string, seed: number) => {
+      const shown = { path, seed, src: convertFileSrc(path) };
+      setLastResult(shown);
+      setBatchImages((prev) => [...prev, shown]);
+    };
+    try {
+      // Generate, one folder at a time.
+      const made_: { path: string; seed: number; dir: string }[] = [];
+      for (let a = start; a < end && !stop; ) {
+        let b = a;
+        while (b < end && dirs[b] === dirs[a]) b++;
+        const requests = images.slice(a, b).map((img, k) => ({ ...img.request, fileStem: fileStemFor(img.request.seed, a + k, batchStart) }));
+        const summary = await generateBatch(runId, requests, dirs[a], guardAnlas, (p) => {
+          if (p.account) setStatus(p.account);
+          if (p.image) {
+            setProgress((pr) => (pr ? { ...pr, done: Math.min(pr.total, made_.length + 1) } : pr));
+            show(p.image.path, p.image.seed);
+          }
+        });
+        summary.images.forEach((im) => made_.push({ ...im, dir: dirs[a] }));
+        if (summary.stoppedReason) stop = summary.stoppedReason;
+        else if (summary.cancelled) stop = "Cancelled.";
+        a = b;
+      }
+      made = made_.length;
+      // Then each image's steps, each on the previous step's result.
+      for (const im of made_) {
+        let path = im.path;
+        for (const step of plan.steps) {
+          if (stop || runIdRef.current !== runId) break;
+          if (step.kind === "emotion" || step.kind === "colorize") {
+            const out = await runDirector(
+              crypto.randomUUID(),
+              { path, tool: step.kind, emotion: step.kind === "emotion" ? step.emotion : "", prompt: step.prompt, defry: step.defry, area: null },
+              im.dir,
+              !!status?.isOpus,
+            );
+            if (out.anlasWarning) stop = out.anlasWarning;
+            path = out.path;
+          } else if (step.kind === "upscale") {
+            const up = await upscaleBatch(crypto.randomUUID(), [path], im.dir);
+            if (up.stoppedReason) stop = up.stoppedReason;
+            if (up.images[0]) path = up.images[0].path;
+          } else {
+            await invoke("strip_metadata_files", { paths: [path] });
+          }
+          show(path, im.seed);
+        }
+      }
+    } catch (err) {
+      stop = String(err);
+    } finally {
+      if (runIdRef.current === runId) {
+        runIdRef.current = null;
+        setGenerating(false);
+        setProgress(null);
+      }
+    }
+    const done = start + made;
+    const finished = done >= images.length || stop !== null;
+    if (made > 0) {
+      advanceAfter(planRun.usedFiles, made, images.length, new Map(), planRun.advancing, { setSize: plan.loops, perSet: plan.perSet });
+    }
+    setPlanRun(finished ? null : { ...planRun, done });
+    setBatchNotice(
+      stop
+        ? `The plan stopped after ${done} of ${images.length} images. ${stop}`
+        : finished
+          ? `The plan is done: ${images.length} image${images.length === 1 ? "" : "s"} in ${dirs[0].replace(/\\set \d+$/, "")}.`
+          : `${done} of ${images.length} done. Press Continue for the next part.`,
+    );
+    if (finished) setBatchSeed(randomSeed());
+    getAccountStatus().then((s) => s && setStatus(s)).catch(() => {});
+  }
+
+  async function runGenerate(fromRemix = false) {
+    if (!outputDir) return;
+    const batchStart = new Date();
+    const remixStart = remixQueue?.next ?? 0;
+    let built: ReturnType<typeof buildBatch>;
+    try {
+      built = buildBatch(fromRemix);
+    } catch (err) {
+      setError(String(err));
+      return;
+    }
+    if (built.images.length === 0) {
+      setError("Parameter creep stops before the first image; check its range.");
+      return;
+    }
+    const requests: GenerateRequest[] = built.images.map((img, i) => ({
+      ...img.request,
+      fileStem: fileStemFor(img.request.seed, i, batchStart),
+    }));
+    const advancing = fromRemix
+      ? []
+      : characters.flatMap((_, j) => {
+          const adv = advanceOf(j);
+          return adv && adv.mode !== "fixed" ? [{ adv, key: poolKey(adv.pool, adv.mode) }] : [];
+        });
+
+    // Characters a model switch set aside are let go once something is made.
+    setStashedChars(null);
+    const runId = crypto.randomUUID();
+    runIdRef.current = runId;
+    setGenerating(true);
+    setError(null);
+    setBatchNotice(
+      fromRemix && remixBatch.some((item) => item.characters.length > maxChars)
+        ? `${modelFamily(model)} takes ${maxChars} characters, so images with more use only their first ${maxChars}.`
+        : built.stopped
+          ? `Parameter creep reached the end of its range, so this batch is ${requests.length} image${requests.length === 1 ? "" : "s"}.`
+          : null,
+    );
     setBatchImages([]);
     setProgress({ done: 0, total: requests.length });
     try {
@@ -1038,10 +1906,11 @@ export default function GenerateTab({
         runId,
         requests,
         outputDir,
-        // Only guard when every image should be free; otherwise the user has
-        // already confirmed the spend.
-        !costsAnlas,
+        // Guard whenever the cost is known (free, or a fixed price); otherwise
+        // the user has already confirmed an open-ended spend.
+        guardAnlas,
         (p) => {
+          if (p.account) setStatus(p.account);
           setProgress({ done: p.done, total: p.total });
           if (p.image) {
             const shown = { ...p.image, src: convertFileSrc(p.image.path) };
@@ -1061,12 +1930,9 @@ export default function GenerateTab({
           return next >= q.items.length ? null : { ...q, next };
         });
       } else if (made > 0) {
-        const advanced = new Map(
-          files.filter((f) => f.mode === "sequential").map((f) => [f.path, (f.position + made) % f.lines.length]),
-        );
-        advanced.forEach((next, path) => void savePosition(path, next));
-        setPromptFiles((prev) => prev.map((f) => (advanced.has(f.path) ? { ...f, position: advanced.get(f.path)! } : f)));
+        advanceAfter(built.usedFiles, made, requests.length, built.assocNext, advancing, null);
       }
+      setBatchSeed(randomSeed());
       if (summary.stoppedReason) {
         setBatchNotice(
           `Stopped after ${made} of ${requests.length}. ${summary.stoppedReason}`,
@@ -1117,6 +1983,85 @@ export default function GenerateTab({
 
   function updatePromptFile(path: string, change: Partial<PromptFile>) {
     setPromptFiles((prev) => prev.map((f) => (f.path === path ? { ...f, ...change } : f)));
+    setFolderFiles((prev) => prev.map((f) => (f.path === path ? { ...f, ...change } : f)));
+    if (change.mode && folderFiles.some((f) => f.path === path)) {
+      setFolderModes((m) => {
+        const next = { ...m };
+        if (change.mode === "sequential") next[path] = "sequential";
+        else delete next[path];
+        return next;
+      });
+    }
+  }
+
+  async function editFile(f: PromptFile) {
+    try {
+      setEditingFile({ file: f, raw: await readPromptFile(f.path) });
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function reloadFile(f: PromptFile) {
+    const fresh = await openPromptFile(f.path, f.name, f.mode);
+    const put = (prev: PromptFile[]) => prev.map((x) => (x.path === f.path ? { ...fresh, fromFolder: x.fromFolder } : x));
+    setPromptFiles(put);
+    setFolderFiles(put);
+  }
+
+  // Gender swap, written into the form (with Undo) instead of only per batch.
+  // A carded character's opposite-gender variant: a card with the same name
+  // and the other gender, or one labelled "variant-of:<name>".
+  function variantFor(link: CardLink | null): CardFile | null {
+    if (!link?.gender || link.gender === "other") return null;
+    const want = link.gender === "female" ? "male" : "female";
+    const name = link.name.toLowerCase();
+    return (
+      cards.find(
+        (c) =>
+          c.card.gender === want &&
+          (c.card.name.toLowerCase() === name || c.card.labels.includes(`variant-of:${name}`) ||
+            (link.labels ?? []).includes(`variant-of:${c.card.name.toLowerCase()}`)),
+      ) ?? null
+    );
+  }
+
+  function applySwapToForm() {
+    const gs = { ...automation.genderSwap, pairs: genderPairs };
+    setSwapUndo({ prompt, negative: negativePrompt, characters, negatives: characterNegatives });
+    const inScope = (j: number) => gs.mode !== "slot" || j === gs.slot - 1;
+    // A carded character with a variant card loads that card instead of
+    // having its tags rewritten.
+    const variants = characters.map((_, j) => (inScope(j) ? variantFor(cardLinks[j]) : null));
+    const swapChar = (c: string, j: number) => {
+      const v = variants[j];
+      return v ? v.card.tags.map((t) => t.text).join(", ") : inScope(j) ? swapGender(c, gs) : c;
+    };
+    const swapNeg = (c: string, j: number) => {
+      const v = variants[j];
+      return v ? v.card.negative : inScope(j) ? swapGender(c, gs) : c;
+    };
+    if (gs.mode !== "slot") {
+      setPrompt(swapGender(prompt, gs));
+      setNegativePrompt(swapGender(negativePrompt, gs));
+    }
+    setCharacters((prev) => prev.map(swapChar));
+    setCharacterNegatives((prev) => prev.map(swapNeg));
+    if (variants.some(Boolean)) {
+      setCharacterCardLinks(cardLinks.map((l, j) => (variants[j] ? linkFor(variants[j]!.card, variants[j]!.path) : l)));
+      setBatchNotice(`Loaded the variant card${variants.filter(Boolean).length === 1 ? "" : "s"} ${variants.filter(Boolean).map((v) => v!.card.name).join(", ")} instead of rewriting their tags.`);
+    }
+    // The form now says it, so the batch shouldn't swap it back.
+    setAutomation((a) => ({ ...a, genderSwap: { ...a.genderSwap, mode: "off" } }));
+  }
+
+  function undoSwap() {
+    if (!swapUndo) return;
+    setPrompt(swapUndo.prompt);
+    setNegativePrompt(swapUndo.negative);
+    setCharacters(swapUndo.characters);
+    setCharacterNegatives(swapUndo.negatives);
+    setSwapUndo(null);
   }
 
   // `line` is 1-based, as shown; out-of-range or non-numbers are ignored.
@@ -1154,7 +2099,7 @@ export default function GenerateTab({
       let i = chars.findIndex((c) => firstTag(c) === part && !usesFile(c));
       if (i < 0) i = chars.findIndex((c) => c.trim() === "");
       if (i < 0) {
-        if (chars.length >= MAX_CHARACTERS) {
+        if (chars.length >= maxChars) {
           noRoom.push(part);
           continue;
         }
@@ -1170,7 +2115,7 @@ export default function GenerateTab({
     setCharacterPositions(positions);
     if (noRoom.length > 0) {
       setError(
-        `There's room for ${MAX_CHARACTERS} characters, so ${noRoom.map((p) => tokenFor(f.name, p)).join(", ")} wasn't placed. Put it in a character yourself.`,
+        `There's room for ${maxChars} characters, so ${noRoom.map((p) => tokenFor(f.name, p)).join(", ")} wasn't placed. Put it in a character yourself.`,
       );
     }
   }
@@ -1218,7 +2163,7 @@ export default function GenerateTab({
     setShowCardDialog(false);
     const index = slot ?? characters.length;
     if (slot === null) {
-      if (characters.length >= MAX_CHARACTERS) return;
+      if (characters.length >= maxChars) return;
       setCharacters((prev) => [...prev, prompt]);
       setCharacterNegatives((prev) => [...prev, negative]);
       setCharacterPositions((prev) => [...prev, CENTER]);
@@ -1227,6 +2172,18 @@ export default function GenerateTab({
       setCharacterNegatives((prev) => prev.map((c, j) => (j === slot ? negative : c)));
     }
     setCharacterCardLinks(characters.map((_, i) => cardLinks[i]).concat([null]).map((l, i) => (i === index ? link : l)));
+  }
+
+  function loadManyCards(items: { prompt: string; negative: string; link: CardLink }[]) {
+    setShowCardDialog(false);
+    const room = Math.max(0, maxChars - characters.length);
+    const take = items.slice(0, room);
+    if (take.length === 0) return;
+    setCharacters((prev) => [...prev, ...take.map((t) => t.prompt)]);
+    setCharacterNegatives((prev) => [...prev, ...take.map((t) => t.negative)]);
+    setCharacterPositions((prev) => [...prev, ...take.map(() => CENTER)]);
+    setCharacterCardLinks([...characters.map((_, i) => cardLinks[i]), ...take.map((t) => t.link)]);
+    if (items.length > room) setError(`There's room for ${room} more character${room === 1 ? "" : "s"}, so only the first ${room} were added.`);
   }
 
   function unlinkCard(index: number) {
@@ -1244,7 +2201,92 @@ export default function GenerateTab({
     setCharacterNegatives((prev) => prev.filter((_, j) => j !== index));
     setCharacterPositions((prev) => prev.filter((_, j) => j !== index));
     setCharacterCardLinks(cardLinks.filter((_, j) => j !== index));
+    setCharacterAdvance(characters.map((_, i) => advanceOf(i)).filter((_, j) => j !== index));
+    setCharacterKeys((prev) => prev.filter((_, j) => j !== index));
     if (typeof lastFieldRef.current?.field === "object") lastFieldRef.current = null;
+  }
+
+  // Applies the same reordering (new index -> old index) to every per-character list.
+  function permuteCharacters(order: number[]) {
+    const pick = <T,>(list: T[], fill: T) => order.map((i) => list[i] ?? fill);
+    setCharacters((prev) => pick(prev, ""));
+    setCharacterNegatives((prev) => pick(prev, ""));
+    setCharacterPositions((prev) => pick(prev, CENTER));
+    setCharacterCardLinks(pick(cardLinks, null));
+    setCharacterAdvance(pick(characters.map((_, i) => advanceOf(i)), null));
+    setCharacterKeys((prev) => pick(prev, ""));
+    if (typeof lastFieldRef.current?.field === "object") lastFieldRef.current = null;
+  }
+
+  function moveCharacter(from: number, to: number) {
+    const order = characters.map((_, i) => i);
+    const [moved] = order.splice(from, 1);
+    order.splice(to, 0, moved);
+    permuteCharacters(order);
+  }
+
+  function toggleExpanded(key: string) {
+    setExpandedChars((prev) => {
+      if (prev.has(key)) {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      }
+      return oneOpen ? new Set([key]) : new Set([...prev, key]);
+    });
+  }
+
+  // Switching models: one that takes fewer characters asks first.
+  function chooseModel(next: string) {
+    const max = MODELS.find((m) => m.id === next)?.maxCharacters ?? 6;
+    if (characters.length > max) {
+      setModelSwitch({ to: next, choosing: false, keep: new Set(characters.map((_, i) => i).slice(0, max)) });
+      return;
+    }
+    setModel(next);
+    // Characters an earlier switch set aside come back when there's room.
+    if (stashedChars && stashedChars.from === next) restoreStash(max);
+  }
+
+  function applyModelSwitch(keep: Set<number>) {
+    if (!modelSwitch) return;
+    const kept = characters.map((_, i) => i).filter((i) => keep.has(i));
+    const removed = characters.map((_, i) => i).filter((i) => !keep.has(i));
+    setStashedChars({
+      from: model,
+      items: removed.map((i) => ({
+        index: i,
+        text: characters[i],
+        negative: characterNegatives[i] ?? "",
+        position: characterPositions[i] ?? CENTER,
+        link: cardLinks[i],
+      })),
+    });
+    permuteCharacters(kept);
+    setModel(modelSwitch.to);
+    setModelSwitch(null);
+  }
+
+  function restoreStash(max: number) {
+    if (!stashedChars) return;
+    const rows = characters.map((text, i) => ({
+      text,
+      negative: characterNegatives[i] ?? "",
+      position: characterPositions[i] ?? CENTER,
+      link: cardLinks[i],
+      key: characterKeys[i] ?? crypto.randomUUID(),
+    }));
+    // Put each back where it was, as far as the list allows.
+    for (const item of [...stashedChars.items].sort((a, b) => a.index - b.index)) {
+      if (rows.length >= max) break;
+      rows.splice(Math.min(item.index, rows.length), 0, { ...item, key: crypto.randomUUID() });
+    }
+    setCharacters(rows.map((r) => r.text));
+    setCharacterNegatives(rows.map((r) => r.negative));
+    setCharacterPositions(rows.map((r) => r.position));
+    setCharacterCardLinks(rows.map((r) => r.link));
+    setCharacterKeys(rows.map((r) => r.key));
+    setStashedChars(null);
   }
 
   function cancelGenerate() {
@@ -1259,6 +2301,17 @@ export default function GenerateTab({
     void refreshStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
+
+  // While the tab is showing, keep the balance and quota current.
+  useEffect(() => {
+    if (!active || phase !== "loggedIn" || generating) return;
+    const timer = setInterval(() => {
+      getAccountStatus()
+        .then((s) => s && setStatus(s))
+        .catch(() => {});
+    }, 60_000);
+    return () => clearInterval(timer);
+  }, [active, phase, generating]);
 
   async function refreshStatus() {
     setPhase((p) => (p === "loggedIn" ? p : "checking"));
@@ -1334,6 +2387,26 @@ export default function GenerateTab({
           style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, whiteSpace: "nowrap" }}
         >
           Show in Explorer
+        </a>{" "}
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            setDirector({ path: lastResult.path, tool: "emotion" });
+          }}
+          style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, whiteSpace: "nowrap" }}
+        >
+          Change expression…
+        </a>{" "}
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            setDirector({ path: lastResult.path, tool: "colorize" });
+          }}
+          style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, whiteSpace: "nowrap" }}
+        >
+          Colorize…
         </a>
       </div>
       {batchImages.length > 1 && (
@@ -1379,6 +2452,19 @@ export default function GenerateTab({
         >
           Import from image…
         </a>
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            if (generating) return;
+            if (!cardFolder) setError("Choose a card folder in the Character Cards tab first; saved prompts are kept there.");
+            else setShowSavedPrompts(true);
+          }}
+          title="Save the form under a name, or load one you saved"
+          style={{ fontSize: 13, fontWeight: 600, marginLeft: 14 }}
+        >
+          Saved prompts…
+        </a>
       </div>
       <div style={{ display: "flex", gap: "14px 28px", flexWrap: "wrap", alignItems: "flex-start" }}>
         <div style={{ flex: "1 1 520px", minWidth: 0 }}>
@@ -1387,7 +2473,7 @@ export default function GenerateTab({
               <Field label="Model">
                 <select
                   value={model}
-                  onChange={(e) => setModel(e.target.value)}
+                  onChange={(e) => chooseModel(e.target.value)}
                   disabled={generating}
                   style={{ ...inputStyle, background: "var(--bg-page)" }}
                 >
@@ -1525,6 +2611,59 @@ export default function GenerateTab({
               </Field>
             </div>
           </div>
+          <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "flex-end", marginTop: 12 }}>
+            <Field label="Sampler">
+              <select
+                value={sampler}
+                onChange={(e) => setSampler(e.target.value)}
+                disabled={generating}
+                style={{ ...inputStyle, background: "var(--bg-page)", padding: "5px 8px" }}
+              >
+                {SAMPLERS.map((x) => (
+                  <option key={x.id} value={x.id}>
+                    {x.label}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field label="Noise schedule">
+              <select
+                value={noiseSchedule}
+                onChange={(e) => setNoiseSchedule(e.target.value)}
+                disabled={generating}
+                style={{ ...inputStyle, background: "var(--bg-page)", padding: "5px 8px" }}
+              >
+                {NOISE_SCHEDULES.map((x) => (
+                  <option key={x.id} value={x.id}>
+                    {x.label}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, fontWeight: 600, paddingBottom: 6 }}>
+              <input
+                type="checkbox"
+                checked={varietyPlus}
+                onChange={(e) => setVarietyPlus(e.target.checked)}
+                disabled={generating}
+                style={{ accentColor: "var(--accent)" }}
+              />
+              Variety+
+              <HelpTip
+                title="Variety+"
+                lines={[
+                  {
+                    text: "Skips guidance in the first, noisiest steps, so images vary more in composition. Free.",
+                  },
+                  {
+                    text: VARIETY_PLUS_VERIFIED
+                      ? `Sends skip_cfg_above_sigma ${varietyPlusSigma(model, size.width, size.height).toFixed(2)} at this size.`
+                      : `Sends skip_cfg_above_sigma ${varietyPlusSigma(model, size.width, size.height).toFixed(2)} at this size (matches a V4.5 image made on novelai.net, 58 at 832×1216; other sizes scale by NovelAI's rule, and V5 isn't checked yet).`,
+                  },
+                ]}
+              />
+            </label>
+          </div>
         </div>
       </div>
     </div>
@@ -1532,7 +2671,7 @@ export default function GenerateTab({
 
   const promptCard = (
     <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 14 }}>
-      <Field label="Prompt">
+      <Field label="Prompt" help={<HelpTip title="Prompt syntax" lines={helpFor("prompt")} />}>
         <GrowingTextarea
           minRows={wide ? 9 : 6}
           maxHeight={560}
@@ -1545,7 +2684,7 @@ export default function GenerateTab({
         />
         {preview(prompt)}
       </Field>
-      <Field label="Undesired content">
+      <Field label="Undesired content" help={<HelpTip title="Undesired content syntax" lines={helpFor("negative")} />}>
         <GrowingTextarea
           minRows={wide ? 5 : 3}
           maxHeight={360}
@@ -1561,11 +2700,165 @@ export default function GenerateTab({
     </div>
   );
 
+  const slots: SlotSummary[] = characters.map((c, i) => ({
+    key: characterKeys[i] ?? String(i),
+    text: c,
+    negative: characterNegatives[i] ?? "",
+    position: characterPositions[i] ?? CENTER,
+    cardName: advanceOf(i) ? `${{ next: "Next", random: "Random", shuffle: "Shuffle" }[advanceOf(i)!.mode as "next"]} card` : (cardLinks[i]?.name ?? null),
+    hasReference: !!cardLinks[i]?.reference,
+  }));
+  const tokensUsed = [prompt, ...characters].reduce((n, t) => n + roughTokens(t), 0);
+  const tokenMax = tokenLimit(model);
+  const setAdvance = (i: number, a: SlotAdvance | null) =>
+    setCharacterAdvance(characters.map((_, j) => (j === i ? a : advanceOf(j))));
+  const advanceRow = (i: number) => {
+    const a = advanceOf(i);
+    const mode = a?.mode ?? "fixed";
+    const pool = a ? poolCards(cards, a.pool) : [];
+    const sel: React.CSSProperties = { ...inputStyle, padding: "3px 6px", fontSize: 12, background: "var(--bg-page)" };
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 12 }}>
+        <span style={{ fontWeight: 600, color: "var(--muted)" }}>
+          Auto-advance
+          <HelpTip
+            lines={[
+              { text: "Fixed keeps this prompt. Next, Random or Shuffle (no repeats until every card is used) puts a card from a pool in this slot, a new one every N images." },
+              { text: "Pools are your character cards filtered by label (set labels in the Character Cards tab). The pool's place is saved, so the next batch carries on." },
+            ]}
+          />
+        </span>
+        <select
+          value={mode}
+          disabled={generating}
+          onChange={(e) => {
+            const m = e.target.value as SlotAdvance["mode"];
+            setAdvance(i, m === "fixed" ? null : { ...(a ?? DEFAULT_ADVANCE), mode: m });
+          }}
+          style={sel}
+        >
+          <option value="fixed">Fixed</option>
+          <option value="next">Next card</option>
+          <option value="random">Random card</option>
+          <option value="shuffle">Shuffle cards</option>
+        </select>
+        {a && (
+          <>
+            <input
+              value={a.pool.include}
+              disabled={generating}
+              placeholder="labels (any card)"
+              onChange={(e) => setAdvance(i, { ...a, pool: { ...a.pool, include: e.target.value } })}
+              style={{ ...sel, width: 120 }}
+            />
+            <select
+              value={a.pool.matchAll ? "all" : "any"}
+              disabled={generating}
+              onChange={(e) => setAdvance(i, { ...a, pool: { ...a.pool, matchAll: e.target.value === "all" } })}
+              style={sel}
+            >
+              <option value="any">any label</option>
+              <option value="all">all labels</option>
+            </select>
+            <input
+              value={a.pool.exclude}
+              disabled={generating}
+              placeholder="not labels"
+              onChange={(e) => setAdvance(i, { ...a, pool: { ...a.pool, exclude: e.target.value } })}
+              style={{ ...sel, width: 100 }}
+            />
+            <select
+              value={a.pool.gender ?? ""}
+              disabled={generating}
+              onChange={(e) => setAdvance(i, { ...a, pool: { ...a.pool, gender: (e.target.value || null) as SlotAdvance["pool"]["gender"] } })}
+              style={sel}
+            >
+              <option value="">any gender</option>
+              <option value="female">female</option>
+              <option value="male">male</option>
+              <option value="other">other</option>
+            </select>
+            <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              every
+              <input
+                type="number"
+                min={1}
+                max={1000}
+                value={a.every}
+                disabled={generating}
+                onChange={(e) => setAdvance(i, { ...a, every: Math.max(1, Math.min(1000, Math.round(Number(e.target.value)) || 1)) })}
+                style={{ ...sel, width: 52 }}
+              />
+              images
+            </label>
+            <span style={{ color: pool.length === 0 ? "rgb(200,140,40)" : "var(--muted)" }}>
+              {cardFolder === null ? "Choose a card folder in Character Cards." : `${pool.length} card${pool.length === 1 ? "" : "s"} in the pool`}
+            </span>
+          </>
+        )}
+      </div>
+    );
+  };
+  const characterBody = (i: number) => {
+    const c = characters[i];
+    return (
+      <>
+        {advanceRow(i)}
+        {cardNote(i, c)}
+        <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+          <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 6 }}>
+            <GrowingTextarea
+              minRows={wide ? 4 : 3}
+              maxHeight={360}
+              value={c}
+              placeholder={`Character ${i + 1}`}
+              data-tags
+              onChange={(e) => setCharacters((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))}
+              onFocus={(e) => (lastFieldRef.current = { field: { character: i, negative: false }, el: e.currentTarget })}
+              readOnly={generating}
+              style={textareaStyle}
+            />
+            {preview(c, true)}
+            <GrowingTextarea
+              minRows={1}
+              maxHeight={200}
+              value={characterNegatives[i] ?? ""}
+              placeholder={`Undesired for character ${i + 1}`}
+              data-tags
+              onChange={(e) => setCharacterNegatives((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))}
+              onFocus={(e) => (lastFieldRef.current = { field: { character: i, negative: true }, el: e.currentTarget })}
+              readOnly={generating}
+              style={{ ...textareaStyle, fontSize: 12.5, padding: "6px 10px" }}
+            />
+            {preview(characterNegatives[i] ?? "")}
+          </div>
+          {useCoords && (
+            <PositionPicker
+              index={i}
+              positions={characterPositions}
+              model={model}
+              aspect={size.width / size.height}
+              disabled={generating}
+              highlight={hoveredChar}
+              onChange={(p) => setCharacterPositions((prev) => prev.map((q, j) => (j === i ? p : q)))}
+            />
+          )}
+        </div>
+      </>
+    );
+  };
   const charactersCard = (
     <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 12 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
         <div style={{ ...cardTitleStyle, marginBottom: 0, flex: 1 }}>
-          CHARACTERS ({characters.length}/{MAX_CHARACTERS})
+          CHARACTERS ({characters.length}/{maxChars})
+          <HelpTip
+            title="Characters"
+            lines={[
+              { text: `${modelFamily(model)} takes up to ${maxChars} character prompts (22 on V5, 6 on V4/V4.5).` },
+              { text: "Order matters to the model: top to bottom, left to right. Drag a row by its ⋮⋮ to move it." },
+            ]}
+          />
         </div>
         <a
           href="#"
@@ -1578,7 +2871,7 @@ export default function GenerateTab({
         >
           Load character card…
         </a>
-        {characters.length < MAX_CHARACTERS && (
+        {characters.length < maxChars && (
           <a
             href="#"
             onClick={(e) => {
@@ -1615,6 +2908,19 @@ export default function GenerateTab({
               </button>
             ))}
           </div>
+          {useCoords && (
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                if (!generating) setCharacterPositions(spreadPositions(characters.length, model));
+              }}
+              title="Place the characters evenly: a row, or a grid for many"
+              style={{ fontWeight: 600 }}
+            >
+              Spread evenly
+            </a>
+          )}
           {useCoords && !positionsApply(model, characters.filter((c) => c.trim() !== "").length) && (
             <span style={{ color: "rgb(200,140,40)", fontFamily: "system-ui, sans-serif" }}>
               V4 and V4.5 place characters only when there are two or more; until then the model decides.
@@ -1627,29 +2933,67 @@ export default function GenerateTab({
           )}
         </div>
       )}
+      {characters.length > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", fontSize: 12 }}>
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault();
+              setExpandedChars(new Set());
+            }}
+            style={{ fontWeight: 600 }}
+          >
+            Collapse all
+          </a>
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault();
+              setExpandedChars(new Set(characterKeys));
+            }}
+            style={{ fontWeight: 600 }}
+          >
+            Expand all
+          </a>
+          <label style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <input
+              type="checkbox"
+              checked={oneOpen}
+              onChange={(e) => setOneOpen(e.target.checked)}
+              style={{ accentColor: "var(--accent)" }}
+            />
+            One open at a time
+          </label>
+          <span
+            title={`A rough count. ${modelFamily(model)} reads about ${tokenMax} tokens of the prompt and all characters together; text past that is ignored.`}
+            style={{
+              marginLeft: "auto",
+              fontFamily: "'IBM Plex Mono', monospace",
+              color: tokensUsed > tokenMax * 0.9 ? "rgb(200,140,40)" : "var(--muted)",
+            }}
+          >
+            ≈{tokensUsed}/{tokenMax} tokens
+          </span>
+        </div>
+      )}
       {characters.length === 0 && (
         <div style={{ fontSize: 12.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif", lineHeight: 1.5 }}>
           No characters. Each character gets its own prompt and undesired content, and can be placed in the
           picture. Add one, or load one of your character cards.
         </div>
       )}
-      {characters.map((c, i) => (
-        <div
-          key={i}
-          style={{
-            border: "1px solid var(--border)",
-            borderRadius: 8,
-            padding: "8px 10px 10px",
-            display: "flex",
-            flexDirection: "column",
-            gap: 6,
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center" }}>
-            <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", flex: 1 }}>
-              Character {i + 1}
-              {cardLinks[i] && <span style={{ fontWeight: 500 }}> · {cardLinks[i]!.name}</span>}
-            </span>
+      {characters.length > 0 && (
+        <CharacterSlots
+          slots={slots}
+          model={model}
+          disabled={generating}
+          expanded={expandedChars}
+          onToggle={toggleExpanded}
+          onReorder={moveCharacter}
+          hovered={hoveredChar}
+          onHover={setHoveredChar}
+          renderBody={characterBody}
+          renderActions={(i) => (
             <a
               href="#"
               onClick={(e) => {
@@ -1661,55 +3005,31 @@ export default function GenerateTab({
             >
               Remove
             </a>
-          </div>
-          {cardNote(i, c)}
-          <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
-            <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 6 }}>
-              <GrowingTextarea
-                minRows={wide ? 4 : 3}
-                maxHeight={360}
-                value={c}
-                placeholder={`Character ${i + 1}`}
-                data-tags
-                onChange={(e) => setCharacters((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))}
-                onFocus={(e) => (lastFieldRef.current = { field: { character: i, negative: false }, el: e.currentTarget })}
-                readOnly={generating}
-                style={textareaStyle}
-              />
-              {preview(c, true)}
-              <GrowingTextarea
-                minRows={1}
-                maxHeight={200}
-                value={characterNegatives[i] ?? ""}
-                placeholder={`Undesired for character ${i + 1}`}
-                data-tags
-                onChange={(e) =>
-                  setCharacterNegatives((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))
-                }
-                onFocus={(e) => (lastFieldRef.current = { field: { character: i, negative: true }, el: e.currentTarget })}
-                readOnly={generating}
-                style={{ ...textareaStyle, fontSize: 12.5, padding: "6px 10px" }}
-              />
-              {preview(characterNegatives[i] ?? "")}
-            </div>
-            {useCoords && (
-              <PositionPicker
-                index={i}
-                positions={characterPositions}
-                model={model}
-                aspect={size.width / size.height}
-                disabled={generating}
-                onChange={(p) => setCharacterPositions((prev) => prev.map((q, j) => (j === i ? p : q)))}
-              />
-            )}
-          </div>
+          )}
+        />
+      )}
+      {stashedChars && (
+        <div style={{ fontSize: 12, color: "var(--muted)", fontFamily: "system-ui, sans-serif" }}>
+          {stashedChars.items.length} character{stashedChars.items.length === 1 ? "" : "s"} set aside by the model switch
+          {" · "}
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault();
+              if (!generating) chooseModel(stashedChars.from);
+            }}
+            style={{ fontWeight: 600 }}
+          >
+            Switch back to {modelFamily(stashedChars.from)} and restore
+          </a>
         </div>
-      ))}
+      )}
       {showCardDialog && (
         <CharacterCardDialog
           characterCount={characters.length}
-          maxCharacters={MAX_CHARACTERS}
+          maxCharacters={maxChars}
           onLoad={loadCharacterCard}
+          onLoadMany={loadManyCards}
           onClose={() => setShowCardDialog(false)}
         />
       )}
@@ -1722,91 +3042,18 @@ export default function GenerateTab({
     (f) => (!usedOnly || usedNames.has(f.name)) && (filterText === "" || f.name.toLowerCase().includes(filterText)),
   );
   const unusedCount = promptFiles.filter((f) => !usedNames.has(f.name)).length;
-  const promptFilesCard = (
-    <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 10 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-        <span style={{ ...cardTitleStyle, marginBottom: 0, flex: 1 }}>
-          PROMPT FILES
-          {promptFiles.length > 0 && (
-            <span style={{ fontWeight: 500 }}>
-              {" "}
-              · {promptFiles.length} loaded, {promptFiles.length - unusedCount} in use
-            </span>
-          )}
-        </span>
-        <a
-          href="#"
-          onClick={(e) => {
-            e.preventDefault();
-            void openWildcardsDir().catch((err) => setError(String(err)));
-          }}
-          title="Open the project's wildcards folder, where prompt files live by default"
-          style={{ fontSize: 13, fontWeight: 600 }}
-        >
-          Open folder
-        </a>
-        <button
-          onClick={() => void addPromptFiles()}
-          disabled={generating}
-          style={{ ...secondaryButtonStyle, padding: "5px 14px" }}
-        >
-          Add .txt files…
-        </button>
-      </div>
-
-      {promptFiles.length === 0 ? (
-        <div style={{ fontSize: 12.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif", lineHeight: 1.5 }}>
-          Text files with one prompt per line, kept in the project's <code>wildcards</code>{" "}
-          folder. Each file gets a token like <code>__hair__</code>; put it in any prompt,
-          undesired content or character, and every image fills it with a line from that file.
-        </div>
-      ) : (
-        <>
-          {promptFiles.length > 5 && (
-            <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", fontSize: 12.5 }}>
-              <input
-                value={fileFilter}
-                onChange={(e) => setFileFilter(e.target.value)}
-                placeholder="Filter files…"
-                spellCheck={false}
-                style={{ ...inputStyle, background: "var(--bg-page)", flex: "1 1 160px", padding: "5px 10px", fontSize: 12.5 }}
-              />
-              <label style={{ display: "flex", alignItems: "center", gap: 6, whiteSpace: "nowrap" }}>
-                <input
-                  type="checkbox"
-                  checked={usedOnly}
-                  onChange={(e) => setUsedOnly(e.target.checked)}
-                  style={{ accentColor: "var(--accent)" }}
-                />
-                In use only
-              </label>
-              {unusedCount > 0 && (
-                <a
-                  href="#"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    if (!generating) setPromptFiles((prev) => prev.filter((x) => usedNames.has(x.name)));
-                  }}
-                  title="Take every file whose token isn't in any prompt off this list (the files stay on disk)"
-                  style={{ fontWeight: 600, whiteSpace: "nowrap" }}
-                >
-                  Remove {unusedCount} unused
-                </a>
-              )}
-            </div>
-          )}
-          <div
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
-              maxHeight: 340,
-              overflowY: "auto",
-              paddingRight: 4,
-            }}
-          >
-            {shownFiles.length === 0 && <div style={{ fontSize: 12.5, color: "var(--muted)" }}>No files match.</div>}
-            {shownFiles.map((f) => (
+  // Folder files, filtered the same way, grouped by subfolder.
+  const shownFolder = folderFiles.filter(
+    (f) => (!usedOnly || usedNames.has(f.name)) && (filterText === "" || f.name.toLowerCase().includes(filterText)),
+  );
+  const folderGroups = [...new Map<string, PromptFile[]>(
+    shownFolder.reduce((m, f) => {
+      const g = f.name.includes("/") ? f.name.slice(0, f.name.lastIndexOf("/")) : "";
+      m.set(g, [...(m.get(g) ?? []), f]);
+      return m;
+    }, new Map<string, PromptFile[]>()),
+  )].sort(([a], [b]) => a.localeCompare(b));
+  const fileRow = (f: PromptFile) => (
               <div key={f.path} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12.5 }}>
                 <button
@@ -1840,7 +3087,11 @@ export default function GenerateTab({
                 >
                   {f.error
                     ? f.error
-                    : `${f.lines.length} ${f.partNames.length > 0 ? "entr" + (f.lines.length === 1 ? "y" : "ies") : "line" + (f.lines.length === 1 ? "" : "s")}${usedNames.has(f.name) ? "" : " · not used yet"}`}
+                    : loops.has(f.name)
+                      ? `Refers back to itself: ${loops.get(f.name)!.join(" → ")}`
+                      : duplicateNames.includes(f.name) && f.fromFolder
+                        ? `Another file is also ${tokenFor(f.name)}; ${handNames.has(f.name) ? "the one added by hand" : "the first"} is used`
+                        : `${f.lines.length} ${f.partNames.length > 0 ? "entr" + (f.lines.length === 1 ? "y" : "ies") : "line" + (f.lines.length === 1 ? "" : "s")}${f.weights.some((w) => w !== 1) ? " · weighted" : ""}${usedNames.has(f.name) ? "" : " · not used yet"}`}
                 </span>
                 {!f.error && (
                   <>
@@ -1909,13 +3160,26 @@ export default function GenerateTab({
                   href="#"
                   onClick={(e) => {
                     e.preventDefault();
-                    if (!generating) setPromptFiles((prev) => prev.filter((x) => x.path !== f.path));
+                    if (!generating) void editFile(f);
                   }}
-                  title="Remove this file (its token is left in the prompt)"
+                  title="Edit this file's lines and weights"
                   style={{ fontWeight: 600 }}
                 >
-                  Remove
+                  Edit
                 </a>
+                {!f.fromFolder && (
+                  <a
+                    href="#"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      if (!generating) setPromptFiles((prev) => prev.filter((x) => x.path !== f.path));
+                    }}
+                    title="Remove this file (its token is left in the prompt)"
+                    style={{ fontWeight: 600 }}
+                  >
+                    Remove
+                  </a>
+                )}
               </div>
               {f.partNames.length > 0 && (
                 <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", paddingLeft: 12, fontSize: 12 }}>
@@ -1954,7 +3218,174 @@ export default function GenerateTab({
                 </div>
               )}
               </div>
-            ))}
+  );
+
+  const promptFilesCard = (
+    <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <span style={{ ...cardTitleStyle, marginBottom: 0, flex: 1 }}>
+          PROMPT FILES
+          {promptFiles.length > 0 && (
+            <span style={{ fontWeight: 500 }}>
+              {" "}
+              · {promptFiles.length} loaded, {promptFiles.length - unusedCount} in use
+            </span>
+          )}
+        </span>
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            void openWildcardsDir().catch((err) => setError(String(err)));
+          }}
+          title="Open the project's wildcards folder, where prompt files live by default"
+          style={{ fontSize: 13, fontWeight: 600 }}
+        >
+          Open folder
+        </a>
+        <button
+          onClick={() => void addPromptFiles()}
+          disabled={generating}
+          style={{ ...secondaryButtonStyle, padding: "5px 14px" }}
+        >
+          Add .txt files…
+        </button>
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", fontSize: 12.5 }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontWeight: 600 }}>
+          <input
+            type="checkbox"
+            checked={wildcardFolder.enabled}
+            disabled={generating}
+            onChange={(e) => setWildcardFolder((w) => ({ ...w, enabled: e.target.checked }))}
+            style={{ accentColor: "var(--accent)" }}
+          />
+          Use whole folder
+          <HelpTip lines={[{ text: CONTROL_HELP.wholeFolder }, ...helpFor("promptFiles")]} />
+        </label>
+        {wildcardFolder.enabled && (
+          <>
+            <span
+              title={wildcardFolder.dir ?? "The project's wildcards folder"}
+              style={{ flex: 1, minWidth: 0, fontFamily: "'IBM Plex Mono', monospace", fontSize: 11.5, color: "var(--muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+            >
+              {wildcardFolder.dir ?? "wildcards (default)"} · {folderFiles.length} file{folderFiles.length === 1 ? "" : "s"}
+            </span>
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                if (!generating) void chooseWildcardFolder();
+              }}
+              style={{ fontWeight: 600 }}
+            >
+              Change…
+            </a>
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                if (!generating) void scanFolder();
+              }}
+              style={{ fontWeight: 600 }}
+            >
+              Refresh
+            </a>
+          </>
+        )}
+      </div>
+      {folderScanError && <div style={{ ...warningBoxStyle, marginTop: 0, fontSize: 12.5 }}>{folderScanError}</div>}
+      {promptFiles.length === 0 && folderFiles.length === 0 ? (
+        <div style={{ fontSize: 12.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif", lineHeight: 1.5 }}>
+          Text files with one prompt per line, kept in the project's <code>wildcards</code>{" "}
+          folder. Each file gets a token like <code>__hair__</code>; put it in any prompt,
+          undesired content or character, and every image fills it with a line from that file.
+        </div>
+      ) : (
+        <>
+          {promptFiles.length + folderFiles.length > 5 && (
+            <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", fontSize: 12.5 }}>
+              <input
+                value={fileFilter}
+                onChange={(e) => setFileFilter(e.target.value)}
+                placeholder="Filter files…"
+                spellCheck={false}
+                style={{ ...inputStyle, background: "var(--bg-page)", flex: "1 1 160px", padding: "5px 10px", fontSize: 12.5 }}
+              />
+              <label style={{ display: "flex", alignItems: "center", gap: 6, whiteSpace: "nowrap" }}>
+                <input
+                  type="checkbox"
+                  checked={usedOnly}
+                  onChange={(e) => setUsedOnly(e.target.checked)}
+                  style={{ accentColor: "var(--accent)" }}
+                />
+                In use only
+              </label>
+              {unusedCount > 0 && (
+                <a
+                  href="#"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    if (!generating) setPromptFiles((prev) => prev.filter((x) => usedNames.has(x.name)));
+                  }}
+                  title="Take every file whose token isn't in any prompt off this list (the files stay on disk)"
+                  style={{ fontWeight: 600, whiteSpace: "nowrap" }}
+                >
+                  Remove {unusedCount} unused
+                </a>
+              )}
+            </div>
+          )}
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+              maxHeight: 340,
+              overflowY: "auto",
+              paddingRight: 4,
+            }}
+          >
+            {shownFiles.length === 0 && shownFolder.length === 0 && (
+              <div style={{ fontSize: 12.5, color: "var(--muted)" }}>No files match.</div>
+            )}
+            {shownFiles.map(fileRow)}
+            {folderGroups.map(([group, files]) => {
+              const isOpen = openGroups.has(group) || filterText !== "";
+              return (
+                <div key={group} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  <button
+                    onClick={() =>
+                      setOpenGroups((g) => {
+                        const next = new Set(g);
+                        if (next.has(group)) next.delete(group);
+                        else next.add(group);
+                        return next;
+                      })
+                    }
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      padding: "2px 0",
+                      border: "none",
+                      background: "transparent",
+                      color: "var(--muted)",
+                      fontFamily: "'Space Grotesk', sans-serif",
+                      fontWeight: 600,
+                      fontSize: 12,
+                      cursor: "pointer",
+                      textAlign: "left",
+                    }}
+                  >
+                    {isOpen ? "▾" : "▸"} {group === "" ? "Wildcards folder" : `${group}/`}
+                    <span style={{ fontWeight: 500 }}>· {files.length}</span>
+                  </button>
+                  {isOpen && files.map(fileRow)}
+                </div>
+              );
+            })}
           </div>
           <div style={{ fontSize: 11.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif" }}>
             Click a token to insert it where you're typing. Each image uses one entry per file, so a
@@ -2056,6 +3487,123 @@ export default function GenerateTab({
     </div>
   );
 
+  async function chooseStyleReference() {
+    const file = await open({
+      directory: false,
+      multiple: false,
+      filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp"] }],
+    });
+    if (typeof file !== "string") return;
+    setStyleReference((r) => ({ kind: "style", strength: 1, fidelity: 1, ...r, path: file }));
+  }
+  const cardRefCount = cardLinks.filter((l) => l?.reference).length;
+  const referenceCard = (
+    <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <span style={{ ...cardTitleStyle, marginBottom: 0, flex: 1 }}>
+          PRECISE REFERENCE
+          <HelpTip
+            lines={[
+              { text: "A reference image for a character's look, a style, or both. Character cards can carry their own (set in Character Cards)." },
+              { text: `NovelAI charges ${PRECISE_REFERENCE_COST} Anlas per image for each reference; Generate shows the run's price and asks first.` },
+              { text: "V4.5 only for now; it can't be used with Vibe Transfer, so vibes are left out while references are on." },
+            ]}
+          />
+          {formReferences.length > 0 && (
+            <span style={{ fontWeight: 500, color: "rgb(200,140,40)" }}>
+              {" "}
+              · {formReferences.length} × {PRECISE_REFERENCE_COST} Anlas per image
+            </span>
+          )}
+        </span>
+        <button onClick={() => void chooseStyleReference()} disabled={generating} style={{ ...secondaryButtonStyle, padding: "6px 14px" }}>
+          {styleReference ? "Change image…" : "Add reference…"}
+        </button>
+      </div>
+      {!modelInfo.preciseReference && (styleReference || cardRefCount > 0) && (
+        <div style={{ ...warningBoxStyle, marginTop: 0 }}>
+          {modelFamily(model)} doesn't support Precise Reference yet, so no references are sent. Switch to V4.5 to use them.
+        </div>
+      )}
+      {modelInfo.preciseReference && formReferences.length > 0 && vibeRefs.length > 0 && (
+        <div style={{ ...warningBoxStyle, marginTop: 0 }}>Vibe Transfer can't be used with Precise Reference, so the vibes are left out.</div>
+      )}
+      {styleReference && (
+        <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
+          <img
+            src={convertFileSrc(styleReference.path)}
+            alt=""
+            style={{ width: 80, height: 80, objectFit: "contain", borderRadius: 6, background: "var(--bg-page)", flexShrink: 0 }}
+          />
+          <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 6, fontSize: 12.5 }}>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {(["style", "character", "character&style"] as ReferenceKind[]).map((k) => (
+                <button
+                  key={k}
+                  disabled={generating}
+                  onClick={() => setStyleReference({ ...styleReference, kind: k })}
+                  style={{
+                    padding: "3px 10px",
+                    borderRadius: 999,
+                    border: `1px solid ${styleReference.kind === k ? "var(--accent)" : "var(--border)"}`,
+                    background: styleReference.kind === k ? "var(--accent)" : "transparent",
+                    color: styleReference.kind === k ? "var(--accent-contrast)" : "var(--text)",
+                    fontWeight: 600,
+                    fontSize: 12,
+                    cursor: "pointer",
+                  }}
+                >
+                  {k === "style" ? "Style" : k === "character" ? "Character" : "Character & Style"}
+                </button>
+              ))}
+              <a
+                href="#"
+                onClick={(e) => {
+                  e.preventDefault();
+                  if (!generating) setStyleReference(null);
+                }}
+                style={{ fontWeight: 600, marginLeft: "auto" }}
+              >
+                Remove
+              </a>
+            </div>
+            {(["strength", "fidelity"] as const).map((k) => (
+              <label key={k} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ minWidth: 92 }}>
+                  {k === "strength" ? "Strength" : "Fidelity"} {styleReference[k].toFixed(2)}
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={styleReference[k]}
+                  disabled={generating}
+                  onChange={(e) => setStyleReference({ ...styleReference, [k]: Number(e.target.value) })}
+                  style={{ flex: 1, accentColor: "var(--accent)" }}
+                />
+              </label>
+            ))}
+            <div style={{ fontSize: 11.5, color: "var(--muted)" }}>Sent padded to 1024×1536, 1536×1024 or 1472×1472, whichever fits its shape.</div>
+          </div>
+        </div>
+      )}
+      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5 }}>
+        <input
+          type="checkbox"
+          checked={useCardReferences}
+          disabled={generating}
+          onChange={(e) => setUseCardReferences(e.target.checked)}
+          style={{ accentColor: "var(--accent)" }}
+        />
+        Send the references that come with character cards
+        <span style={{ color: "var(--muted)" }}>
+          ({cardRefCount} loaded card{cardRefCount === 1 ? " has" : "s have"} one)
+        </span>
+      </label>
+    </div>
+  );
+
   const vibesCard = (
     <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 12 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -2064,10 +3612,34 @@ export default function GenerateTab({
           {vibes.length > 0 && modelInfo.vibes && (
             <span style={{ fontWeight: 500 }}>
               {" "}
-              · {vibeRefs.length} of {MAX_VIBES} in use
+              · {rotating ? `${Math.min(vibeRotation.k, MAX_VIBES)} per image from ${vibeRefs.length}` : `${vibeRefs.length} of ${MAX_VIBES} in use`}
             </span>
           )}
         </span>
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            if (!generating) void openVibeLibrary();
+          }}
+          title="The vibe files in your vibe library folder"
+          style={{ fontSize: 13, fontWeight: 600 }}
+        >
+          Library…
+        </a>
+        {modelInfo.vibes && (
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault();
+              if (!generating) void startEncode();
+            }}
+            title="Encode a plain image as a vibe (2 Anlas, once; saved as a .naiv4vibe file and reused after)"
+            style={{ fontSize: 13, fontWeight: 600 }}
+          >
+            Encode image…
+          </a>
+        )}
         <button
           onClick={() => void chooseVibeFiles()}
           disabled={generating}
@@ -2076,6 +3648,115 @@ export default function GenerateTab({
           Add vibe file…
         </button>
       </div>
+
+      {vibes.length > 0 && modelInfo.vibes && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 12 }}>
+          <span style={{ fontWeight: 600, color: "var(--muted)" }}>
+            Use
+            <HelpTip
+              lines={[
+                { text: "Fixed sends every ticked vibe (up to 4, so it stays free)." },
+                { text: "Random or Next sends K of the ticked vibes per image (at most 4), picked at random or in turn every N images; tick as many as you like." },
+              ]}
+            />
+          </span>
+          <select
+            value={vibeRotation.mode}
+            disabled={generating}
+            onChange={(e) => setVibeRotation({ ...vibeRotation, mode: e.target.value as VibeRotation["mode"] })}
+            style={{ ...inputStyle, padding: "3px 6px", fontSize: 12, background: "var(--bg-page)" }}
+          >
+            <option value="fixed">every ticked vibe</option>
+            <option value="random">K at random per image</option>
+            <option value="next">the next K every N images</option>
+          </select>
+          {rotating && (
+            <>
+              K
+              <input
+                type="number"
+                min={1}
+                max={MAX_VIBES}
+                value={vibeRotation.k}
+                disabled={generating}
+                onChange={(e) => setVibeRotation({ ...vibeRotation, k: Math.max(1, Math.min(MAX_VIBES, Math.round(Number(e.target.value)) || 1)) })}
+                style={{ ...inputStyle, width: 48, padding: "3px 6px", background: "var(--bg-page)" }}
+              />
+            </>
+          )}
+          {vibeRotation.mode === "next" && (
+            <>
+              every
+              <input
+                type="number"
+                min={1}
+                value={vibeRotation.every}
+                disabled={generating}
+                onChange={(e) => setVibeRotation({ ...vibeRotation, every: Math.max(1, Math.round(Number(e.target.value)) || 1) })}
+                style={{ ...inputStyle, width: 48, padding: "3px 6px", background: "var(--bg-page)" }}
+              />
+              images
+            </>
+          )}
+        </div>
+      )}
+
+      {vibeLibrary && (
+        <div style={{ border: "1px solid var(--border)", borderRadius: 8, padding: "8px 10px", display: "flex", flexDirection: "column", gap: 6, fontSize: 12.5 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontWeight: 600, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={vibeDir() ?? ""}>
+              Vibe library · {vibeLibrary.length} file{vibeLibrary.length === 1 ? "" : "s"}
+            </span>
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                void chooseVibeLibrary();
+              }}
+              style={{ fontWeight: 600 }}
+            >
+              Change folder…
+            </a>
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                setVibeLibrary(null);
+              }}
+              style={{ fontWeight: 600 }}
+            >
+              Close
+            </a>
+          </div>
+          {vibeLibrary.length === 0 && <div style={{ color: "var(--muted)" }}>No vibe files here yet; encoded images are saved here.</div>}
+          <div style={{ display: "flex", flexDirection: "column", gap: 3, maxHeight: 180, overflowY: "auto" }}>
+            {vibeLibrary.map((p) => {
+              const listed = vibes.some((v) => v.path === p);
+              return (
+                <div key={p} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={p}>
+                    {fileName(p)}
+                  </span>
+                  {listed ? (
+                    <span style={{ color: "var(--muted)" }}>in the list</span>
+                  ) : (
+                    <a
+                      href="#"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        void addVibeFiles([p]);
+                      }}
+                      style={{ fontWeight: 600 }}
+                    >
+                      Add
+                    </a>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {vibes.length === 0 && (
         <div style={{ fontSize: 12.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif" }}>
@@ -2108,10 +3789,10 @@ export default function GenerateTab({
               type="checkbox"
               checked={v.enabled}
               onChange={(e) => updateVibe(v.key, { enabled: e.target.checked })}
-              disabled={generating || (!v.enabled && vibesOn >= MAX_VIBES)}
+              disabled={generating || (!rotating && !v.enabled && vibesOn >= MAX_VIBES)}
               title={
-                !v.enabled && vibesOn >= MAX_VIBES
-                  ? `Up to ${MAX_VIBES} vibes at once; more would cost Anlas`
+                !rotating && !v.enabled && vibesOn >= MAX_VIBES
+                  ? `Up to ${MAX_VIBES} vibes at once; more would cost Anlas (or rotate them, below)`
                   : "Use this vibe"
               }
               style={{ accentColor: "var(--accent)" }}
@@ -2228,6 +3909,73 @@ export default function GenerateTab({
     </div>
   );
 
+  const artistCard = (
+    <ArtistLibraryCard
+      value={artists}
+      onChange={setArtists}
+      family={family}
+      disabled={generating}
+      hasFolder={cardFolder !== null}
+      cardStyle={cardStyle}
+      titleStyle={cardTitleStyle}
+    />
+  );
+
+  const workflowCard = (
+    <WorkflowCard
+      value={workflow}
+      onChange={setWorkflow}
+      disabled={generating || (!canGenerate && !planRun)}
+      folder={cardFolder}
+      run={planRun ? { done: planRun.done, total: planRun.images.length } : null}
+      onStart={startPlan}
+      onContinue={() => setPlanConfirm({ start: false })}
+      onStop={() => {
+        setPlanRun(null);
+        setBatchNotice("The plan was ended.");
+      }}
+      cardStyle={cardStyle}
+      titleStyle={cardTitleStyle}
+    />
+  );
+
+  const creepCard = (
+    <CreepCard
+      value={creep}
+      onChange={setCreep}
+      disabled={generating}
+      maxSteps={MAX_STEPS}
+      stepsFixed={modelInfo.fixedSteps !== undefined}
+      varietyPlus={varietyPlus}
+      samplers={SAMPLERS}
+      schedules={NOISE_SCHEDULES}
+      cardStyle={cardStyle}
+      titleStyle={cardTitleStyle}
+    />
+  );
+
+  const automationCard = (
+    <AutomationCard
+      value={automation}
+      onChange={setAutomation}
+      disabled={generating}
+      characterCount={characters.length}
+      genderPairs={genderPairs}
+      onEditPairs={(pairs) => {
+        setGenderPairs(pairs);
+        if (cardFolder) void saveGenderPairs(cardFolder, pairs).catch((e) => setError(String(e)));
+        else setError("Choose a card folder in the Character Cards tab to keep the swap table.");
+      }}
+      associationCount={cardFolder ? associations.length : null}
+      onReloadAssociations={() => void loadLibrary()}
+      onApplySwapToForm={applySwapToForm}
+      canUndoSwap={swapUndo !== null}
+      onUndoSwap={undoSwap}
+      cardStyle={cardStyle}
+      titleStyle={cardTitleStyle}
+    />
+  );
+
   // Pinned to the bottom of the window; the strip under it hides what scrolls past.
   const bottomBar = (
     <div
@@ -2324,6 +4072,34 @@ export default function GenerateTab({
               style={{ ...inputStyle, width: 64, background: "var(--bg-page)" }}
             />
           </label>
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault();
+              if (!generating) showPreview();
+            }}
+            title="See every image's prompts before anything is sent"
+            style={{ fontSize: 12.5, fontWeight: 600, whiteSpace: "nowrap" }}
+          >
+            Preview batch
+          </a>
+          {runEstimate && (
+            <span
+              title={runEstimate.reasons.join(" ") || "Every image in this run should be free."}
+              style={{
+                fontFamily: "'IBM Plex Mono', monospace",
+                fontSize: 12,
+                color: runEstimate.free ? "var(--muted)" : "rgb(200,140,40)",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {runEstimate.free
+                ? "Free"
+                : runEstimate.anlas !== null
+                  ? `~${(runEstimate.anlas * count).toLocaleString()} Anlas`
+                  : "Costs Anlas"}
+            </span>
+          )}
           {generating ? (
             <button onClick={cancelGenerate} style={{ ...secondaryButtonStyle, minWidth: 130 }}>
               Cancel
@@ -2459,32 +4235,6 @@ export default function GenerateTab({
                     <div style={{ flex: 1, fontSize: 13.5 }}>
                       <span style={{ fontWeight: 700 }}>{status.tierName}</span>
                       {!status.active && <span style={{ color: "var(--muted)" }}> (inactive)</span>}
-                      <span
-                        style={{
-                          marginLeft: 10,
-                          fontFamily: "'IBM Plex Mono', monospace",
-                          fontSize: 12,
-                          color: "var(--muted)",
-                        }}
-                      >
-                        {status.anlas.toLocaleString()} ANLAS
-                      </span>
-                      {status.isOpus && status.usage && (
-                        <span
-                          title="Opus generations with V5 models draw from this refilling quota. V4 and V4.5 are unlimited."
-                          style={{
-                            marginLeft: 10,
-                            fontFamily: "'IBM Plex Mono', monospace",
-                            fontSize: 12,
-                            color: status.usage.isNegative ? "rgb(200,140,40)" : "var(--muted)",
-                          }}
-                        >
-                          V5 QUOTA{" "}
-                          {status.usage.isNegative
-                            ? "USED UP"
-                            : `${status.usage.percent + status.usage.purchasedPercent}%`}
-                        </span>
-                      )}
                     </div>
                     <a
                       href="#"
@@ -2505,6 +4255,7 @@ export default function GenerateTab({
                     </button>
                   </div>
 
+                  <AccountBars status={status} />
                   {!status.isOpus && (
                     <div style={warningBoxStyle}>
                       {status.active
@@ -2562,10 +4313,15 @@ export default function GenerateTab({
                 <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                   {promptCard}
                   {promptFilesCard}
+                  {automationCard}
+                  {artistCard}
+                  {creepCard}
+                  {workflowCard}
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                   {charactersCard}
                   {img2imgCard}
+                  {referenceCard}
                   {vibesCard}
                   {lastCard}
                 </div>
@@ -2575,7 +4331,12 @@ export default function GenerateTab({
                 {promptCard}
                 {charactersCard}
                 {img2imgCard}
+                {referenceCard}
                 {promptFilesCard}
+                {automationCard}
+                {artistCard}
+                {creepCard}
+                {workflowCard}
                 {vibesCard}
                 {lastCard}
               </div>
@@ -2592,9 +4353,16 @@ export default function GenerateTab({
         <ConfirmModal
           title={quotaExhausted ? "V5 quota used up" : "This will cost Anlas"}
           message={
-            quotaExhausted
-              ? `Your Opus quota for V5 models is used up, so this may cost Anlas. You have ${status.anlas.toLocaleString()} Anlas. V4.5 models stay free. Generate ${n === 1 ? "1 image" : `${n} images`}?`
-              : `Your ${status.tierName} subscription doesn't include free generations. You have ${status.anlas.toLocaleString()} Anlas. Generate ${n === 1 ? "1 image" : `${n} images`}?`
+            (quotaExhausted
+              ? `Your Opus quota for V5 models is used up, so this may cost Anlas. V4.5 models stay free. `
+              : !status.isOpus
+                ? `Your ${status.tierName} subscription doesn't include free generations. `
+                : "") +
+            (runEstimate && runEstimate.reasons.length > 0 ? runEstimate.reasons.join(" ") + " " : "") +
+            (runEstimate?.anlas
+              ? `${n} image${n === 1 ? "" : "s"} × ${runEstimate.anlas} = ${n * runEstimate.anlas} Anlas. `
+              : "") +
+            `You have ${status.anlas.toLocaleString()} Anlas. Generate ${n === 1 ? "1 image" : `${n} images`}?`
           }
           confirmLabel="Generate"
           cancelLabel="Cancel"
@@ -2607,11 +4375,188 @@ export default function GenerateTab({
         );
       })()}
 
+      {modelSwitch && !modelSwitch.choosing && (
+        <ConfirmModal
+          title={`${modelFamily(modelSwitch.to)} takes ${MODELS.find((m) => m.id === modelSwitch.to)?.maxCharacters ?? 6} characters`}
+          message={`There are ${characters.length} characters. Which should stay? The others are set aside until the next generation, so switching back restores them.`}
+          confirmLabel={`Keep the first ${MODELS.find((m) => m.id === modelSwitch.to)?.maxCharacters ?? 6}`}
+          middleLabel="Choose which"
+          cancelLabel={`Stay on ${modelFamily(model)}`}
+          onConfirm={() => applyModelSwitch(modelSwitch.keep)}
+          onMiddle={() => setModelSwitch({ ...modelSwitch, choosing: true })}
+          onCancel={() => setModelSwitch(null)}
+        />
+      )}
+      {modelSwitch && modelSwitch.choosing && (() => {
+        const max = MODELS.find((m) => m.id === modelSwitch.to)?.maxCharacters ?? 6;
+        const n = modelSwitch.keep.size;
+        return (
+          <div
+            onClick={() => setModelSwitch(null)}
+            style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 300 }}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              style={{ ...cardStyle, width: 520, maxWidth: "90vw", maxHeight: "80vh", overflowY: "auto", display: "flex", flexDirection: "column", gap: 10 }}
+            >
+              <div style={{ fontSize: 16, fontWeight: 700 }}>Choose {max} characters to keep</div>
+              {characters.map((c, i) => (
+                <label key={i} style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 13 }}>
+                  <input
+                    type="checkbox"
+                    checked={modelSwitch.keep.has(i)}
+                    disabled={!modelSwitch.keep.has(i) && n >= max}
+                    onChange={(e) => {
+                      const keep = new Set(modelSwitch.keep);
+                      if (e.target.checked) keep.add(i);
+                      else keep.delete(i);
+                      setModelSwitch({ ...modelSwitch, keep });
+                    }}
+                    style={{ accentColor: "var(--accent)" }}
+                  />
+                  <span style={{ fontWeight: 600 }}>{i + 1}.</span>
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {cardLinks[i]?.name ?? (c || "(empty)")}
+                  </span>
+                </label>
+              ))}
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                <button onClick={() => setModelSwitch(null)} style={secondaryButtonStyle}>
+                  Stay on {modelFamily(model)}
+                </button>
+                <button onClick={() => applyModelSwitch(modelSwitch.keep)} style={primaryButtonStyle}>
+                  Keep {n}, switch
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {director && (
+        <DirectorDialog
+          path={director.path}
+          initialTool={director.tool}
+          outputDir={outputDir}
+          onDone={(out) => {
+            const shown = { path: out.path, seed: lastResult?.seed ?? 0, src: convertFileSrc(out.path) };
+            setLastResult(shown);
+            setBatchImages((prev) => [...prev, shown]);
+            getAccountStatus().then((s) => s && setStatus(s)).catch(() => {});
+          }}
+          onClose={() => setDirector(null)}
+        />
+      )}
+      {encoding && status && (
+        <div
+          onClick={() => !encoding.busy && setEncoding(null)}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 300 }}
+        >
+          <div onClick={(e) => e.stopPropagation()} style={{ ...cardStyle, width: 460, maxWidth: "90vw", display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ fontSize: 16, fontWeight: 700 }}>Encode a vibe</div>
+            <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+              <img src={convertFileSrc(encoding.path)} alt="" style={{ width: 72, height: 72, objectFit: "contain", borderRadius: 6, background: "var(--bg-page)" }} />
+              <div style={{ fontSize: 13, wordBreak: "break-all" }}>{fileName(encoding.path)}</div>
+            </div>
+            <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12.5 }}>
+              <span style={{ fontWeight: 600, color: "var(--muted)" }}>Information extracted: {encoding.ie.toFixed(2)}</span>
+              <input
+                type="range"
+                min={0.01}
+                max={1}
+                step={0.01}
+                value={encoding.ie}
+                disabled={encoding.busy}
+                onChange={(e) => setEncoding({ ...encoding, ie: Number(e.target.value) })}
+                style={{ accentColor: "var(--accent)" }}
+              />
+            </label>
+            <div style={{ ...warningBoxStyle, marginTop: 0 }}>
+              Encoding costs 2 Anlas (one time) for {modelInfo.label} at {encoding.ie.toFixed(2)}. You have {status.anlas.toLocaleString()} Anlas.
+              The result is saved as a .naiv4vibe file and reused after, so the same image, model and setting are never paid for twice.
+            </div>
+            {encoding.error && <div style={{ fontSize: 12.5, color: "#c9482f" }}>{encoding.error}</div>}
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+              <button onClick={() => setEncoding(null)} disabled={encoding.busy} style={secondaryButtonStyle}>
+                Cancel
+              </button>
+              <button onClick={() => void runEncode()} disabled={encoding.busy} style={{ ...primaryButtonStyle, opacity: encoding.busy ? 0.5 : 1 }}>
+                {encoding.busy ? "Encoding…" : "Encode (2 Anlas)"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {planConfirm && planRun && status && (() => {
+        const p = planRun.plan;
+        const chunk = chunkImages(p);
+        const n = Math.min(planRun.images.length - planRun.done, chunk);
+        const upscales = p.steps.filter((x) => x.kind === "upscale").length;
+        const directors = p.steps.filter((x) => x.kind === "emotion" || x.kind === "colorize").length;
+        const genCost = needsConfirm && runEstimate?.anlas ? runEstimate.anlas * n : 0;
+        const lines = [
+          planConfirm.start
+            ? `${planRun.images.length} images in ${p.sets} set${p.sets === 1 ? "" : "s"} of ${p.loops}, ${chunk} per click.`
+            : `Images ${planRun.done + 1}–${planRun.done + n} of ${planRun.images.length}.`,
+          `This part: ${n} generation${n === 1 ? "" : "s"}${directors ? `, ${n * directors} Director step${n * directors === 1 ? "" : "s"}` : ""}${upscales ? `, ${n * upscales} upscale${n * upscales === 1 ? "" : "s"} (${n * upscales} Anlas)` : ""}.`,
+          needsConfirm ? `Generations ${runEstimate?.anlas ? `cost ${genCost} Anlas` : "cost Anlas"}: ${(runEstimate?.reasons ?? []).join(" ")}` : "Generations are free.",
+          directors && !status.isOpus ? "Director steps cost Anlas on this account." : "",
+          `You have ${status.anlas.toLocaleString()} Anlas.`,
+        ].filter(Boolean);
+        return (
+          <ConfirmModal
+            title={planConfirm.start ? "Start the plan?" : "Run the next part?"}
+            message={lines.join(" ")}
+            confirmLabel={planConfirm.start ? "Start" : "Continue"}
+            cancelLabel="Not now"
+            onConfirm={() => void runPlanChunk()}
+            onCancel={() => {
+              setPlanConfirm(null);
+              if (planConfirm.start) setPlanRun(null);
+            }}
+          />
+        );
+      })()}
+      {showSavedPrompts && cardFolder && (
+        <SavedPromptsDialog
+          folder={cardFolder}
+          current={snapshot()}
+          onLoad={startLoadSaved}
+          onSaveFromImage={snapshotFromImage}
+          onClose={() => setShowSavedPrompts(false)}
+        />
+      )}
+      {previewImages && (
+        <BatchPreview
+          images={previewImages}
+          onClose={() => setPreviewImages(null)}
+          onReroll={() => {
+            const seed = randomSeed();
+            setBatchSeed(seed);
+            showPreview(seed);
+          }}
+        />
+      )}
+      {editingFile && (
+        <PromptFileEditor
+          path={editingFile.file.path}
+          name={editingFile.file.name}
+          initial={editingFile.raw}
+          knownNames={new Set(allFiles.map((f) => f.name))}
+          loop={loops.get(editingFile.file.name) ?? null}
+          onSaved={() => void reloadFile(editingFile.file)}
+          onClose={() => setEditingFile(null)}
+        />
+      )}
+
       {importPlan && (
         <ImportConfirmModal
           plan={importPlan}
-          onConfirm={() => applyImport(importPlan)}
-          onCancel={() => setImportPlan(null)}
+          onConfirm={() => (pendingSnapshot ? applySnapshot(pendingSnapshot) : applyImport(importPlan))}
+          onCancel={() => {
+            setImportPlan(null);
+            setPendingSnapshot(null);
+          }}
         />
       )}
 

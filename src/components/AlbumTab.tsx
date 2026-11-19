@@ -18,6 +18,8 @@ import ConfirmModal from "./ConfirmModal";
 import ContextMenu from "./ContextMenu";
 import RenamePreviewModal from "./RenamePreviewModal";
 import PdfExportDialog from "./PdfExportDialog";
+import DirectorDialog from "./DirectorDialog";
+import type { DirectorTool } from "../lib/director";
 import { isImageFile, naturalCompare } from "../lib/images";
 import {
   loadAlbum,
@@ -84,6 +86,8 @@ export default function AlbumTab({ active }: { active: boolean }) {
   const [showRenamePreview, setShowRenamePreview] = useState(false);
   const [pdfExportTarget, setPdfExportTarget] = useState<string | null>(null);
   const [selectedBytes, setSelectedBytes] = useState(0);
+  // Emotion / Colorize on one photo (NovelAI; saved as a new file).
+  const [director, setDirector] = useState<{ path: string; tool: DirectorTool } | null>(null);
   // Bumped on every loadFolder call so in-flight thumbnail decodes from a
   // folder the user has since navigated away from don't write into the
   // current one.
@@ -896,6 +900,15 @@ export default function AlbumTab({ active }: { active: boolean }) {
                 onClick: () => void setMarked(names, !allMarked),
               };
             })(),
+            ...(contextMenu.targets.size === 1
+              ? (["emotion", "colorize"] as const).map((tool) => ({
+                  label: tool === "emotion" ? "Change expression…" : "Colorize…",
+                  onClick: () => {
+                    const name = [...contextMenu.targets][0];
+                    void join(folderPath, name).then((path) => setDirector({ path, tool }));
+                  },
+                }))
+              : []),
             {
               label: contextMenu.targets.size === 1 ? "Delete" : "Delete photos",
               danger: true,
@@ -931,6 +944,16 @@ export default function AlbumTab({ active }: { active: boolean }) {
             );
           }}
           onCancel={() => setShowRenamePreview(false)}
+        />
+      )}
+
+      {director && (
+        <DirectorDialog
+          path={director.path}
+          initialTool={director.tool}
+          outputDir={null}
+          onDone={() => void handleRefresh()}
+          onClose={() => setDirector(null)}
         />
       )}
 

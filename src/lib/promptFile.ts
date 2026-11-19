@@ -15,12 +15,20 @@ export type PromptFile = {
   parts: Record<string, string>[];
   /** Every label used in the file, in first-seen order; empty for a plain file. */
   partNames: string[];
+  /** Each entry's weight in random mode (1 unless its line starts with `%N `). */
+  weights: number[];
   mode: PromptFileMode;
   /** The next line in sequential mode. */
   position: number;
   /** Set when the file couldn't be read; it stays listed so its token isn't silently dropped. */
   error: string | null;
+  /** Found in the wildcards folder rather than added by hand. */
+  fromFolder?: boolean;
 };
+
+// `%3 red dress`: this line comes up 3 times as often in random mode. `%`
+// never starts a Danbooru tag, and `::` is NovelAI's own weight syntax.
+const WEIGHT = /^%(\d+(?:\.\d+)?)\s+(.*)$/;
 
 /** The project's `wildcards` folder, where prompt files live by default. */
 export async function wildcardsDir(): Promise<string> {
@@ -50,10 +58,11 @@ const PART_LINE = /^([A-Za-z][A-Za-z0-9 _-]{0,29}):(?:\s+(.*))?$/;
  *
  * Lines starting with `#` are comments in any file.
  */
-export function parseEntries(rawLines: string[]): Pick<PromptFile, "lines" | "parts" | "partNames"> {
+export function parseEntries(rawLines: string[]): Pick<PromptFile, "lines" | "parts" | "partNames" | "weights"> {
   const lines: string[] = [];
   const parts: Record<string, string>[] = [];
   const partNames: string[] = [];
+  const weights: number[] = [];
   for (const raw of rawLines) {
     if (raw.startsWith("#")) continue;
     const m = PART_LINE.exec(raw);
@@ -62,11 +71,14 @@ export function parseEntries(rawLines: string[]): Pick<PromptFile, "lines" | "pa
       parts[parts.length - 1][label] = (m[2] ?? "").trim();
       if (!partNames.includes(label)) partNames.push(label);
     } else {
-      lines.push(raw);
+      const w = WEIGHT.exec(raw);
+      const weight = w ? Number(w[1]) : 1;
+      lines.push(w ? w[2] : raw);
+      weights.push(Number.isFinite(weight) && weight > 0 ? weight : 1);
       parts.push({});
     }
   }
-  return { lines, parts, partNames };
+  return { lines, parts, partNames, weights };
 }
 
 /** One prompt segment per non-blank line, as parsed in Rust. */
@@ -76,11 +88,11 @@ export async function readPromptFile(path: string): Promise<string[]> {
 
 /** Reads a file and its saved sequential position. Never throws. */
 export async function openPromptFile(path: string, name: string, mode: PromptFileMode): Promise<PromptFile> {
-  let entries: Pick<PromptFile, "lines" | "parts" | "partNames">;
+  let entries: Pick<PromptFile, "lines" | "parts" | "partNames" | "weights">;
   try {
     entries = parseEntries(await readPromptFile(path));
   } catch (err) {
-    return { path, name, lines: [], parts: [], partNames: [], mode, position: 0, error: String(err) };
+    return { path, name, lines: [], parts: [], partNames: [], weights: [], mode, position: 0, error: String(err) };
   }
   // The file may have been edited since; keep the saved position in range.
   // A position that can't be read just means starting from the first entry.
@@ -99,12 +111,28 @@ export function pickLineIndices(
   position: number,
   count: number,
   random: () => number = Math.random,
+  weights?: number[],
 ): number[] {
   return Array.from({ length: count }, (_, i) =>
-    mode === "sequential"
-      ? (position + i) % lineCount
-      : Math.floor(random() * lineCount),
+    mode === "sequential" ? (position + i) % lineCount : weightedIndex(lineCount, random, weights),
   );
+}
+
+/** A random index, each `weights[i]` times as likely as a weight of 1 (all 1 when absent). */
+export function weightedIndex(count: number, random: () => number, weights?: number[]): number {
+  if (!weights || weights.length !== count || weights.every((w) => w === 1)) return Math.floor(random() * count);
+  const total = weights.reduce((a, b) => a + b, 0);
+  let r = random() * total;
+  for (let i = 0; i < count; i++) {
+    r -= weights[i];
+    if (r < 0) return i;
+  }
+  return count - 1;
+}
+
+/** The .txt files in a wildcards folder and its subfolders. */
+export async function listWildcardFiles(dir: string): Promise<{ path: string; relative: string }[]> {
+  return invoke("list_wildcard_files", { dir });
 }
 
 // Sequential positions are kept per file path, so removing and re-adding a

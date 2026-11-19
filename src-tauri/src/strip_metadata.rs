@@ -107,7 +107,7 @@ fn scrub_alpha(img: DynamicImage) -> DynamicImage {
 // through the encoder directly at a high quality instead of the plain
 // `save()` default (75), since this operation is meant to remove metadata,
 // not visibly recompress people's photos.
-fn strip_one(path: &Path) -> Result<(), String> {
+pub fn strip_one(path: &Path) -> Result<(), String> {
     let img = scrub_alpha(image::open(path).map_err(|e| format!("{}: {e}", path.display()))?);
     let format = ImageFormat::from_path(path).map_err(|e| format!("{}: {e}", path.display()))?;
 

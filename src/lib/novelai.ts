@@ -13,7 +13,12 @@ export type AccountStatus = {
   tierName: string;
   active: boolean;
   isOpus: boolean;
+  /** Subscription and purchased Anlas together. */
   anlas: number;
+  /** The subscription's monthly Anlas left (10,000 a month on Opus). */
+  subscriptionAnlas: number;
+  /** Anlas bought separately; they don't expire. */
+  purchasedAnlas: number;
   usage: UsageStatus | null;
 };
 
@@ -43,24 +48,72 @@ export type ModelInfo = {
   fixedSteps?: number;
   /** Supports Vibe Transfer (V5 doesn't yet). */
   vibes: boolean;
+  /** How many character prompts NovelAI takes: 22 on V5, 6 on V4/V4.5. */
+  maxCharacters: number;
+  /** Supports Precise Reference (V4.5 only so far; V5 later). */
+  preciseReference: boolean;
 };
 
 // Mirrors the Rust-side allowlist; the backend validates these again.
+// When NovelAI adds a feature to a model, flip its flag here and in
+// novelai-core.
+const V5 = { usageLimited: true, vibes: false, maxCharacters: 22, preciseReference: false };
+const V45 = { usageLimited: false, vibes: true, maxCharacters: 6, preciseReference: true };
+const V4 = { usageLimited: false, vibes: true, maxCharacters: 6, preciseReference: false };
 export const MODELS: ModelInfo[] = [
-  { id: "nai-diffusion-5-full", label: "NAI Diffusion V5 Full", usageLimited: true, vibes: false },
-  {
-    id: "nai-diffusion-5-full-medium",
-    label: "NAI Diffusion V5 Full (Medium Effort)",
-    usageLimited: true,
-    fixedSteps: 14,
-    vibes: false,
-  },
-  { id: "nai-diffusion-5-curated", label: "NAI Diffusion V5 Curated", usageLimited: true, vibes: false },
-  { id: "nai-diffusion-4-5-full", label: "NAI Diffusion V4.5 Full", usageLimited: false, vibes: true },
-  { id: "nai-diffusion-4-5-curated", label: "NAI Diffusion V4.5 Curated", usageLimited: false, vibes: true },
-  { id: "nai-diffusion-4-full", label: "NAI Diffusion V4 Full", usageLimited: false, vibes: true },
-  { id: "nai-diffusion-4-curated-preview", label: "NAI Diffusion V4 Curated", usageLimited: false, vibes: true },
+  { id: "nai-diffusion-5-full", label: "NAI Diffusion V5 Full", ...V5 },
+  { id: "nai-diffusion-5-full-medium", label: "NAI Diffusion V5 Full (Medium Effort)", ...V5, fixedSteps: 14 },
+  { id: "nai-diffusion-5-curated", label: "NAI Diffusion V5 Curated", ...V5 },
+  { id: "nai-diffusion-4-5-full", label: "NAI Diffusion V4.5 Full", ...V45 },
+  { id: "nai-diffusion-4-5-curated", label: "NAI Diffusion V4.5 Curated", ...V45 },
+  { id: "nai-diffusion-4-full", label: "NAI Diffusion V4 Full", ...V4 },
+  { id: "nai-diffusion-4-curated-preview", label: "NAI Diffusion V4 Curated", ...V4 },
 ];
+
+export function modelInfo(id: string): ModelInfo | undefined {
+  return MODELS.find((m) => m.id === id);
+}
+
+/** "V5", "V4.5" or "V4", for messages. */
+export function modelFamily(id: string): string {
+  return id.startsWith("nai-diffusion-5") ? "V5" : id.startsWith("nai-diffusion-4-5") ? "V4.5" : "V4";
+}
+
+/** Character prompts `model` takes (22 on V5, 6 on V4/V4.5). */
+export function maxCharactersFor(model: string): number {
+  return modelInfo(model)?.maxCharacters ?? 6;
+}
+/** The most any model takes. */
+export const MAX_CHARACTERS_ANY = 22;
+
+/** Samplers NovelAI's web client offers; Rust checks the same list. */
+export const SAMPLERS: { id: string; label: string }[] = [
+  { id: "k_euler_ancestral", label: "Euler Ancestral" },
+  { id: "k_euler", label: "Euler" },
+  { id: "k_dpmpp_2s_ancestral", label: "DPM++ 2S Ancestral" },
+  { id: "k_dpmpp_2m_sde", label: "DPM++ 2M SDE" },
+  { id: "k_dpmpp_2m", label: "DPM++ 2M" },
+  { id: "k_dpmpp_sde", label: "DPM++ SDE" },
+];
+export const DEFAULT_SAMPLER = "k_euler_ancestral";
+export const NOISE_SCHEDULES: { id: string; label: string }[] = [
+  { id: "karras", label: "Karras" },
+  { id: "exponential", label: "Exponential" },
+  { id: "polyexponential", label: "Polyexponential" },
+];
+export const DEFAULT_NOISE_SCHEDULE = "karras";
+
+/**
+ * The value NovelAI's site sends as `skip_cfg_above_sigma` with Variety+ on:
+ * 58 at 832×1216, scaled with the square root of the pixel count. Mirrors
+ * `variety_plus_sigma` in novelai-core. Not yet checked against images made
+ * on novelai.net with Variety+ (VARIETY_PLUS_VERIFIED).
+ */
+export function varietyPlusSigma(_model: string, width: number, height: number): number {
+  const latent = 4 * (width / 8) * (height / 8);
+  return Math.round(58 * Math.sqrt(latent / 63232) * 1e6) / 1e6;
+}
+export const VARIETY_PLUS_VERIFIED = false;
 
 export const DEFAULT_STEPS = 28;
 // More than 28 steps costs Anlas even on Opus.
@@ -112,8 +165,6 @@ export function fitFreeSize(width: number | null, height: number | null): { widt
   }
   return { width: w, height: h };
 }
-
-export const MAX_CHARACTERS = 4;
 
 /** Where a character sits, as fractions of the image from its top-left corner. */
 export type CharacterPosition = { x: number; y: number };
@@ -212,7 +263,31 @@ export type GenerateRequest = {
   vibes: VibeRef[];
   /** Image to image: the picture to start from and how much may change (0–1). */
   sourceImage?: { path: string; strength: number } | null;
+  /** Null or absent: NovelAI's defaults (Euler Ancestral, Karras). */
+  sampler?: string | null;
+  noiseSchedule?: string | null;
+  /** Variety+: set to `varietyPlusSigma(...)`; null leaves it off. */
+  skipCfgAboveSigma?: number | null;
+  /** Precise Reference images (V4.5; NovelAI charges 5 Anlas each per image). */
+  preciseReferences?: PreciseReference[];
 };
+
+export type ReferenceKind = "character" | "style" | "character&style";
+export type PreciseReference = { path: string; kind: ReferenceKind; strength: number; fidelity: number };
+/** NovelAI's charge per reference per image. */
+export const PRECISE_REFERENCE_COST = 5;
+export const MAX_PRECISE_REFERENCES = 4;
+
+/** What a request should cost; `anlas` is null when it can't be priced. */
+export type CostEstimate = { free: boolean; anlas: number | null; reasons: string[] };
+
+/** Rust's cost estimate for each request, against `account` (null: unknown). */
+export async function estimateCosts(
+  requests: GenerateRequest[],
+  account: AccountStatus | null,
+): Promise<CostEstimate[]> {
+  return invoke("nai_estimate_costs", { requests, account });
+}
 
 /** Settings read from a NovelAI image's metadata, before deciding what applies. */
 export type ImportedSettings = {
@@ -231,6 +306,10 @@ export type ImportedSettings = {
   /** Our model ID, or null if the image's model isn't one this tab offers. */
   model: string | null;
   source: string | null;
+  sampler: string | null;
+  noiseSchedule: string | null;
+  /** Set when the image was made with Variety+. */
+  skipCfgAboveSigma: number | null;
 };
 
 export async function readImageMetadata(path: string): Promise<ImportedSettings> {
@@ -251,6 +330,9 @@ export type FormValues = {
   characterPositions: CharacterPosition[] | null;
   steps?: number;
   scale?: number;
+  sampler?: string;
+  noiseSchedule?: string;
+  varietyPlus?: boolean;
 };
 
 export type ImportPlan = {
@@ -263,21 +345,23 @@ export type ImportPlan = {
 
 // Works out which of an image's settings this tab can apply, clamping or
 // skipping anything outside its limits instead of failing the whole import.
-export function buildImportPlan(s: ImportedSettings): ImportPlan {
+// `currentModel` is the form's model, kept when the image's isn't offered.
+export function buildImportPlan(s: ImportedSettings, currentModel?: string): ImportPlan {
   const applied: ImportPlan["applied"] = [];
   const skipped: string[] = [];
+  const model = MODELS.find((m) => m.id === s.model);
+  // The model the characters will be used with decides how many fit.
+  const max = maxCharactersFor(model?.id ?? currentModel ?? "");
+  const kept = s.characters.slice(0, max);
   const values: FormValues = {
     prompt: s.prompt,
     negativePrompt: s.negativePrompt,
-    characters: s.characters.slice(0, MAX_CHARACTERS),
-    characterNegatives: s.characters.slice(0, MAX_CHARACTERS).map((_, i) => s.characterNegatives[i] ?? ""),
-    characterPositions: s.characterPositions
-      ? s.characters.slice(0, MAX_CHARACTERS).map((_, i) => s.characterPositions?.[i] ?? CENTER)
-      : null,
+    characters: kept,
+    characterNegatives: kept.map((_, i) => s.characterNegatives[i] ?? ""),
+    characterPositions: s.characterPositions ? kept.map((_, i) => s.characterPositions?.[i] ?? CENTER) : null,
   };
   const shorten = (t: string) => (t.length > 90 ? t.slice(0, 90) + "…" : t || "(empty)");
 
-  const model = MODELS.find((m) => m.id === s.model);
   if (model) {
     values.model = model.id;
     applied.push({ label: "Model", value: model.label });
@@ -315,9 +399,9 @@ export function buildImportPlan(s: ImportedSettings): ImportPlan {
         : "AI's choice",
     });
   }
-  if (s.characters.length > MAX_CHARACTERS) {
+  if (s.characters.length > max) {
     skipped.push(
-      `Characters: only the first ${MAX_CHARACTERS} of ${s.characters.length} are imported.`,
+      `Characters: ${modelFamily(model?.id ?? currentModel ?? "")} takes ${max}, so only the first ${max} of ${s.characters.length} are imported.`,
     );
   }
 
@@ -356,6 +440,17 @@ export function buildImportPlan(s: ImportedSettings): ImportPlan {
     }
   }
 
+  if (s.sampler && SAMPLERS.some((x) => x.id === s.sampler)) {
+    values.sampler = s.sampler;
+    applied.push({ label: "Sampler", value: SAMPLERS.find((x) => x.id === s.sampler)!.label });
+  }
+  if (s.noiseSchedule && NOISE_SCHEDULES.some((x) => x.id === s.noiseSchedule)) {
+    values.noiseSchedule = s.noiseSchedule;
+    applied.push({ label: "Noise schedule", value: NOISE_SCHEDULES.find((x) => x.id === s.noiseSchedule)!.label });
+  }
+  values.varietyPlus = s.skipCfgAboveSigma !== null && s.skipCfgAboveSigma > 0;
+  applied.push({ label: "Variety+", value: values.varietyPlus ? "On" : "Off" });
+
   if (s.seed !== null) {
     skipped.push(`Seed ${s.seed}: not imported, since every generation here uses a random seed.`);
   }
@@ -370,6 +465,8 @@ export type BatchProgress = {
   done: number;
   total: number;
   image: GeneratedImage | null;
+  /** The account after an image, when the Anlas guard checked it. */
+  account: AccountStatus | null;
 };
 
 export type BatchSummary = {

@@ -1,6 +1,17 @@
 import ThemeSwitch from "./ThemeSwitch";
 
-export type TabId = "album" | "matching" | "detection" | "stripMetadata" | "generate" | "upscale" | "convert" | "characterCard" | "remix";
+export const TAB_IDS = [
+  "generate",
+  "album",
+  "matching",
+  "detection",
+  "stripMetadata",
+  "upscale",
+  "remix",
+  "convert",
+  "characterCard",
+] as const;
+export type TabId = (typeof TAB_IDS)[number];
 
 type Theme = "light" | "dark";
 
@@ -321,6 +332,13 @@ export default function Sidebar({
 
       <nav style={{ flex: 1, padding: 8 }}>
         <NavItem
+          icon={<GenerateTabIcon color={iconColorFor("generate")} />}
+          label="Generate"
+          active={activeTab === "generate"}
+          collapsed={collapsed}
+          onClick={() => onSelectTab("generate")}
+        />
+        <NavItem
           icon={<FolderTabIcon color={iconColorFor("album")} />}
           label="Album"
           active={activeTab === "album"}
@@ -347,13 +365,6 @@ export default function Sidebar({
           active={activeTab === "stripMetadata"}
           collapsed={collapsed}
           onClick={() => onSelectTab("stripMetadata")}
-        />
-        <NavItem
-          icon={<GenerateTabIcon color={iconColorFor("generate")} />}
-          label="Generate"
-          active={activeTab === "generate"}
-          collapsed={collapsed}
-          onClick={() => onSelectTab("generate")}
         />
         <NavItem
           icon={<UpscaleTabIcon color={iconColorFor("upscale")} />}
@@ -402,7 +413,7 @@ export default function Sidebar({
               fontFamily: "'IBM Plex Mono', monospace",
             }}
           >
-            v1.4
+            v1.5
           </span>
         )}
         <ThemeSwitch theme={theme} onToggle={onToggleTheme} />

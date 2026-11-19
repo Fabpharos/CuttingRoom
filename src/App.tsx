@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import "./theme.css";
-import Sidebar, { type TabId } from "./components/Sidebar";
+import Sidebar, { TAB_IDS, type TabId } from "./components/Sidebar";
+import { loadLastTab, saveLastTab } from "./lib/appSettings";
 import AlbumTab from "./components/AlbumTab";
 import MatchingTab from "./components/MatchingTab";
 import DetectionTab from "./components/DetectionTab";
@@ -30,10 +31,25 @@ function TabPanel({ active, children }: { active: boolean; children: React.React
 export default function App() {
   const [theme, setTheme] = useState<Theme>(getSystemTheme);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [activeTab, setActiveTab] = useState<TabId>("album");
+  // Generate until the saved tab has loaded, so Album never flashes first.
+  const [activeTab, setActiveTab] = useState<TabId>("generate");
+  const [tabLoaded, setTabLoaded] = useState(false);
   // A prompt sent from Convert to Generate; the id makes each send new.
   const [sentToGenerate, setSentToGenerate] = useState<IncomingSettings | null>(null);
   const [remixJob, setRemixJob] = useState<RemixJob | null>(null);
+
+  // Reopen the tab that was showing last time; Generate on a first launch.
+  useEffect(() => {
+    loadLastTab()
+      .then((t) => {
+        if (t && (TAB_IDS as readonly string[]).includes(t)) setActiveTab(t as TabId);
+      })
+      .catch(() => {})
+      .finally(() => setTabLoaded(true));
+  }, []);
+  useEffect(() => {
+    if (tabLoaded) saveLastTab(activeTab).catch(() => {});
+  }, [activeTab, tabLoaded]);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -58,6 +74,9 @@ export default function App() {
         onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
       />
       <div style={{ flex: 1, minWidth: 0, overflowY: "auto" }}>
+        <TabPanel active={activeTab === "generate"}>
+          <GenerateTab active={activeTab === "generate"} incoming={sentToGenerate} remix={remixJob} />
+        </TabPanel>
         <TabPanel active={activeTab === "album"}>
           <AlbumTab active={activeTab === "album"} />
         </TabPanel>
@@ -69,9 +88,6 @@ export default function App() {
         </TabPanel>
         <TabPanel active={activeTab === "stripMetadata"}>
           <StripMetadataTab />
-        </TabPanel>
-        <TabPanel active={activeTab === "generate"}>
-          <GenerateTab active={activeTab === "generate"} incoming={sentToGenerate} remix={remixJob} />
         </TabPanel>
         <TabPanel active={activeTab === "upscale"}>
           <UpscaleTab active={activeTab === "upscale"} />

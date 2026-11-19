@@ -4,6 +4,7 @@ mod novelai;
 mod pdf_export;
 mod prompt_scan;
 mod character_preset;
+mod library;
 mod strip_metadata;
 
 use detection::{DetectionOutput, DetectionProgress, PixelateJob};
@@ -276,6 +277,57 @@ async fn save_character_card(
 }
 
 #[tauri::command]
+async fn nai_plan_director(request: novelai::DirectorRequest) -> Result<novelai::DirectorPlan, String> {
+    novelai::plan_director_file(request).await
+}
+
+#[tauri::command]
+async fn nai_run_director(
+    run_id: String,
+    request: novelai::DirectorRequest,
+    output_dir: String,
+    guard_anlas: bool,
+) -> Result<novelai::DirectorOutcome, String> {
+    novelai::run_director(run_id, request, output_dir, guard_anlas).await
+}
+
+#[tauri::command]
+async fn nai_encode_vibe(
+    run_id: String,
+    path: String,
+    model: String,
+    information_extracted: f64,
+    out_dir: String,
+) -> Result<novelai::EncodedVibe, String> {
+    novelai::encode_vibe(run_id, path, model, information_extracted, out_dir).await
+}
+
+#[tauri::command]
+async fn list_vibe_files(dir: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || novelai::list_vibe_files(&dir))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Strips metadata from the given files in place (a workflow plan's last step).
+#[tauri::command]
+async fn strip_metadata_files(paths: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        paths.iter().try_for_each(|p| strip_metadata::strip_one(std::path::Path::new(p)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn nai_estimate_costs(
+    requests: Vec<novelai::GenerateRequest>,
+    account: Option<novelai::AccountStatus>,
+) -> Vec<novelai::CostEstimate> {
+    requests.iter().map(|r| novelai::estimate_cost(r, account.as_ref())).collect()
+}
+
+#[tauri::command]
 async fn nai_read_image_metadata(path: String) -> Result<novelai::ImportedSettings, String> {
     novelai::read_image_metadata(path).await
 }
@@ -321,6 +373,41 @@ fn wildcards_path() -> Result<std::path::PathBuf, String> {
 }
 
 #[tauri::command]
+async fn library_read(folder: String, sub: String, name: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || library::read(&folder, &sub, &name))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn library_write(folder: String, sub: String, name: String, value: serde_json::Value) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || library::write(&folder, &sub, &name, &value))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn library_list(folder: String, sub: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || library::list(&folder, &sub))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn write_prompt_file(path: String, lines: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || library::write_prompt_file(&path, &lines))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn list_wildcard_files(dir: String) -> Result<Vec<library::WildcardFile>, String> {
+    tauri::async_runtime::spawn_blocking(move || library::list_wildcards(&dir))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 fn wildcards_dir() -> Result<String, String> {
     Ok(wildcards_path()?.to_string_lossy().into_owned())
 }
@@ -360,6 +447,12 @@ pub fn run() {
             nai_clear_token,
             nai_generate_batch,
             nai_cancel_batch,
+            nai_estimate_costs,
+            strip_metadata_files,
+            nai_encode_vibe,
+            list_vibe_files,
+            nai_plan_director,
+            nai_run_director,
             nai_read_image_metadata,
             scan_image_prompt,
             list_character_cards,
@@ -369,6 +462,11 @@ pub fn run() {
             nai_scan_upscale,
             nai_upscale_batch,
             wildcards_dir,
+            library_read,
+            library_write,
+            library_list,
+            list_wildcard_files,
+            write_prompt_file,
             open_wildcards_dir
         ])
         .run(tauri::generate_context!())

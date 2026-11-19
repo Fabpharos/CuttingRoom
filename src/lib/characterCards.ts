@@ -21,29 +21,106 @@ export const PARTS: { key: Part; label: string; hint: string }[] = [
 
 export type CardTag = { text: string; part: Part };
 
+export type Gender = "female" | "male" | "other";
+export const GENDERS: { key: Gender; label: string }[] = [
+  { key: "female", label: "Female" },
+  { key: "male", label: "Male" },
+  { key: "other", label: "Other" },
+];
+
+/** A tag swap the card asks for: `$c1 swap: from$` becomes `to`. */
+export type CardSwap = { from: string; to: string };
+
+/** A Precise Reference image that comes with the card (V4.5 for now). */
+export type CardReference = {
+  path: string;
+  type: "character" | "character&style";
+  /** 0–1. */
+  strength: number;
+  /** 0–1. */
+  fidelity: number;
+};
+
 export type CharacterCard = {
-  version: 1;
+  version: 2;
   name: string;
   /** The character's prompt, tag by tag, in order. */
   tags: CardTag[];
   /** The character's undesired content. */
   negative: string;
+  gender: Gender;
+  /** The user's own groups ("pokemon", "oc"), for pools and associations. */
+  labels: string[];
+  swaps: CardSwap[];
+  reference: CardReference | null;
 };
+
+/** A new, empty card's extra fields. */
+export const CARD_V2_DEFAULTS = { gender: "other" as Gender, labels: [] as string[], swaps: [] as CardSwap[], reference: null };
+
+/** Best guess at a card's gender from its tags, for v1 cards and new ones. */
+export function guessGender(tags: { text: string }[]): Gender {
+  const t = new Set(tags.map((x) => bareTag(x.text)));
+  const female = ["1girl", "girl", "female", "woman", "2girls", "multiple girls"].some((g) => t.has(g));
+  const male = ["1boy", "boy", "male", "man", "2boys", "multiple boys"].some((g) => t.has(g));
+  return female && !male ? "female" : male && !female ? "male" : "other";
+}
+
+/** Labels as typed: lowercased, trimmed, unique, no empty ones. */
+export function cleanLabels(labels: string[]): string[] {
+  return [...new Set(labels.map((l) => l.trim().toLowerCase()).filter(Boolean))];
+}
 
 export type CardFile = { path: string; card: CharacterCard };
 
 const isPart = (v: unknown): v is Part => PARTS.some((p) => p.key === v);
 
-/** A card read from disk, or null if it isn't one this version understands. */
-function parseCard(raw: unknown): CharacterCard | null {
+const isGender = (v: unknown): v is Gender => GENDERS.some((g) => g.key === v);
+const unit = (v: unknown, fallback: number) =>
+  typeof v === "number" && Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : fallback;
+
+function parseReference(raw: unknown): CardReference | null {
   if (typeof raw !== "object" || raw === null) return null;
   const r = raw as Record<string, unknown>;
-  if (r.version !== 1 || typeof r.name !== "string" || !Array.isArray(r.tags)) return null;
+  if (typeof r.path !== "string" || !r.path) return null;
+  return {
+    path: r.path,
+    type: r.type === "character&style" ? "character&style" : "character",
+    strength: unit(r.strength, 1),
+    fidelity: unit(r.fidelity, 1),
+  };
+}
+
+/**
+ * A card read from disk, or null if it isn't one. Version 1 cards (name,
+ * tags, negative) are read as version 2 with their gender guessed from tags.
+ */
+export function parseCard(raw: unknown): CharacterCard | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  if ((r.version !== 1 && r.version !== 2) || typeof r.name !== "string" || !Array.isArray(r.tags)) return null;
   const tags = r.tags.flatMap((t) => {
     const o = t as Record<string, unknown> | null;
     return o && typeof o.text === "string" && isPart(o.part) ? [{ text: o.text, part: o.part }] : [];
   });
-  return { version: 1, name: r.name, tags, negative: typeof r.negative === "string" ? r.negative : "" };
+  const swaps = Array.isArray(r.swaps)
+    ? r.swaps.flatMap((x) => {
+        const o = x as Record<string, unknown> | null;
+        return o && typeof o.from === "string" && typeof o.to === "string" && o.from.trim()
+          ? [{ from: o.from.trim(), to: o.to.trim() }]
+          : [];
+      })
+    : [];
+  return {
+    version: 2,
+    name: r.name,
+    tags,
+    negative: typeof r.negative === "string" ? r.negative : "",
+    gender: isGender(r.gender) ? r.gender : guessGender(tags),
+    labels: Array.isArray(r.labels) ? cleanLabels(r.labels.filter((l): l is string => typeof l === "string")) : [],
+    swaps,
+    reference: parseReference(r.reference),
+  };
 }
 
 export async function listCards(folder: string): Promise<CardFile[]> {
@@ -155,8 +232,36 @@ export function buildCharacterPrompt(card: CharacterCard, hidden: Set<Part>, opt
 
 // --- A card in Generate that adapts to each image's view tags
 
-/** The card a Generate character was filled from, kept so each image can drop what it won't show. */
-export type CardLink = { name: string; tags: CardTag[] };
+/**
+ * The card a Generate character was filled from, kept so each image can drop
+ * what it won't show, and so `$c1$`, swaps and the reference image work.
+ */
+export type CardLink = {
+  name: string;
+  tags: CardTag[];
+  gender?: Gender;
+  labels?: string[];
+  swaps?: CardSwap[];
+  reference?: CardReference | null;
+  /** The card's undesired content. */
+  negative?: string;
+  /** The card's file, when known. */
+  path?: string;
+};
+
+/** The link a character keeps to `card`. */
+export function linkFor(card: CharacterCard, path?: string): CardLink {
+  return {
+    name: card.name,
+    tags: card.tags,
+    gender: card.gender,
+    labels: card.labels,
+    swaps: card.swaps,
+    reference: card.reference,
+    negative: card.negative,
+    path,
+  };
+}
 
 /**
  * View tags that put parts of a carded character out of sight: the four
@@ -221,5 +326,16 @@ export function parseCardLink(raw: unknown): CardLink | null {
     const o = t as Record<string, unknown> | null;
     return o && typeof o.text === "string" && isPart(o.part) ? [{ text: o.text, part: o.part }] : [];
   });
-  return { name: r.name, tags };
+  // The rest is what the card said when it was loaded; parseCard checks it the same way.
+  const full = parseCard({ ...r, version: 2 });
+  return {
+    name: r.name,
+    tags,
+    gender: full?.gender,
+    labels: full?.labels ?? [],
+    swaps: full?.swaps ?? [],
+    reference: full?.reference ?? null,
+    negative: typeof r.negative === "string" ? r.negative : undefined,
+    path: typeof r.path === "string" ? r.path : undefined,
+  };
 }

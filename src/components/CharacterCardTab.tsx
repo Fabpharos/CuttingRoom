@@ -15,10 +15,19 @@ import {
   saveCard,
   saveCardFolder,
   tagsFromPrompt,
+  GENDERS,
+  CARD_V2_DEFAULTS,
+  cleanLabels,
+  guessGender,
   type CardFile,
+  type CardReference,
+  type CardSwap,
   type CardTag,
+  type Gender,
   type Part,
 } from "../lib/characterCards";
+import HelpTip from "./HelpTip";
+import AssociationsDialog from "./AssociationsDialog";
 
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "webp"];
 
@@ -85,6 +94,11 @@ type Draft = {
   text: string;
   tags: CardTag[];
   negative: string;
+  gender: Gender;
+  /** Comma-separated, as typed. */
+  labels: string;
+  swaps: CardSwap[];
+  reference: CardReference | null;
   /** The prompts the source image has (new cards only). */
   choices: PromptChoice[];
   choice: number;
@@ -103,6 +117,7 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
   const [version, setVersion] = useState(0);
+  const [showAssociations, setShowAssociations] = useState(false);
 
   // Prompt boxes marked data-tags get Danbooru tag suggestions.
   const rootRef = useRef<HTMLDivElement>(null);
@@ -167,6 +182,10 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
         text: promptOf(file.card.tags),
         tags: file.card.tags,
         negative: file.card.negative,
+        gender: file.card.gender,
+        labels: file.card.labels.join(", "),
+        swaps: file.card.swaps,
+        reference: file.card.reference,
         choices: [],
         choice: 0,
       });
@@ -197,6 +216,9 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
       text: first?.prompt ?? "",
       tags,
       negative: first?.negative ?? "",
+      ...CARD_V2_DEFAULTS,
+      gender: guessGender(tags),
+      labels: "",
       choices,
       choice: 0,
     });
@@ -304,7 +326,16 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
     setSaving(true);
     setError(null);
     try {
-      const card = { version: 1 as const, name: draft.name.trim(), tags: draft.tags, negative: draft.negative };
+      const card = {
+        version: 2 as const,
+        name: draft.name.trim(),
+        tags: draft.tags,
+        negative: draft.negative,
+        gender: draft.gender,
+        labels: cleanLabels(draft.labels.split(",")),
+        swaps: draft.swaps.filter((x) => x.from.trim()),
+        reference: draft.reference,
+      };
       const path = await saveCard(f, card, draft.path ? { existing: draft.path } : { image: draft.image! });
       await refresh(f);
       setDraft({ ...draft, path, image: null, name: card.name, choices: [], choice: 0 });
@@ -315,6 +346,16 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
     } finally {
       setSaving(false);
     }
+  }
+
+  async function chooseReference() {
+    const picked = await open({
+      directory: false,
+      multiple: false,
+      filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp"] }],
+    });
+    if (typeof picked !== "string" || !draft) return;
+    edit({ reference: { type: "character", strength: 1, fidelity: 1, ...draft.reference, path: picked } });
   }
 
   async function runDelete(file: CardFile) {
@@ -371,6 +412,9 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
             >
               Refresh
             </a>
+            <button style={{ ...secondaryButtonStyle, marginLeft: "auto" }} onClick={() => setShowAssociations(true)}>
+              Tag associations…
+            </button>
           </>
         )}
       </div>
@@ -599,6 +643,182 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
               />
             </label>
 
+            <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "flex-start" }}>
+              <label style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                <span style={labelStyle}>
+                  Gender
+                  <HelpTip lines={[{ text: "Used by Generate's gender swap and to filter character pools." }]} />
+                </span>
+                <select
+                  value={draft.gender}
+                  onChange={(e) => edit({ gender: e.target.value as Gender })}
+                  style={{ ...textareaStyle, resize: "none", padding: "6px 8px" }}
+                >
+                  {GENDERS.map((g) => (
+                    <option key={g.key} value={g.key}>
+                      {g.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label style={{ display: "flex", flexDirection: "column", gap: 5, flex: "1 1 240px" }}>
+                <span style={labelStyle}>
+                  Labels
+                  <HelpTip
+                    lines={[
+                      { text: "Your own groups, separated by commas (e.g. pokemon, oc, manga-cast)." },
+                      { text: "Generate can pick the next or a random card from a label, and tag associations can apply only to cards with a label." },
+                    ]}
+                  />
+                </span>
+                <input
+                  value={draft.labels}
+                  onChange={(e) => edit({ labels: e.target.value })}
+                  placeholder="e.g. oc, manga-cast"
+                  style={{ ...textareaStyle, resize: "none" }}
+                />
+              </label>
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <span style={labelStyle}>
+                Swaps
+                <HelpTip
+                  lines={[
+                    { syntax: "$c1 swap: boy$", text: "In Generate, becomes this card's replacement for “boy” (when it's in slot 1)." },
+                    { text: "e.g. boy → girl, so one prompt works whichever card is in the slot." },
+                  ]}
+                />
+              </span>
+              {draft.swaps.map((sw, i) => (
+                <div key={i} style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                  <input
+                    value={sw.from}
+                    onChange={(e) => edit({ swaps: draft.swaps.map((x, j) => (j === i ? { ...x, from: e.target.value } : x)) })}
+                    placeholder="tag"
+                    style={{ ...textareaStyle, resize: "none", padding: "4px 8px", flex: 1 }}
+                  />
+                  <span style={{ color: "var(--muted)" }}>→</span>
+                  <input
+                    value={sw.to}
+                    onChange={(e) => edit({ swaps: draft.swaps.map((x, j) => (j === i ? { ...x, to: e.target.value } : x)) })}
+                    placeholder="becomes"
+                    style={{ ...textareaStyle, resize: "none", padding: "4px 8px", flex: 1 }}
+                  />
+                  <a
+                    href="#"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      edit({ swaps: draft.swaps.filter((_, j) => j !== i) });
+                    }}
+                    style={{ fontSize: 12, fontWeight: 600 }}
+                  >
+                    Remove
+                  </a>
+                </div>
+              ))}
+              <a
+                href="#"
+                onClick={(e) => {
+                  e.preventDefault();
+                  edit({ swaps: [...draft.swaps, { from: "", to: "" }] });
+                }}
+                style={{ fontSize: 12.5, fontWeight: 600, alignSelf: "flex-start" }}
+              >
+                + Add swap
+              </a>
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <span style={labelStyle}>
+                Precise Reference
+                <HelpTip
+                  lines={[
+                    { text: "A reference image that comes with the card, so faces stay the same across images." },
+                    { text: "V4.5 only for now. NovelAI charges 5 Anlas per image for each reference; Generate shows the price and asks first." },
+                  ]}
+                />
+              </span>
+              {draft.reference ? (
+                <div style={{ display: "flex", gap: 12, alignItems: "flex-start", flexWrap: "wrap" }}>
+                  <img
+                    src={convertFileSrc(draft.reference.path)}
+                    alt=""
+                    style={{ width: 72, height: 72, objectFit: "contain", borderRadius: 6, background: "var(--bg-page)" }}
+                  />
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12.5, flex: 1, minWidth: 220 }}>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      {(["character", "character&style"] as const).map((t) => (
+                        <button
+                          key={t}
+                          onClick={() => edit({ reference: { ...draft.reference!, type: t } })}
+                          style={{
+                            ...secondaryButtonStyle,
+                            padding: "3px 10px",
+                            fontSize: 12,
+                            background: draft.reference!.type === t ? "var(--accent)" : "transparent",
+                            color: draft.reference!.type === t ? "var(--accent-contrast)" : "var(--text)",
+                            borderColor: draft.reference!.type === t ? "var(--accent)" : "var(--border)",
+                          }}
+                        >
+                          {t === "character" ? "Character" : "Character & Style"}
+                        </button>
+                      ))}
+                    </div>
+                    {(["strength", "fidelity"] as const).map((k) => (
+                      <label key={k} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <span style={{ minWidth: 92 }}>
+                          {k === "strength" ? "Strength" : "Fidelity"} {draft.reference![k].toFixed(2)}
+                        </span>
+                        <input
+                          type="range"
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          value={draft.reference![k]}
+                          onChange={(e) => edit({ reference: { ...draft.reference!, [k]: Number(e.target.value) } })}
+                          style={{ flex: 1, accentColor: "var(--accent)" }}
+                        />
+                      </label>
+                    ))}
+                    <div style={{ display: "flex", gap: 12 }}>
+                      <a
+                        href="#"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          void chooseReference();
+                        }}
+                        style={{ fontWeight: 600 }}
+                      >
+                        Change image…
+                      </a>
+                      <a
+                        href="#"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          edit({ reference: null });
+                        }}
+                        style={{ fontWeight: 600 }}
+                      >
+                        Remove
+                      </a>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <a
+                  href="#"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    void chooseReference();
+                  }}
+                  style={{ fontSize: 12.5, fontWeight: 600, alignSelf: "flex-start" }}
+                >
+                  Choose reference image…
+                </a>
+              )}
+            </div>
+
             <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
               <button
                 style={{ ...primaryButtonStyle, opacity: saving || !dirty || !draft.name.trim() ? 0.5 : 1 }}
@@ -636,6 +856,10 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
           </div>
         )}
       </div>
+
+      {showAssociations && folder && (
+        <AssociationsDialog folder={folder} cards={cards} onClose={() => setShowAssociations(false)} />
+      )}
 
       {pendingDiscard && (
         <ConfirmModal

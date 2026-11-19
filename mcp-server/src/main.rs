@@ -25,6 +25,8 @@ const INFO: ServerInfo = ServerInfo {
         check a file with novelai_list_vibes first. \
         To repaint part of an image of any size, check the area with novelai_preview_inpaint, \
         then call novelai_inpaint. \
+        To change a character's expression or colour an image, use novelai_emotion or novelai_colorize \
+        (free on Opus; give an `area` on a big image). \
         novelai_upscale costs 1 Anlas per image, so only use it when the user asks for an upscale.",
 };
 

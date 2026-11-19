@@ -15,9 +15,12 @@ use novelai_core::{
     InpaintSettings, MaskSpec,
 };
 use novelai_core::{
-    account_status, generate_batch, is_usage_limited, read_vibe_file, vibe_encoding_for,
+    account_status, estimate_cost, generate_batch, is_usage_limited, read_vibe_file, vibe_encoding_for,
     vibe_encoding_key, AccountStatus, GenerateRequest, VibeInfo, VibeRef, DEFAULT_VIBE_STRENGTH,
-    MAX_CHARACTERS, MAX_FREE_VIBES, MAX_GUIDANCE, MAX_STEPS, MEDIUM_MODEL, MEDIUM_STEPS, MODELS,
+    max_characters, model_family, MAX_CHARACTERS_ANY, MAX_FREE_VIBES, MAX_GUIDANCE, MAX_STEPS, MEDIUM_MODEL, MEDIUM_STEPS, MODELS,
+};
+use novelai_core::{
+    director_stem, plan_director_file, run_director, Area, DirectorPlan, DirectorRequest, DirectorTool, EMOTIONS, MAX_DEFRY,
 };
 use serde_json::{json, Value};
 
@@ -213,8 +216,9 @@ pub fn parse_generate_args(args: &Value) -> Result<GenerateArgs, String> {
         positions.push(at.unwrap_or(CharacterPosition { x: 0.5, y: 0.5 }));
     }
     let character_positions = raw_positions.map(|_| positions);
-    if characters.len() > MAX_CHARACTERS {
-        return Err(format!("At most {MAX_CHARACTERS} character prompts are allowed."));
+    let max = max_characters(&model);
+    if characters.len() > max {
+        return Err(format!("{} allows at most {max} character prompts.", model_family(&model)));
     }
 
     let seed = match args.get("seed") {
@@ -595,6 +599,76 @@ pub fn upscale_approval_text(image: &UpscaleCandidate, anlas: i64, save_to: &str
     t
 }
 
+// ---- Director tools (Emotion, Colorize) ----
+
+#[derive(Debug, PartialEq)]
+pub struct DirectorArgs {
+    pub request: DirectorRequest,
+    pub output_dir: Option<String>,
+}
+
+pub fn parse_director_args(tool: DirectorTool, args: &Value) -> Result<DirectorArgs, String> {
+    let path = args.get("image_path").and_then(Value::as_str).map(str::trim).unwrap_or("");
+    if path.is_empty() {
+        return Err("`image_path` is required: the full path of the image.".into());
+    }
+    let emotion = args.get("emotion").and_then(Value::as_str).unwrap_or("").trim().to_lowercase();
+    if tool == DirectorTool::Emotion && !EMOTIONS.contains(&emotion.as_str()) {
+        return Err(format!("`emotion` must be one of: {}.", EMOTIONS.join(", ")));
+    }
+    let prompt = args.get("prompt").and_then(Value::as_str).unwrap_or("").to_string();
+    let defry = match args.get("strength_level") {
+        None | Some(Value::Null) => 0,
+        Some(v) => match v.as_u64() {
+            Some(n) if n <= MAX_DEFRY as u64 => n as u32,
+            _ => return Err(format!("`strength_level` must be a whole number from 0 (normal) to {MAX_DEFRY} (weakest).")),
+        },
+    };
+    let area = match args.get("area") {
+        None | Some(Value::Null) => None,
+        Some(a) => {
+            let n = |k: &str| a.get(k).and_then(Value::as_u64).filter(|v| *v <= u32::MAX as u64).map(|v| v as u32);
+            match (n("x"), n("y"), n("width"), n("height")) {
+                (Some(x), Some(y), Some(width), Some(height)) => Some(Area { x, y, width, height }),
+                _ => return Err("`area` needs whole-number x, y, width and height in the image's pixels.".into()),
+            }
+        }
+    };
+    let output_dir = match args.get("output_dir") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(d)) if d.trim().is_empty() => None,
+        Some(Value::String(d)) => Some(validate_output_dir(d)?),
+        Some(_) => return Err("`output_dir` must be a string.".into()),
+    };
+    Ok(DirectorArgs {
+        request: DirectorRequest { path: path.to_string(), tool, emotion, prompt, defry, area },
+        output_dir,
+    })
+}
+
+pub fn director_approval_text(a: &DirectorArgs, plan: &DirectorPlan, status: &AccountStatus, save_to: &str) -> String {
+    let r = &a.request;
+    let what = match r.tool {
+        DirectorTool::Emotion => format!("change the expression to \"{}\"", r.emotion),
+        DirectorTool::Colorize => "colorize".to_string(),
+    };
+    let mut t = format!(
+        "COSTS ANLAS: an AI assistant is asking to {what} with your NovelAI account. Your {} subscription doesn't \
+         include free Director tools. You have {} Anlas.\n\n",
+        status.tier_name, status.anlas
+    );
+    t += &format!("Image: {}\n", clip(&r.path));
+    t += &format!(
+        "Area: {}x{} at {},{} (sent at {}x{})\n",
+        plan.area.width, plan.area.height, plan.area.x, plan.area.y, plan.send_width, plan.send_height
+    );
+    if !r.prompt.trim().is_empty() {
+        t += &format!("Prompt: {}\n", clip(&r.prompt));
+    }
+    t += &format!("\nSave to: {} (as {}.png; the original isn't changed)\n\nGo ahead?", clip(save_to), director_stem(r));
+    t
+}
+
 /// One paragraph describing a plan, for the preview and the dialog.
 pub fn describe_plan(plan: &InpaintPlan) -> String {
     let c = plan.crop;
@@ -780,6 +854,57 @@ impl NovelAiTools {
         }
     }
 
+    fn director_tool(&mut self, tool: DirectorTool, arguments: &Value) -> ToolResult {
+        if let Some(reason) = &self.paused {
+            return ToolResult::error(format!(
+                "Generation is paused for this session: {reason} Restart the MCP server to resume."
+            ));
+        }
+        let a = match parse_director_args(tool, arguments) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(e),
+        };
+        let plan = match self.runtime.block_on(plan_director_file(a.request.clone())) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(e),
+        };
+        let status = match self.status() {
+            Ok(s) => s,
+            Err(e) => return ToolResult::error(e),
+        };
+        // Free on Opus within the free size (what's sent always is); anything
+        // else is the user's call, in the server's own dialog.
+        let costs = !status.is_opus;
+        let save_to = a.output_dir.clone().unwrap_or_else(|| self.output_dir.clone());
+        if costs && !(self.approve)("NovelAI Director request (costs Anlas)", &director_approval_text(&a, &plan, &status, &save_to)) {
+            return ToolResult::error("The user declined this request. Don't retry it unless they ask you to.");
+        }
+        let run_id = format!("mcp-director-{}", random_seed());
+        self.pause_before_request();
+        let outcome = match self.runtime.block_on(run_director(run_id, a.request.clone(), save_to, !costs)) {
+            Ok(o) => o,
+            Err(e) => return ToolResult::error(e),
+        };
+        let mut text = format!(
+            "Saved {} ({}x{} area at {},{}; sent at {}x{}). The image below is a downscaled JPEG preview.",
+            outcome.path,
+            plan.area.width,
+            plan.area.height,
+            plan.area.x,
+            plan.area.y,
+            plan.send_width,
+            plan.send_height
+        );
+        if let Some(w) = outcome.anlas_warning {
+            self.paused = Some(w.clone());
+            text += &format!("\n\nWARNING: {w} Further requests are paused for this session.");
+        }
+        ToolResult {
+            content: vec![json!({ "type": "text", "text": text }), image_content(jpeg_preview(&outcome.path))],
+            is_error: false,
+        }
+    }
+
     fn preview_inpaint_tool(&self, arguments: &Value) -> ToolResult {
         let area = match parse_inpaint_area(arguments) {
             Ok(a) => a,
@@ -935,7 +1060,14 @@ impl NovelAiTools {
             file_stem: format!("{}_mcp_{seed}", (self.timestamp)()),
             vibes: vibes.iter().map(|v| v.reference.clone()).collect(),
             source_image: None,
+            ..Default::default()
         };
+        // A second opinion from the shared estimate: anything it says costs
+        // Anlas, that the user wasn't asked about, is refused.
+        let estimate = estimate_cost(&request, Some(&status));
+        if !costs && !estimate.free {
+            return ToolResult::error(format!("This request would cost Anlas: {}", estimate.reasons.join(" ")));
+        }
         self.pause_before_request();
         let summary = match self.runtime.block_on(generate_batch(
             format!("mcp-{seed}"),
@@ -1013,15 +1145,15 @@ impl Tools for NovelAiTools {
                         "prompt": { "type": "string", "description": "Main prompt (NovelAI tags and/or natural language)." },
                         "negative_prompt": { "type": "string", "description": "Undesired content." },
                         "characters": {
-                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS,
-                            "description": "Up to 4 character prompts."
+                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS_ANY,
+                            "description": "Up to 22 character prompts on V5 models, 6 on V4/V4.5."
                         },
                         "character_negatives": {
-                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS,
+                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS_ANY,
                             "description": "Undesired content for each character, in the same order as `characters` (use \"\" to skip one)."
                         },
                         "character_positions": {
-                            "type": "array", "maxItems": MAX_CHARACTERS,
+                            "type": "array", "maxItems": MAX_CHARACTERS_ANY,
                             "items": { "anyOf": [
                                 { "type": "object", "properties": { "x": { "type": "number", "minimum": 0, "maximum": 1 },
                                                                     "y": { "type": "number", "minimum": 0, "maximum": 1 } },
@@ -1162,15 +1294,15 @@ impl Tools for NovelAiTools {
                         "prompt": { "type": "string", "description": "Describe the whole crop as it should look, not only the masked part." },
                         "negative_prompt": { "type": "string", "description": "Undesired content." },
                         "characters": {
-                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS,
-                            "description": "Up to 4 character prompts."
+                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS_ANY,
+                            "description": "Up to 22 character prompts on V5 models, 6 on V4/V4.5."
                         },
                         "character_negatives": {
-                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS,
+                            "type": "array", "items": { "type": "string" }, "maxItems": MAX_CHARACTERS_ANY,
                             "description": "Undesired content for each character, in the same order as `characters` (use \"\" to skip one)."
                         },
                         "character_positions": {
-                            "type": "array", "maxItems": MAX_CHARACTERS,
+                            "type": "array", "maxItems": MAX_CHARACTERS_ANY,
                             "items": { "anyOf": [
                                 { "type": "object", "properties": { "x": { "type": "number", "minimum": 0, "maximum": 1 },
                                                                     "y": { "type": "number", "minimum": 0, "maximum": 1 } },
@@ -1216,6 +1348,52 @@ impl Tools for NovelAiTools {
                 },
             }),
             json!({
+                "name": "novelai_emotion",
+                "description": "Change the expression of the character in ONE image with NovelAI's Emotion Director tool. Free on Opus: \
+                    the image (or the `area` you give, e.g. a face on a big manga page) is sent at no more than 1024x1024 worth \
+                    of pixels and blended back. On a non-Opus account the user is asked in a Windows dialog first. Saved as a new \
+                    <name>_emotion-<emotion>.png; the original isn't changed. Returns a preview.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "image_path": { "type": "string", "description": "Full path of the image." },
+                        "emotion": { "type": "string", "enum": EMOTIONS },
+                        "prompt": { "type": "string", "description": "Optional extra tags, e.g. \"blush, tears\"." },
+                        "strength_level": { "type": "integer", "minimum": 0, "maximum": MAX_DEFRY,
+                                            "description": "0 = normal (strongest change) to 5 = weakest." },
+                        "area": { "type": "object", "description": "Optional part of the image to change, in its pixels (at least 64x64).",
+                                  "properties": { "x": { "type": "integer", "minimum": 0 }, "y": { "type": "integer", "minimum": 0 },
+                                                  "width": { "type": "integer", "minimum": 64 }, "height": { "type": "integer", "minimum": 64 } },
+                                  "required": ["x", "y", "width", "height"], "additionalProperties": false },
+                        "output_dir": { "type": "string", "description": "Folder to save in (full local path). Defaults to the server's output folder." }
+                    },
+                    "required": ["image_path", "emotion"],
+                    "additionalProperties": false
+                },
+            }),
+            json!({
+                "name": "novelai_colorize",
+                "description": "Colorize ONE image (a sketch or greyscale page) with NovelAI's Colorize Director tool. Free on Opus, \
+                    the same way as novelai_emotion (an optional `area` of a bigger image is sent and blended back). Saved as \
+                    a new <name>_colorized.png. Returns a preview.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "image_path": { "type": "string", "description": "Full path of the image." },
+                        "prompt": { "type": "string", "description": "Optional colours to aim for, e.g. \"red hair, blue eyes\"." },
+                        "strength_level": { "type": "integer", "minimum": 0, "maximum": MAX_DEFRY,
+                                            "description": "0 = normal to 5 = weakest." },
+                        "area": { "type": "object",
+                                  "properties": { "x": { "type": "integer", "minimum": 0 }, "y": { "type": "integer", "minimum": 0 },
+                                                  "width": { "type": "integer", "minimum": 64 }, "height": { "type": "integer", "minimum": 64 } },
+                                  "required": ["x", "y", "width", "height"], "additionalProperties": false },
+                        "output_dir": { "type": "string" }
+                    },
+                    "required": ["image_path"],
+                    "additionalProperties": false
+                },
+            }),
+            json!({
                 "name": "novelai_list_vibes",
                 "description": "List the vibes in a NovelAI vibe file (.naiv4vibe, .naiv4vibebundle, or a NovelAI PNG \
                     with vibes embedded): each vibe's index, name, saved settings, and which models it's encoded for. \
@@ -1238,6 +1416,8 @@ impl Tools for NovelAiTools {
             "novelai_preview_inpaint" => Some(self.preview_inpaint_tool(arguments)),
             "novelai_inpaint" => Some(self.inpaint_tool(arguments)),
             "novelai_upscale" => Some(self.upscale_tool(arguments)),
+            "novelai_emotion" => Some(self.director_tool(DirectorTool::Emotion, arguments)),
+            "novelai_colorize" => Some(self.director_tool(DirectorTool::Colorize, arguments)),
             _ => None,
         }
     }
@@ -1267,7 +1447,8 @@ mod tests {
             json!({ "prompt": "x", "guidance": 11 }),
             json!({ "prompt": "x", "size": "huge" }),
             json!({ "prompt": "x", "model": "nai-diffusion-3" }),
-            json!({ "prompt": "x", "characters": ["a", "b", "c", "d", "e"] }),
+            json!({ "prompt": "x", "characters": ["a", "b", "c", "d", "e", "f", "g"] }),
+            json!({ "prompt": "x", "model": "nai-diffusion-5-full", "characters": vec!["a"; 23] }),
             json!({ "prompt": "x", "characters": "a" }),
             json!({ "prompt": "x", "seed": -1 }),
         ] {
@@ -1275,6 +1456,32 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn parses_director_requests() {
+        let a = parse_director_args(
+            DirectorTool::Emotion,
+            &json!({ "image_path": "C:\\art\\a.png", "emotion": "Happy", "strength_level": 2, "area": { "x": 10, "y": 20, "width": 64, "height": 128 } }),
+        )
+        .unwrap();
+        assert_eq!(a.request.emotion, "happy");
+        assert_eq!(a.request.defry, 2);
+        assert_eq!(a.request.area, Some(Area { x: 10, y: 20, width: 64, height: 128 }));
+        assert!(parse_director_args(DirectorTool::Emotion, &json!({ "image_path": "x.png", "emotion": "furious" })).is_err());
+        assert!(parse_director_args(DirectorTool::Colorize, &json!({ "image_path": "x.png", "strength_level": 9 })).is_err());
+        assert!(parse_director_args(DirectorTool::Colorize, &json!({ "image_path": "x.png", "output_dir": "..\\up" })).is_err());
+        assert!(parse_director_args(DirectorTool::Colorize, &json!({ "image_path": "x.png" })).is_ok());
+    }
+
+    #[test]
+    fn character_limit_follows_the_model() {
+        let ok = parse_generate_args(&json!({ "prompt": "x", "model": "nai-diffusion-5-full", "characters": vec!["a"; 22] }));
+        assert!(ok.is_ok());
+        let err = parse_generate_args(&json!({ "prompt": "x", "model": "nai-diffusion-4-5-full", "characters": vec!["a"; 7] }))
+            .err()
+            .unwrap();
+        assert!(err.contains("V4.5") && err.contains('6'), "{err}");
+    }
     #[test]
     fn medium_effort_ignores_requested_steps() {
         let a = parse_generate_args(&json!({ "prompt": "x", "model": MEDIUM_MODEL, "steps": 28 })).unwrap();
@@ -1345,6 +1552,8 @@ mod tests {
             active: true,
             is_opus,
             anlas: 500,
+            subscription_anlas: 500,
+            purchased_anlas: 0,
             usage,
         }
     }

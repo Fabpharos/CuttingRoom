@@ -4,7 +4,12 @@ import {
   SIZES,
   SIZE_STEP,
   MAX_SIDE,
-  MAX_CHARACTERS,
+  MAX_CHARACTERS_ANY,
+  maxCharactersFor,
+  SAMPLERS,
+  NOISE_SCHEDULES,
+  DEFAULT_SAMPLER,
+  DEFAULT_NOISE_SCHEDULE,
   MAX_STEPS,
   MAX_SCALE,
   MAX_BATCH,
@@ -14,10 +19,15 @@ import {
   DEFAULT_SCALE,
   CENTER,
   type CharacterPosition,
+  type PreciseReference,
 } from "./novelai";
 import type { PromptFileMode } from "./promptFile";
 import { parseCardLink, type CardLink } from "./characterCards";
 import { fileTokenName, isValidTokenName, tokenFor } from "./promptTokens";
+import { parseAutomation, DEFAULT_AUTOMATION, type AutomationSettings } from "../components/AutomationCard";
+import { parseAdvance, type SlotAdvance } from "./characterPool";
+import { DEFAULT_CREEP, parseCreep, type CreepSettings } from "./creep";
+import { DEFAULT_PLAN, parsePlan, type WorkflowPlan } from "../components/WorkflowCard";
 
 // One store for everything the Generate tab saves, shared with the prompt
 // file's sequential positions. The API token is never stored here — it
@@ -63,11 +73,34 @@ export type GenerateSettings = {
   img2imgStrength: number;
   steps: number;
   scale: number;
+  sampler: string;
+  noiseSchedule: string;
+  /** Variety+: skip guidance at high noise levels for more varied images. */
+  varietyPlus: boolean;
   count: number;
   outputDir: string | null;
   promptFiles: SavedPromptFile[];
   vibes: SavedVibe[];
+  automation: AutomationSettings;
+  /** Each character's auto-advance (null: fixed), the same length as `characters`. */
+  characterAdvance: (SlotAdvance | null)[];
+  /** Use every .txt in a wildcards folder without adding them one by one. */
+  wildcardFolder: { enabled: boolean; dir: string | null };
+  /** Random or sequential, for files found in the wildcards folder (random when absent). */
+  folderModes: Record<string, PromptFileMode>;
+  /** A free-standing Precise Reference (a style, usually). */
+  styleReference: PreciseReference | null;
+  /** Send the reference images that come with loaded character cards. */
+  useCardReferences: boolean;
+  creep: CreepSettings;
+  /** Fixed: every ticked vibe (up to 4). Random / next: K of the ticked ones per image. */
+  vibeRotation: VibeRotation;
+  /** Where encoded vibes are saved and the library is read from (null: the card folder's "vibes"). */
+  vibeLibraryDir: string | null;
+  workflow: WorkflowPlan;
 };
+
+export type VibeRotation = { mode: "fixed" | "random" | "next"; k: number; every: number };
 
 export const DEFAULT_SETTINGS: GenerateSettings = {
   model: MODELS[0].id,
@@ -85,10 +118,23 @@ export const DEFAULT_SETTINGS: GenerateSettings = {
   img2imgStrength: 0.7,
   steps: DEFAULT_STEPS,
   scale: DEFAULT_SCALE,
+  sampler: DEFAULT_SAMPLER,
+  noiseSchedule: DEFAULT_NOISE_SCHEDULE,
+  varietyPlus: false,
   count: 1,
   outputDir: null,
   promptFiles: [],
   vibes: [],
+  automation: DEFAULT_AUTOMATION,
+  characterAdvance: [],
+  wildcardFolder: { enabled: false, dir: null },
+  folderModes: {},
+  styleReference: null,
+  useCardReferences: true,
+  creep: DEFAULT_CREEP,
+  vibeRotation: { mode: "fixed", k: 2, every: 1 },
+  vibeLibraryDir: null,
+  workflow: DEFAULT_PLAN,
 };
 
 const SETTINGS_KEY = "form";
@@ -103,7 +149,7 @@ const str = (v: unknown, fallback: string) => (typeof v === "string" ? v : fallb
 // corrupted file.
 const MAX_SAVED_VIBES = 32;
 
-function sanitizeVibes(raw: unknown): SavedVibe[] {
+function sanitizeVibes(raw: unknown, capEnabled = true): SavedVibe[] {
   if (!Array.isArray(raw)) return [];
   const vibes: SavedVibe[] = [];
   for (const v of raw.slice(0, MAX_SAVED_VIBES)) {
@@ -121,7 +167,9 @@ function sanitizeVibes(raw: unknown): SavedVibe[] {
       enabled: r.enabled === true,
     });
   }
-  // Never come back with more switched on than can be sent for free.
+  // Never come back with more switched on than can be sent for free (a
+  // rotating pool sends at most four per image, so it may tick more).
+  if (!capEnabled) return vibes;
   let on = 0;
   return vibes.map((v) => (v.enabled && ++on > MAX_VIBES ? { ...v, enabled: false } : v));
 }
@@ -160,7 +208,7 @@ function migrateLegacyFile(raw: Legacy, prompt: string, characters: string[]) {
   };
   const field = str(raw.fileBefore, "") + tokenFor(file.name) + str(raw.fileAfter, "");
   const t = raw.fileTarget;
-  if (typeof t === "number" && Number.isInteger(t) && t >= 0 && t < MAX_CHARACTERS) {
+  if (typeof t === "number" && Number.isInteger(t) && t >= 0 && t < MAX_CHARACTERS_ANY) {
     const chars = [...characters, ...Array(Math.max(0, t + 1 - characters.length)).fill("")];
     chars[t] = field;
     return { file, prompt, characters: chars };
@@ -173,8 +221,9 @@ function migrateLegacyFile(raw: Legacy, prompt: string, characters: string[]) {
 // trusted: anything unusable falls back to its default.
 function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy): GenerateSettings {
   const d = DEFAULT_SETTINGS;
+  const model = MODELS.some((m) => m.id === raw.model) ? (raw.model as string) : d.model;
   let characters = Array.isArray(raw.characters)
-    ? raw.characters.filter((c): c is string => typeof c === "string").slice(0, MAX_CHARACTERS)
+    ? raw.characters.filter((c): c is string => typeof c === "string").slice(0, maxCharactersFor(model))
     : d.characters;
   let prompt = str(raw.prompt, d.prompt);
   let promptFiles = sanitizePromptFiles(raw.promptFiles);
@@ -184,7 +233,7 @@ function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy
     promptFiles = [legacy.file];
   }
   return {
-    model: MODELS.some((m) => m.id === raw.model) ? (raw.model as string) : d.model,
+    model,
     sizeIndex: Math.round(clamp(raw.sizeIndex, 0, SIZES.length, d.sizeIndex)),
     customWidth: side(raw.customWidth, d.customWidth),
     customHeight: side(raw.customHeight, d.customHeight),
@@ -209,10 +258,49 @@ function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy
     img2imgStrength: clamp(raw.img2imgStrength, 0, 1, d.img2imgStrength),
     steps: Math.round(clamp(raw.steps, 1, MAX_STEPS, d.steps)),
     scale: clamp(raw.scale, 0, MAX_SCALE, d.scale),
+    sampler: SAMPLERS.some((x) => x.id === raw.sampler) ? (raw.sampler as string) : d.sampler,
+    noiseSchedule: NOISE_SCHEDULES.some((x) => x.id === raw.noiseSchedule) ? (raw.noiseSchedule as string) : d.noiseSchedule,
+    varietyPlus: raw.varietyPlus === true,
     count: Math.round(clamp(raw.count, 1, MAX_BATCH, d.count)),
     outputDir: typeof raw.outputDir === "string" ? raw.outputDir : d.outputDir,
     promptFiles,
-    vibes: sanitizeVibes(raw.vibes),
+    vibes: sanitizeVibes(raw.vibes, (raw.vibeRotation as { mode?: unknown } | undefined)?.mode !== "random" && (raw.vibeRotation as { mode?: unknown } | undefined)?.mode !== "next"),
+    automation: parseAutomation(raw.automation),
+    characterAdvance: characters.map((_, i) =>
+      Array.isArray(raw.characterAdvance) ? parseAdvance(raw.characterAdvance[i]) : null,
+    ),
+    wildcardFolder: (() => {
+      const w = (raw.wildcardFolder ?? {}) as Record<string, unknown>;
+      return { enabled: w.enabled === true, dir: typeof w.dir === "string" ? w.dir : null };
+    })(),
+    styleReference: (() => {
+      const r = raw.styleReference as Record<string, unknown> | null | undefined;
+      if (!r || typeof r !== "object" || typeof r.path !== "string") return null;
+      const kind = r.kind === "character" || r.kind === "character&style" ? r.kind : "style";
+      return { path: r.path, kind, strength: clamp(r.strength, 0, 1, 1), fidelity: clamp(r.fidelity, 0, 1, 1) };
+    })(),
+    useCardReferences: raw.useCardReferences !== false,
+    creep: parseCreep(raw.creep, SAMPLERS.map((x) => x.id), NOISE_SCHEDULES.map((x) => x.id)),
+    vibeRotation: (() => {
+      const v = (raw.vibeRotation ?? {}) as Record<string, unknown>;
+      return {
+        mode: v.mode === "random" || v.mode === "next" ? v.mode : "fixed",
+        k: Math.round(clamp(v.k, 1, MAX_VIBES, 2)),
+        every: Math.round(clamp(v.every, 1, 1000, 1)),
+      } as VibeRotation;
+    })(),
+    vibeLibraryDir: typeof raw.vibeLibraryDir === "string" ? raw.vibeLibraryDir : null,
+    workflow: parsePlan(raw.workflow),
+    folderModes: (() => {
+      const m = raw.folderModes;
+      if (typeof m !== "object" || m === null) return {};
+      return Object.fromEntries(
+        Object.entries(m as Record<string, unknown>)
+          .filter(([, v]) => v === "sequential")
+          .slice(0, 5000)
+          .map(([k]) => [k, "sequential" as PromptFileMode]),
+      );
+    })(),
   };
 }
 
