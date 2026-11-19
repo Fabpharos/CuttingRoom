@@ -65,6 +65,20 @@ import BatchPreview, { type PreviewImage } from "./BatchPreview";
 import PromptFileEditor from "./PromptFileEditor";
 import DirectorDialog from "./DirectorDialog";
 import CreepCard from "./CreepCard";
+import SavedPromptsDialog from "./SavedPromptsDialog";
+import ArtistLibraryCard from "./ArtistLibraryCard";
+import {
+  DEFAULT_ARTISTS,
+  artistsForImage,
+  insertArtists,
+  loadArtists,
+  saveArtists,
+  usableArtists,
+  type ArtistLibrary,
+  type ModelFamily,
+  type PromptSnapshot,
+  type SavedPrompt,
+} from "../lib/savedPrompts";
 import { DEFAULT_CREEP, listAt, numberAt, seedAt, type CreepSettings } from "../lib/creep";
 import type { DirectorTool } from "../lib/director";
 import { buildImage, findLoops, imageRng, seededRng, swapGender, type EngineFile, type EngineSettings, type Slot } from "../lib/promptEngine";
@@ -617,6 +631,11 @@ export default function GenerateTab({
   const [styleReference, setStyleReference] = useState<PreciseReference | null>(null);
   const [useCardReferences, setUseCardReferences] = useState(true);
   const [creep, setCreep] = useState<CreepSettings>(DEFAULT_CREEP);
+  const [artists, setArtists] = useState<ArtistLibrary>(DEFAULT_ARTISTS);
+  const artistsLoadedRef = useRef(false);
+  const [showSavedPrompts, setShowSavedPrompts] = useState(false);
+  // A saved prompt waiting on the import confirmation.
+  const [pendingSnapshot, setPendingSnapshot] = useState<PromptSnapshot | null>(null);
   const [outputDir, setOutputDir] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   // Which run a cost confirmation is for: the form's, or the next remix batch.
@@ -783,7 +802,15 @@ export default function GenerateTab({
     ]);
     setAssociations(rules);
     setCards(list);
+    setArtists(await loadArtists(folder).catch(() => DEFAULT_ARTISTS));
+    artistsLoadedRef.current = true;
   }
+  // The artist library is saved in the card folder as it changes.
+  useEffect(() => {
+    if (!artistsLoadedRef.current || !cardFolder) return;
+    const timer = setTimeout(() => void saveArtists(cardFolder, artists).catch((e) => setError(String(e))), 500);
+    return () => clearTimeout(timer);
+  }, [artists, cardFolder]);
   const libraryLoadedRef = useRef(false);
   useEffect(() => {
     if (!active || libraryLoadedRef.current) return;
@@ -907,7 +934,9 @@ export default function GenerateTab({
   }
   const usedNames = new Set([...usedTokens].map(tokenFile));
   const usedFiles = allFiles.filter((f) => usedNames.has(f.name));
-  const unknownTokens = [...formTokens].filter((key) => !allFiles.some((f) => f.name === tokenFile(key)));
+  const unknownTokens = [...formTokens].filter(
+    (key) => !allFiles.some((f) => f.name === tokenFile(key)) && !(key === "artists" && artists.enabled),
+  );
   const missingParts = [...formTokens].filter((key) => {
     const part = tokenPart(key);
     const file = allFiles.find((f) => f.name === tokenFile(key));
@@ -1082,6 +1111,114 @@ export default function GenerateTab({
       setCustomWidth(fit.width);
       setCustomHeight(fit.height);
     }
+  }
+
+  const snapshot = (): PromptSnapshot => ({
+    model,
+    sizeIndex,
+    customWidth,
+    customHeight,
+    prompt,
+    negativePrompt,
+    characters,
+    characterNegatives,
+    useCoords,
+    characterPositions,
+    characterCardLinks: cardLinks,
+    steps,
+    scale,
+    sampler,
+    noiseSchedule,
+    varietyPlus,
+    vibes: vibes.map(({ path, index, strength, informationExtracted, enabled }) => ({ path, index, strength, informationExtracted, enabled })),
+    styleReference,
+    seed: lastResult?.seed ?? null,
+  });
+
+  // A saved prompt goes through the same confirmation as an import.
+  function startLoadSaved(saved: SavedPrompt) {
+    const s = saved.snapshot;
+    const plan = buildImportPlan(
+      {
+        prompt: s.prompt,
+        negativePrompt: s.negativePrompt,
+        characters: s.characters,
+        characterNegatives: s.characterNegatives,
+        characterPositions: s.useCoords ? s.characterPositions : null,
+        width: null,
+        height: null,
+        steps: s.steps,
+        scale: s.scale,
+        seed: s.seed,
+        model: s.model,
+        source: null,
+        sampler: s.sampler,
+        noiseSchedule: s.noiseSchedule,
+        skipCfgAboveSigma: s.varietyPlus ? 1 : null,
+      },
+      model,
+    );
+    plan.applied.unshift({ label: "Saved prompt", value: saved.name });
+    plan.skipped = plan.skipped.filter((x) => !x.startsWith("Seed"));
+    if (s.seed !== null) plan.applied.push({ label: "Seed", value: `${s.seed} (shown in Preview; images still use random seeds unless creep fixes one)` });
+    setShowSavedPrompts(false);
+    setPendingSnapshot(s);
+    setImportPlan(plan);
+  }
+
+  function applySnapshot(s: PromptSnapshot) {
+    setModel(s.model);
+    setSizeIndex(s.sizeIndex);
+    setCustomWidth(s.customWidth);
+    setCustomHeight(s.customHeight);
+    setPrompt(s.prompt);
+    setNegativePrompt(s.negativePrompt);
+    setCharacters(s.characters);
+    setCharacterNegatives(s.characterNegatives);
+    setUseCoords(s.useCoords);
+    setCharacterPositions(s.characterPositions);
+    setCharacterCardLinks(s.characterCardLinks);
+    setCharacterAdvance([]);
+    setSteps(s.steps);
+    setScale(s.scale);
+    setSampler(s.sampler);
+    setNoiseSchedule(s.noiseSchedule);
+    setVarietyPlus(s.varietyPlus);
+    setStyleReference(s.styleReference);
+    if (s.vibes.length > 0) void loadVibeEntries(s.vibes).then(setVibes);
+    else setVibes([]);
+    setPendingSnapshot(null);
+    setImportPlan(null);
+  }
+
+  async function snapshotFromImage(): Promise<PromptSnapshot | null> {
+    const file = await open({ directory: false, multiple: false, filters: [{ name: "PNG image", extensions: ["png"] }] });
+    if (typeof file !== "string") return null;
+    const meta = await readImageMetadata(file);
+    const v = buildImportPlan(meta, model).values;
+    const custom = v.customSize;
+    return {
+      ...snapshot(),
+      model: v.model ?? model,
+      sizeIndex: v.sizeIndex ?? sizeIndex,
+      customWidth: custom?.width ?? customWidth,
+      customHeight: custom?.height ?? customHeight,
+      prompt: v.prompt,
+      negativePrompt: v.negativePrompt,
+      characters: v.characters,
+      characterNegatives: v.characterNegatives,
+      useCoords: v.characterPositions !== null,
+      characterPositions: v.characterPositions ?? v.characters.map(() => CENTER),
+      characterCardLinks: v.characters.map(() => null),
+      steps: v.steps ?? steps,
+      scale: v.scale ?? scale,
+      sampler: v.sampler ?? sampler,
+      noiseSchedule: v.noiseSchedule ?? noiseSchedule,
+      varietyPlus: v.varietyPlus ?? false,
+      vibes: [],
+      styleReference: null,
+      seed: meta.seed !== null && meta.seed <= 0xffff_ffff ? meta.seed : null,
+    };
   }
 
   async function startImport(path: string) {
@@ -1286,6 +1423,7 @@ export default function GenerateTab({
    * slot syntax, gender swap, associations, auto-advanced characters, view
    * tags, random weights and scramble. The preview shows exactly this.
    */
+  const family = modelFamily(model) as ModelFamily;
   function buildBatch(fromRemix: boolean, seedBase = batchSeed) {
     const sendSettings = (w: number, h: number) => ({
       sampler,
@@ -1378,8 +1516,9 @@ export default function GenerateTab({
         assocNext.set(key, k + 1);
         return linkOf(pool[((poolStates[key]?.position ?? 0) + k) % pool.length]);
       };
+      const artistLine = fromRemix ? "" : artistsForImage(artists, family, i, rng, poolStates["artists-next"]?.position ?? 0);
       const res = buildImage(
-        { prompt: row.prompt, negative: row.negative, slots },
+        { prompt: fromRemix ? row.prompt : insertArtists(row.prompt, artistLine), negative: row.negative, slots },
         { index: i, rng, files: engineFiles, maxSlots: maxChars, settings, pickCard },
       );
       res.usedFiles.forEach((f) => usedFiles.add(f));
@@ -1505,6 +1644,10 @@ export default function GenerateTab({
         // Character pools and "next card" associations carry on next time.
         const states = { ...poolStates };
         for (const { adv, key } of advancing) states[key] = advancedState(adv, states[key] ?? { position: 0, seed: randomSeed() }, made);
+        if (artists.enabled && artists.mode === "next" && usableArtists(artists, family).length > 0) {
+          const st = states["artists-next"] ?? { position: 0, seed: 1 };
+          states["artists-next"] = { ...st, position: st.position + Math.ceil(made / Math.max(1, artists.every)) };
+        }
         built.assocNext.forEach((k, key) => {
           // Only the images actually made moved the association on.
           const share = Math.round((k * made) / requests.length);
@@ -2004,6 +2147,19 @@ export default function GenerateTab({
           style={{ fontSize: 13, fontWeight: 600 }}
         >
           Import from image…
+        </a>
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            if (generating) return;
+            if (!cardFolder) setError("Choose a card folder in the Character Cards tab first; saved prompts are kept there.");
+            else setShowSavedPrompts(true);
+          }}
+          title="Save the form under a name, or load one you saved"
+          style={{ fontSize: 13, fontWeight: 600, marginLeft: 14 }}
+        >
+          Saved prompts…
         </a>
       </div>
       <div style={{ display: "flex", gap: "14px 28px", flexWrap: "wrap", alignItems: "flex-start" }}>
@@ -3316,6 +3472,18 @@ export default function GenerateTab({
     </div>
   );
 
+  const artistCard = (
+    <ArtistLibraryCard
+      value={artists}
+      onChange={setArtists}
+      family={family}
+      disabled={generating}
+      hasFolder={cardFolder !== null}
+      cardStyle={cardStyle}
+      titleStyle={cardTitleStyle}
+    />
+  );
+
   const creepCard = (
     <CreepCard
       value={creep}
@@ -3691,6 +3859,7 @@ export default function GenerateTab({
                   {promptCard}
                   {promptFilesCard}
                   {automationCard}
+                  {artistCard}
                   {creepCard}
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -3709,6 +3878,7 @@ export default function GenerateTab({
                 {referenceCard}
                 {promptFilesCard}
                 {automationCard}
+                {artistCard}
                 {creepCard}
                 {vibesCard}
                 {lastCard}
@@ -3820,6 +3990,15 @@ export default function GenerateTab({
           onClose={() => setDirector(null)}
         />
       )}
+      {showSavedPrompts && cardFolder && (
+        <SavedPromptsDialog
+          folder={cardFolder}
+          current={snapshot()}
+          onLoad={startLoadSaved}
+          onSaveFromImage={snapshotFromImage}
+          onClose={() => setShowSavedPrompts(false)}
+        />
+      )}
       {previewImages && (
         <BatchPreview
           images={previewImages}
@@ -3846,8 +4025,11 @@ export default function GenerateTab({
       {importPlan && (
         <ImportConfirmModal
           plan={importPlan}
-          onConfirm={() => applyImport(importPlan)}
-          onCancel={() => setImportPlan(null)}
+          onConfirm={() => (pendingSnapshot ? applySnapshot(pendingSnapshot) : applyImport(importPlan))}
+          onCancel={() => {
+            setImportPlan(null);
+            setPendingSnapshot(null);
+          }}
         />
       )}
 
