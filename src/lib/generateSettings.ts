@@ -23,6 +23,8 @@ import {
 import type { PromptFileMode } from "./promptFile";
 import { parseCardLink, type CardLink } from "./characterCards";
 import { fileTokenName, isValidTokenName, tokenFor } from "./promptTokens";
+import { parseAutomation, DEFAULT_AUTOMATION, type AutomationSettings } from "../components/AutomationCard";
+import { parseAdvance, type SlotAdvance } from "./characterPool";
 
 // One store for everything the Generate tab saves, shared with the prompt
 // file's sequential positions. The API token is never stored here — it
@@ -76,6 +78,13 @@ export type GenerateSettings = {
   outputDir: string | null;
   promptFiles: SavedPromptFile[];
   vibes: SavedVibe[];
+  automation: AutomationSettings;
+  /** Each character's auto-advance (null: fixed), the same length as `characters`. */
+  characterAdvance: (SlotAdvance | null)[];
+  /** Use every .txt in a wildcards folder without adding them one by one. */
+  wildcardFolder: { enabled: boolean; dir: string | null };
+  /** Random or sequential, for files found in the wildcards folder (random when absent). */
+  folderModes: Record<string, PromptFileMode>;
 };
 
 export const DEFAULT_SETTINGS: GenerateSettings = {
@@ -101,6 +110,10 @@ export const DEFAULT_SETTINGS: GenerateSettings = {
   outputDir: null,
   promptFiles: [],
   vibes: [],
+  automation: DEFAULT_AUTOMATION,
+  characterAdvance: [],
+  wildcardFolder: { enabled: false, dir: null },
+  folderModes: {},
 };
 
 const SETTINGS_KEY = "form";
@@ -229,6 +242,24 @@ function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy
     outputDir: typeof raw.outputDir === "string" ? raw.outputDir : d.outputDir,
     promptFiles,
     vibes: sanitizeVibes(raw.vibes),
+    automation: parseAutomation(raw.automation),
+    characterAdvance: characters.map((_, i) =>
+      Array.isArray(raw.characterAdvance) ? parseAdvance(raw.characterAdvance[i]) : null,
+    ),
+    wildcardFolder: (() => {
+      const w = (raw.wildcardFolder ?? {}) as Record<string, unknown>;
+      return { enabled: w.enabled === true, dir: typeof w.dir === "string" ? w.dir : null };
+    })(),
+    folderModes: (() => {
+      const m = raw.folderModes;
+      if (typeof m !== "object" || m === null) return {};
+      return Object.fromEntries(
+        Object.entries(m as Record<string, unknown>)
+          .filter(([, v]) => v === "sequential")
+          .slice(0, 5000)
+          .map(([k]) => [k, "sequential" as PromptFileMode]),
+      );
+    })(),
   };
 }
 

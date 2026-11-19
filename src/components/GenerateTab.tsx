@@ -55,19 +55,45 @@ import HelpTip from "./HelpTip";
 import AccountBars from "./AccountBars";
 import CharacterSlots, { roughTokens, spreadPositions, tokenLimit, type SlotSummary } from "./CharacterSlots";
 import CharacterCardDialog from "./CharacterCardDialog";
-import { PARTS, adaptCardCharacter, type CardLink } from "../lib/characterCards";
+import { PARTS, adaptCardCharacter, listCards, loadCardFolder, type CardFile, type CardLink } from "../lib/characterCards";
+import AutomationCard, { DEFAULT_AUTOMATION, type AutomationSettings } from "./AutomationCard";
+import BatchPreview, { type PreviewImage } from "./BatchPreview";
+import PromptFileEditor from "./PromptFileEditor";
+import { buildImage, findLoops, imageRng, seededRng, swapGender, type EngineFile, type EngineSettings, type Slot } from "../lib/promptEngine";
+import { helpFor } from "../lib/syntaxHelp";
+import { CONTROL_HELP } from "../lib/syntaxHelp";
+import {
+  DEFAULT_GENDER_PAIRS,
+  loadAssociations,
+  loadGenderPairs,
+  saveGenderPairs,
+  type Association,
+  type CardChoice,
+} from "../lib/library";
+import {
+  DEFAULT_ADVANCE,
+  advancedState,
+  cardForImage,
+  linkOf,
+  poolCards,
+  poolKey,
+  type PoolState,
+  type SlotAdvance,
+} from "../lib/characterPool";
 import TagSuggestions from "./TagSuggestions";
 import {
   openPromptFile,
   openWildcardsDir,
   wildcardsDir,
-  pickLineIndices,
+  listWildcardFiles,
+  readPromptFile,
   savePosition,
   type PromptFile,
   type PromptFileMode,
 } from "../lib/promptFile";
-import { fileTokenName, fillTokens, tokenFile, tokenFor, tokenPart, tokensIn } from "../lib/promptTokens";
+import { fileTokenName, fillTokens, folderTokenName, tokenFile, tokenFor, tokenPart, tokensIn } from "../lib/promptTokens";
 import {
+  generateStore,
   loadGenerateSettings,
   saveGenerateSettings,
   type SavedVibe,
@@ -219,10 +245,13 @@ function GrowingTextarea({
   return <textarea ref={ref} rows={minRows} {...props} style={{ ...style, resize: "none", overflowY: "auto" }} />;
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({ label, children, help }: { label: string; children: React.ReactNode; help?: React.ReactNode }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-      <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)" }}>{label}</span>
+      <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)" }}>
+        {label}
+        {help}
+      </span>
       {children}
     </div>
   );
@@ -553,6 +582,28 @@ export default function GenerateTab({
     { from: string; items: { index: number; text: string; negative: string; position: CharacterPosition; link: CardLink | null }[] } | null
   >(null);
   const [runEstimate, setRunEstimate] = useState<CostEstimate | null>(null);
+  // Prompt automation: scramble, gender swap, random weights, associations.
+  const [automation, setAutomation] = useState<AutomationSettings>(DEFAULT_AUTOMATION);
+  const [associations, setAssociations] = useState<Association[]>([]);
+  const [genderPairs, setGenderPairs] = useState<[string, string][]>(DEFAULT_GENDER_PAIRS);
+  const [cardFolder, setCardFolder] = useState<string | null>(null);
+  const [cards, setCards] = useState<CardFile[]>([]);
+  // The form before "Apply to the form" rewrote it, for Undo.
+  const [swapUndo, setSwapUndo] = useState<{ prompt: string; negative: string; characters: string[]; negatives: string[] } | null>(null);
+  // Each character's auto-advance (null: fixed), kept the same length as `characters`.
+  const [characterAdvance, setCharacterAdvance] = useState<(SlotAdvance | null)[]>([]);
+  const advanceOf = (i: number) => characterAdvance[i] ?? null;
+  const [poolStates, setPoolStates] = useState<Record<string, PoolState>>({});
+  // Every .txt in a wildcards folder, usable without adding it.
+  const [wildcardFolder, setWildcardFolder] = useState<{ enabled: boolean; dir: string | null }>({ enabled: false, dir: null });
+  const [folderFiles, setFolderFiles] = useState<PromptFile[]>([]);
+  const [folderModes, setFolderModes] = useState<Record<string, PromptFileMode>>({});
+  const [folderScanError, setFolderScanError] = useState<string | null>(null);
+  const [openGroups, setOpenGroups] = useState<Set<string>>(new Set());
+  const [editingFile, setEditingFile] = useState<{ file: PromptFile; raw: string[] } | null>(null);
+  // The batch's random picks come from this, so a preview matches the run.
+  const [batchSeed, setBatchSeed] = useState(() => randomSeed());
+  const [previewImages, setPreviewImages] = useState<PreviewImage[] | null>(null);
   const [outputDir, setOutputDir] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   // Which run a cost confirmation is for: the form's, or the next remix batch.
@@ -590,6 +641,11 @@ export default function GenerateTab({
         setSampler(s.sampler);
         setNoiseSchedule(s.noiseSchedule);
         setVarietyPlus(s.varietyPlus);
+        setAutomation(s.automation);
+        setCharacterAdvance(s.characterAdvance);
+        setWildcardFolder(s.wildcardFolder);
+        setFolderModes(s.folderModes);
+        setPoolStates((await generateStore.get<Record<string, PoolState>>("poolStates")) ?? {});
         setCount(s.count);
         setOutputDir(s.outputDir);
         setCharacters(s.characters);
@@ -638,6 +694,10 @@ export default function GenerateTab({
         sampler,
         noiseSchedule,
         varietyPlus,
+        automation,
+        characterAdvance: characters.map((_, i) => advanceOf(i)),
+        wildcardFolder,
+        folderModes,
         count,
         outputDir,
         promptFiles: promptFiles.map(({ path, name, mode }) => ({ path, name, mode })),
@@ -671,11 +731,86 @@ export default function GenerateTab({
     sampler,
     noiseSchedule,
     varietyPlus,
+    automation,
+    characterAdvance,
+    wildcardFolder,
+    folderModes,
     count,
     outputDir,
     promptFiles,
     vibes,
   ]);
+
+  // The card folder holds the cards (for auto-advance and associations), the
+  // tag associations and the gender swap table. All local files.
+  async function loadLibrary() {
+    const folder = await loadCardFolder().catch(() => null);
+    setCardFolder(folder);
+    setGenderPairs(await loadGenderPairs(folder).catch(() => DEFAULT_GENDER_PAIRS));
+    if (!folder) {
+      setAssociations([]);
+      setCards([]);
+      return;
+    }
+    const [rules, list] = await Promise.all([
+      loadAssociations(folder).catch((e) => {
+        setError(`Couldn't read the tag associations: ${String(e)}`);
+        return [] as Association[];
+      }),
+      listCards(folder).catch(() => [] as CardFile[]),
+    ]);
+    setAssociations(rules);
+    setCards(list);
+  }
+  const libraryLoadedRef = useRef(false);
+  useEffect(() => {
+    if (!active || libraryLoadedRef.current) return;
+    libraryLoadedRef.current = true;
+    void loadLibrary();
+  }, [active]);
+
+  // ---- The wildcards folder ----
+  async function scanFolder(dir: string | null = wildcardFolder.dir) {
+    const d = dir ?? (await wildcardsDir().catch(() => null));
+    if (!d) return;
+    try {
+      const list = await listWildcardFiles(d);
+      const files = await Promise.all(
+        list.map(async (f) => ({ ...(await openPromptFile(f.path, folderTokenName(f.relative), folderModes[f.path] ?? "random")), fromFolder: true })),
+      );
+      setFolderFiles(files);
+      setFolderScanError(null);
+    } catch (e) {
+      setFolderFiles([]);
+      setFolderScanError(String(e));
+    }
+  }
+  useEffect(() => {
+    if (!settingsLoaded || !wildcardFolder.enabled) {
+      setFolderFiles([]);
+      return;
+    }
+    void scanFolder();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingsLoaded, wildcardFolder.enabled, wildcardFolder.dir]);
+  // Files edited elsewhere are picked up when the window comes back.
+  useEffect(() => {
+    if (!active || !wildcardFolder.enabled) return;
+    let last = 0;
+    const onFocus = () => {
+      if (Date.now() - last < 2000 || generating) return;
+      last = Date.now();
+      void scanFolder();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, wildcardFolder.enabled, wildcardFolder.dir, generating, folderModes]);
+
+  async function chooseWildcardFolder() {
+    const dir = await open({ directory: true, multiple: false, defaultPath: await wildcardsDir().catch(() => undefined) });
+    if (typeof dir === "string") setWildcardFolder({ enabled: true, dir });
+  }
 
   // Keep a row id per character; new characters open expanded.
   useEffect(() => {
@@ -716,14 +851,44 @@ export default function GenerateTab({
           : [];
       })
     : [];
-  // Prompt file tokens used anywhere in the form, and any that can't be filled.
-  const usedTokens = new Set([prompt, negativePrompt, ...characters, ...characterNegatives].flatMap(tokensIn));
+  // Files added by hand win over a folder file of the same name.
+  const handNames = new Set(promptFiles.map((f) => f.name));
+  const folderNameCounts = new Map<string, number>();
+  folderFiles.forEach((f) => folderNameCounts.set(f.name, (folderNameCounts.get(f.name) ?? 0) + 1));
+  const duplicateNames = [...folderNameCounts].filter(([n, c]) => c > 1 || handNames.has(n)).map(([n]) => n);
+  const allFiles: PromptFile[] = [
+    ...promptFiles,
+    ...folderFiles.filter((f, i) => !handNames.has(f.name) && folderFiles.findIndex((g) => g.name === f.name) === i),
+  ];
+  const engineFiles = new Map<string, EngineFile>(
+    allFiles
+      .filter((f) => f.lines.length > 0)
+      .map((f) => [f.name, { name: f.name, lines: f.lines, parts: f.parts, weights: f.weights, mode: f.mode, position: f.position }]),
+  );
+  const loops = findLoops([...engineFiles.values()]);
+  // Prompt file tokens used anywhere in the form (and inside the files they
+  // use), and any that can't be filled.
+  const formTokens = new Set([prompt, negativePrompt, ...characters, ...characterNegatives].flatMap(tokensIn));
+  const usedTokens = new Set(formTokens);
+  for (let changed = true; changed; ) {
+    changed = false;
+    for (const key of [...usedTokens]) {
+      const f = engineFiles.get(tokenFile(key));
+      if (!f) continue;
+      for (const t of [...f.lines, ...f.parts.flatMap((p) => Object.values(p))].flatMap(tokensIn)) {
+        if (!usedTokens.has(t)) {
+          usedTokens.add(t);
+          changed = true;
+        }
+      }
+    }
+  }
   const usedNames = new Set([...usedTokens].map(tokenFile));
-  const usedFiles = promptFiles.filter((f) => usedNames.has(f.name));
-  const unknownTokens = [...usedTokens].filter((key) => !promptFiles.some((f) => f.name === tokenFile(key)));
-  const missingParts = [...usedTokens].filter((key) => {
+  const usedFiles = allFiles.filter((f) => usedNames.has(f.name));
+  const unknownTokens = [...formTokens].filter((key) => !allFiles.some((f) => f.name === tokenFile(key)));
+  const missingParts = [...formTokens].filter((key) => {
     const part = tokenPart(key);
-    const file = promptFiles.find((f) => f.name === tokenFile(key));
+    const file = allFiles.find((f) => f.name === tokenFile(key));
     return part !== null && file !== undefined && file.lines.length > 0 && !file.partNames.includes(part);
   });
   const unreadable = usedFiles.filter((f) => f.lines.length === 0);
@@ -751,7 +916,7 @@ export default function GenerateTab({
   // What each token becomes for the next image: the actual next line in
   // sequential mode, a placeholder in random mode.
   const nextValues = Object.fromEntries(
-    promptFiles
+    allFiles
       .filter((f) => f.lines.length > 0)
       .flatMap((f) =>
         f.mode === "sequential"
@@ -1071,71 +1236,145 @@ export default function GenerateTab({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [remix]);
 
-  async function runGenerate(fromRemix = false) {
-    if (!outputDir) return;
-    const batchStart = new Date();
-    const remixStart = remixQueue?.next ?? 0;
-    // One line per file per image: a token used in several fields gets the
-    // same line in each, so they stay consistent within an image.
-    const files = usedFiles;
-    const picks = files.map((f) => pickLineIndices(f.lines.length, f.mode, f.position, count));
-    // A remix image keeps its own prompt, and its seed and size when the
-    // Remix tab kept them; the model, steps, guidance and vibes are this tab's.
+  const engineSettings = (): EngineSettings => ({
+    scramble: automation.scramble,
+    genderSwap: { ...automation.genderSwap, pairs: genderPairs },
+    weightStep: automation.weightStep,
+    associations: automation.useAssociations ? associations : [],
+  });
+
+  /**
+   * Every image of a run, decided up front from `batchSeed`: prompt files,
+   * slot syntax, gender swap, associations, auto-advanced characters, view
+   * tags, random weights and scramble. The preview shows exactly this.
+   */
+  function buildBatch(fromRemix: boolean, seedBase = batchSeed) {
     const sendSettings = (w: number, h: number) => ({
       sampler,
       noiseSchedule,
       skipCfgAboveSigma: varietyPlus ? varietyPlusSigma(model, w, h) : null,
     });
-    const remixRequests: GenerateRequest[] = remixBatch.map((item, i) => {
-      const seed = item.seed ?? randomSeed();
-      const w = item.size?.width ?? size.width;
-      const h = item.size?.height ?? size.height;
-      return {
+    const settings = engineSettings();
+    const rows = fromRemix
+      ? remixBatch.map((item) => ({
+          prompt: item.prompt,
+          negative: item.negativePrompt,
+          // The Remix tab keeps up to 22; this model may take fewer.
+          slots: item.characters.slice(0, maxChars).map(
+            (c, j): Slot => ({
+              text: c,
+              negative: item.characterNegatives[j] ?? "",
+              position: item.characterPositions?.[j] ?? CENTER,
+              link: null,
+              present: true,
+            }),
+          ),
+          placed: item.characterPositions !== null,
+          item,
+        }))
+      : Array.from({ length: count }, () => ({
+          prompt,
+          negative: negativePrompt,
+          slots: characters.map(
+            (c, j): Slot => ({
+              text: c,
+              negative: characterNegatives[j] ?? "",
+              position: characterPositions[j] ?? CENTER,
+              link: cardLinks[j],
+              present: true,
+            }),
+          ),
+          placed: useCoords,
+          item: null,
+        }));
+    const usedFiles = new Set<string>();
+    // "Next card with label" associations count through the batch.
+    const assocNext = new Map<string, number>();
+    const images: PreviewImage[] = rows.map((row, i) => {
+      const rng = imageRng(seedBase, i);
+      const seed = row.item?.seed ?? Math.floor(seededRng((seedBase ^ Math.imul(i + 1, 0x85ebca6b)) >>> 0)() * 0x1_0000_0000);
+      const slots = row.slots.map((s, j): Slot => {
+        const adv = fromRemix ? null : advanceOf(j);
+        if (!adv || adv.mode === "fixed") return s;
+        const pool = poolCards(cards, adv.pool);
+        const key = poolKey(adv.pool, adv.mode);
+        const st = poolStates[key] ?? { position: 0, seed: 1 };
+        const file = cardForImage(adv, pool, st, i, (g) => seededRng((seedBase + Math.imul(g + 1, 104729) + j * 31) >>> 0));
+        if (!file) return s;
+        const link = linkOf(file);
+        return { ...s, text: link.tags.map((t) => t.text).join(", "), negative: file.card.negative, link };
+      });
+      const pickCard = (choice: CardChoice): CardLink | null => {
+        if (choice.mode === "named") {
+          const f = cards.find((c) => c.card.name.toLowerCase() === choice.name.toLowerCase());
+          return f ? linkOf(f) : null;
+        }
+        const pool = poolCards(cards, { include: choice.label, exclude: "", matchAll: false, gender: null });
+        if (pool.length === 0) return null;
+        if (choice.mode === "random") return linkOf(pool[Math.floor(rng() * pool.length)]);
+        const key = `assoc-next:${choice.label.toLowerCase()}`;
+        const k = assocNext.get(key) ?? 0;
+        assocNext.set(key, k + 1);
+        return linkOf(pool[((poolStates[key]?.position ?? 0) + k) % pool.length]);
+      };
+      const res = buildImage(
+        { prompt: row.prompt, negative: row.negative, slots },
+        { index: i, rng, files: engineFiles, maxSlots: maxChars, settings, pickCard },
+      );
+      res.usedFiles.forEach((f) => usedFiles.add(f));
+      const w = row.item?.size?.width ?? size.width;
+      const h = row.item?.size?.height ?? size.height;
+      const request: GenerateRequest = {
         ...sendSettings(w, h),
         model,
-        prompt: item.prompt,
-        negativePrompt: item.negativePrompt,
-        // The Remix tab keeps up to 22; this model may take fewer.
-        characters: item.characters.slice(0, maxChars),
-        characterNegatives: item.characterNegatives.slice(0, maxChars),
-        characterPositions: item.characterPositions?.slice(0, maxChars) ?? null,
-        width: item.size?.width ?? size.width,
-        height: item.size?.height ?? size.height,
+        prompt: res.prompt,
+        negativePrompt: res.negative,
+        characters: res.slots.map((s) => (s.present ? s.text : "")),
+        characterNegatives: res.slots.map((s) => (s.present ? s.negative : "")),
+        characterPositions: row.placed ? res.slots.map((s) => s.position) : null,
+        width: w,
+        height: h,
         steps: effectiveSteps,
         scale,
         seed,
-        fileStem: fileStemFor(seed, i, batchStart),
+        fileStem: "",
         vibes: vibeRefs,
+        sourceImage: !fromRemix && sourceImage ? { path: sourceImage.path, strength: img2imgStrength } : null,
       };
+      return { request, log: res.log, warnings: res.warnings, cardNames: res.slots.map((s) => s.link?.name ?? null) };
     });
-    const requests: GenerateRequest[] = fromRemix ? remixRequests : Array.from({ length: count }, (_, i) => {
-      const seed = randomSeed();
-      const entry = Object.fromEntries(files.flatMap((f, k) => entryValues(f, picks[k][i])));
-      const values = present(entry);
-      const scene = fillTokens(prompt, values);
-      return {
-        ...sendSettings(size.width, size.height),
-        model,
-        prompt: scene,
-        negativePrompt: fillTokens(negativePrompt, values),
-        characters: characters.map((c, j) => {
-          if (missingPart(c, entry)) return "";
-          const filled = fillTokens(c, values);
-          const link = cardLinks[j];
-          return link ? adaptCardCharacter(filled, link, scene).text : filled;
-        }),
-        characterNegatives: characterNegatives.map((c) => fillTokens(c, values)),
-        characterPositions: useCoords ? characterPositions : null,
-        width: size.width,
-        height: size.height,
-        steps: effectiveSteps,
-        scale,
-        seed,
-        fileStem: fileStemFor(seed, i, batchStart),
-        vibes: vibeRefs,
-        sourceImage: sourceImage ? { path: sourceImage.path, strength: img2imgStrength } : null,
-      };
-    });
+    return { images, usedFiles, assocNext };
+  }
+
+  function showPreview(seedBase = batchSeed) {
+    try {
+      setPreviewImages(buildBatch(remixQueue !== null && remixBatch.length > 0, seedBase).images);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function runGenerate(fromRemix = false) {
+    if (!outputDir) return;
+    const batchStart = new Date();
+    const remixStart = remixQueue?.next ?? 0;
+    let built: ReturnType<typeof buildBatch>;
+    try {
+      built = buildBatch(fromRemix);
+    } catch (err) {
+      setError(String(err));
+      return;
+    }
+    const requests: GenerateRequest[] = built.images.map((img, i) => ({
+      ...img.request,
+      fileStem: fileStemFor(img.request.seed, i, batchStart),
+    }));
+    const advancing = fromRemix
+      ? []
+      : characters.flatMap((_, j) => {
+          const adv = advanceOf(j);
+          return adv && adv.mode !== "fixed" ? [{ adv, key: poolKey(adv.pool, adv.mode) }] : [];
+        });
 
     // Characters a model switch set aside are let go once something is made.
     setStashedChars(null);
@@ -1180,11 +1419,26 @@ export default function GenerateTab({
         });
       } else if (made > 0) {
         const advanced = new Map(
-          files.filter((f) => f.mode === "sequential").map((f) => [f.path, (f.position + made) % f.lines.length]),
+          allFiles
+            .filter((f) => f.mode === "sequential" && built.usedFiles.has(f.name) && f.lines.length > 0)
+            .map((f) => [f.path, (f.position + made) % f.lines.length]),
         );
         advanced.forEach((next, path) => void savePosition(path, next));
-        setPromptFiles((prev) => prev.map((f) => (advanced.has(f.path) ? { ...f, position: advanced.get(f.path)! } : f)));
+        const move = (prev: PromptFile[]) => prev.map((f) => (advanced.has(f.path) ? { ...f, position: advanced.get(f.path)! } : f));
+        setPromptFiles(move);
+        setFolderFiles(move);
+        // Character pools and "next card" associations carry on next time.
+        const states = { ...poolStates };
+        for (const { adv, key } of advancing) states[key] = advancedState(adv, states[key] ?? { position: 0, seed: randomSeed() }, made);
+        built.assocNext.forEach((k, key) => {
+          // Only the images actually made moved the association on.
+          const share = Math.round((k * made) / requests.length);
+          states[key] = { position: (states[key]?.position ?? 0) + share, seed: 1 };
+        });
+        setPoolStates(states);
+        void generateStore.set("poolStates", states).catch(() => {});
       }
+      setBatchSeed(randomSeed());
       if (summary.stoppedReason) {
         setBatchNotice(
           `Stopped after ${made} of ${requests.length}. ${summary.stoppedReason}`,
@@ -1235,6 +1489,57 @@ export default function GenerateTab({
 
   function updatePromptFile(path: string, change: Partial<PromptFile>) {
     setPromptFiles((prev) => prev.map((f) => (f.path === path ? { ...f, ...change } : f)));
+    setFolderFiles((prev) => prev.map((f) => (f.path === path ? { ...f, ...change } : f)));
+    if (change.mode && folderFiles.some((f) => f.path === path)) {
+      setFolderModes((m) => {
+        const next = { ...m };
+        if (change.mode === "sequential") next[path] = "sequential";
+        else delete next[path];
+        return next;
+      });
+    }
+  }
+
+  async function editFile(f: PromptFile) {
+    try {
+      setEditingFile({ file: f, raw: await readPromptFile(f.path) });
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function reloadFile(f: PromptFile) {
+    const fresh = await openPromptFile(f.path, f.name, f.mode);
+    const put = (prev: PromptFile[]) => prev.map((x) => (x.path === f.path ? { ...fresh, fromFolder: x.fromFolder } : x));
+    setPromptFiles(put);
+    setFolderFiles(put);
+  }
+
+  // Gender swap, written into the form (with Undo) instead of only per batch.
+  function applySwapToForm() {
+    const gs = { ...automation.genderSwap, pairs: genderPairs };
+    setSwapUndo({ prompt, negative: negativePrompt, characters, negatives: characterNegatives });
+    if (gs.mode === "slot") {
+      const i = gs.slot - 1;
+      setCharacters((prev) => prev.map((c, j) => (j === i ? swapGender(c, gs) : c)));
+      setCharacterNegatives((prev) => prev.map((c, j) => (j === i ? swapGender(c, gs) : c)));
+    } else {
+      setPrompt(swapGender(prompt, gs));
+      setNegativePrompt(swapGender(negativePrompt, gs));
+      setCharacters((prev) => prev.map((c) => swapGender(c, gs)));
+      setCharacterNegatives((prev) => prev.map((c) => swapGender(c, gs)));
+    }
+    // The form now says it, so the batch shouldn't swap it back.
+    setAutomation((a) => ({ ...a, genderSwap: { ...a.genderSwap, mode: "off" } }));
+  }
+
+  function undoSwap() {
+    if (!swapUndo) return;
+    setPrompt(swapUndo.prompt);
+    setNegativePrompt(swapUndo.negative);
+    setCharacters(swapUndo.characters);
+    setCharacterNegatives(swapUndo.negatives);
+    setSwapUndo(null);
   }
 
   // `line` is 1-based, as shown; out-of-range or non-numbers are ignored.
@@ -1347,6 +1652,18 @@ export default function GenerateTab({
     setCharacterCardLinks(characters.map((_, i) => cardLinks[i]).concat([null]).map((l, i) => (i === index ? link : l)));
   }
 
+  function loadManyCards(items: { prompt: string; negative: string; link: CardLink }[]) {
+    setShowCardDialog(false);
+    const room = Math.max(0, maxChars - characters.length);
+    const take = items.slice(0, room);
+    if (take.length === 0) return;
+    setCharacters((prev) => [...prev, ...take.map((t) => t.prompt)]);
+    setCharacterNegatives((prev) => [...prev, ...take.map((t) => t.negative)]);
+    setCharacterPositions((prev) => [...prev, ...take.map(() => CENTER)]);
+    setCharacterCardLinks([...characters.map((_, i) => cardLinks[i]), ...take.map((t) => t.link)]);
+    if (items.length > room) setError(`There's room for ${room} more character${room === 1 ? "" : "s"}, so only the first ${room} were added.`);
+  }
+
   function unlinkCard(index: number) {
     setCharacterCardLinks(cardLinks.map((l, i) => (i === index ? null : l)));
   }
@@ -1362,6 +1679,7 @@ export default function GenerateTab({
     setCharacterNegatives((prev) => prev.filter((_, j) => j !== index));
     setCharacterPositions((prev) => prev.filter((_, j) => j !== index));
     setCharacterCardLinks(cardLinks.filter((_, j) => j !== index));
+    setCharacterAdvance(characters.map((_, i) => advanceOf(i)).filter((_, j) => j !== index));
     setCharacterKeys((prev) => prev.filter((_, j) => j !== index));
     if (typeof lastFieldRef.current?.field === "object") lastFieldRef.current = null;
   }
@@ -1373,6 +1691,7 @@ export default function GenerateTab({
     setCharacterNegatives((prev) => pick(prev, ""));
     setCharacterPositions((prev) => pick(prev, CENTER));
     setCharacterCardLinks(pick(cardLinks, null));
+    setCharacterAdvance(pick(characters.map((_, i) => advanceOf(i)), null));
     setCharacterKeys((prev) => pick(prev, ""));
     if (typeof lastFieldRef.current?.field === "object") lastFieldRef.current = null;
   }
@@ -1797,7 +2116,7 @@ export default function GenerateTab({
 
   const promptCard = (
     <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 14 }}>
-      <Field label="Prompt">
+      <Field label="Prompt" help={<HelpTip title="Prompt syntax" lines={helpFor("prompt")} />}>
         <GrowingTextarea
           minRows={wide ? 9 : 6}
           maxHeight={560}
@@ -1810,7 +2129,7 @@ export default function GenerateTab({
         />
         {preview(prompt)}
       </Field>
-      <Field label="Undesired content">
+      <Field label="Undesired content" help={<HelpTip title="Undesired content syntax" lines={helpFor("negative")} />}>
         <GrowingTextarea
           minRows={wide ? 5 : 3}
           maxHeight={360}
@@ -1831,15 +2150,105 @@ export default function GenerateTab({
     text: c,
     negative: characterNegatives[i] ?? "",
     position: characterPositions[i] ?? CENTER,
-    cardName: cardLinks[i]?.name ?? null,
-    hasReference: false,
+    cardName: advanceOf(i) ? `${{ next: "Next", random: "Random", shuffle: "Shuffle" }[advanceOf(i)!.mode as "next"]} card` : (cardLinks[i]?.name ?? null),
+    hasReference: !!cardLinks[i]?.reference,
   }));
   const tokensUsed = [prompt, ...characters].reduce((n, t) => n + roughTokens(t), 0);
   const tokenMax = tokenLimit(model);
+  const setAdvance = (i: number, a: SlotAdvance | null) =>
+    setCharacterAdvance(characters.map((_, j) => (j === i ? a : advanceOf(j))));
+  const advanceRow = (i: number) => {
+    const a = advanceOf(i);
+    const mode = a?.mode ?? "fixed";
+    const pool = a ? poolCards(cards, a.pool) : [];
+    const sel: React.CSSProperties = { ...inputStyle, padding: "3px 6px", fontSize: 12, background: "var(--bg-page)" };
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 12 }}>
+        <span style={{ fontWeight: 600, color: "var(--muted)" }}>
+          Auto-advance
+          <HelpTip
+            lines={[
+              { text: "Fixed keeps this prompt. Next, Random or Shuffle (no repeats until every card is used) puts a card from a pool in this slot, a new one every N images." },
+              { text: "Pools are your character cards filtered by label (set labels in the Character Cards tab). The pool's place is saved, so the next batch carries on." },
+            ]}
+          />
+        </span>
+        <select
+          value={mode}
+          disabled={generating}
+          onChange={(e) => {
+            const m = e.target.value as SlotAdvance["mode"];
+            setAdvance(i, m === "fixed" ? null : { ...(a ?? DEFAULT_ADVANCE), mode: m });
+          }}
+          style={sel}
+        >
+          <option value="fixed">Fixed</option>
+          <option value="next">Next card</option>
+          <option value="random">Random card</option>
+          <option value="shuffle">Shuffle cards</option>
+        </select>
+        {a && (
+          <>
+            <input
+              value={a.pool.include}
+              disabled={generating}
+              placeholder="labels (any card)"
+              onChange={(e) => setAdvance(i, { ...a, pool: { ...a.pool, include: e.target.value } })}
+              style={{ ...sel, width: 120 }}
+            />
+            <select
+              value={a.pool.matchAll ? "all" : "any"}
+              disabled={generating}
+              onChange={(e) => setAdvance(i, { ...a, pool: { ...a.pool, matchAll: e.target.value === "all" } })}
+              style={sel}
+            >
+              <option value="any">any label</option>
+              <option value="all">all labels</option>
+            </select>
+            <input
+              value={a.pool.exclude}
+              disabled={generating}
+              placeholder="not labels"
+              onChange={(e) => setAdvance(i, { ...a, pool: { ...a.pool, exclude: e.target.value } })}
+              style={{ ...sel, width: 100 }}
+            />
+            <select
+              value={a.pool.gender ?? ""}
+              disabled={generating}
+              onChange={(e) => setAdvance(i, { ...a, pool: { ...a.pool, gender: (e.target.value || null) as SlotAdvance["pool"]["gender"] } })}
+              style={sel}
+            >
+              <option value="">any gender</option>
+              <option value="female">female</option>
+              <option value="male">male</option>
+              <option value="other">other</option>
+            </select>
+            <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              every
+              <input
+                type="number"
+                min={1}
+                max={1000}
+                value={a.every}
+                disabled={generating}
+                onChange={(e) => setAdvance(i, { ...a, every: Math.max(1, Math.min(1000, Math.round(Number(e.target.value)) || 1)) })}
+                style={{ ...sel, width: 52 }}
+              />
+              images
+            </label>
+            <span style={{ color: pool.length === 0 ? "rgb(200,140,40)" : "var(--muted)" }}>
+              {cardFolder === null ? "Choose a card folder in Character Cards." : `${pool.length} card${pool.length === 1 ? "" : "s"} in the pool`}
+            </span>
+          </>
+        )}
+      </div>
+    );
+  };
   const characterBody = (i: number) => {
     const c = characters[i];
     return (
       <>
+        {advanceRow(i)}
         {cardNote(i, c)}
         <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
           <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 6 }}>
@@ -2065,6 +2474,7 @@ export default function GenerateTab({
           characterCount={characters.length}
           maxCharacters={maxChars}
           onLoad={loadCharacterCard}
+          onLoadMany={loadManyCards}
           onClose={() => setShowCardDialog(false)}
         />
       )}
@@ -2077,91 +2487,18 @@ export default function GenerateTab({
     (f) => (!usedOnly || usedNames.has(f.name)) && (filterText === "" || f.name.toLowerCase().includes(filterText)),
   );
   const unusedCount = promptFiles.filter((f) => !usedNames.has(f.name)).length;
-  const promptFilesCard = (
-    <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 10 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-        <span style={{ ...cardTitleStyle, marginBottom: 0, flex: 1 }}>
-          PROMPT FILES
-          {promptFiles.length > 0 && (
-            <span style={{ fontWeight: 500 }}>
-              {" "}
-              · {promptFiles.length} loaded, {promptFiles.length - unusedCount} in use
-            </span>
-          )}
-        </span>
-        <a
-          href="#"
-          onClick={(e) => {
-            e.preventDefault();
-            void openWildcardsDir().catch((err) => setError(String(err)));
-          }}
-          title="Open the project's wildcards folder, where prompt files live by default"
-          style={{ fontSize: 13, fontWeight: 600 }}
-        >
-          Open folder
-        </a>
-        <button
-          onClick={() => void addPromptFiles()}
-          disabled={generating}
-          style={{ ...secondaryButtonStyle, padding: "5px 14px" }}
-        >
-          Add .txt files…
-        </button>
-      </div>
-
-      {promptFiles.length === 0 ? (
-        <div style={{ fontSize: 12.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif", lineHeight: 1.5 }}>
-          Text files with one prompt per line, kept in the project's <code>wildcards</code>{" "}
-          folder. Each file gets a token like <code>__hair__</code>; put it in any prompt,
-          undesired content or character, and every image fills it with a line from that file.
-        </div>
-      ) : (
-        <>
-          {promptFiles.length > 5 && (
-            <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", fontSize: 12.5 }}>
-              <input
-                value={fileFilter}
-                onChange={(e) => setFileFilter(e.target.value)}
-                placeholder="Filter files…"
-                spellCheck={false}
-                style={{ ...inputStyle, background: "var(--bg-page)", flex: "1 1 160px", padding: "5px 10px", fontSize: 12.5 }}
-              />
-              <label style={{ display: "flex", alignItems: "center", gap: 6, whiteSpace: "nowrap" }}>
-                <input
-                  type="checkbox"
-                  checked={usedOnly}
-                  onChange={(e) => setUsedOnly(e.target.checked)}
-                  style={{ accentColor: "var(--accent)" }}
-                />
-                In use only
-              </label>
-              {unusedCount > 0 && (
-                <a
-                  href="#"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    if (!generating) setPromptFiles((prev) => prev.filter((x) => usedNames.has(x.name)));
-                  }}
-                  title="Take every file whose token isn't in any prompt off this list (the files stay on disk)"
-                  style={{ fontWeight: 600, whiteSpace: "nowrap" }}
-                >
-                  Remove {unusedCount} unused
-                </a>
-              )}
-            </div>
-          )}
-          <div
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
-              maxHeight: 340,
-              overflowY: "auto",
-              paddingRight: 4,
-            }}
-          >
-            {shownFiles.length === 0 && <div style={{ fontSize: 12.5, color: "var(--muted)" }}>No files match.</div>}
-            {shownFiles.map((f) => (
+  // Folder files, filtered the same way, grouped by subfolder.
+  const shownFolder = folderFiles.filter(
+    (f) => (!usedOnly || usedNames.has(f.name)) && (filterText === "" || f.name.toLowerCase().includes(filterText)),
+  );
+  const folderGroups = [...new Map<string, PromptFile[]>(
+    shownFolder.reduce((m, f) => {
+      const g = f.name.includes("/") ? f.name.slice(0, f.name.lastIndexOf("/")) : "";
+      m.set(g, [...(m.get(g) ?? []), f]);
+      return m;
+    }, new Map<string, PromptFile[]>()),
+  )].sort(([a], [b]) => a.localeCompare(b));
+  const fileRow = (f: PromptFile) => (
               <div key={f.path} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12.5 }}>
                 <button
@@ -2195,7 +2532,11 @@ export default function GenerateTab({
                 >
                   {f.error
                     ? f.error
-                    : `${f.lines.length} ${f.partNames.length > 0 ? "entr" + (f.lines.length === 1 ? "y" : "ies") : "line" + (f.lines.length === 1 ? "" : "s")}${usedNames.has(f.name) ? "" : " · not used yet"}`}
+                    : loops.has(f.name)
+                      ? `Refers back to itself: ${loops.get(f.name)!.join(" → ")}`
+                      : duplicateNames.includes(f.name) && f.fromFolder
+                        ? `Another file is also ${tokenFor(f.name)}; ${handNames.has(f.name) ? "the one added by hand" : "the first"} is used`
+                        : `${f.lines.length} ${f.partNames.length > 0 ? "entr" + (f.lines.length === 1 ? "y" : "ies") : "line" + (f.lines.length === 1 ? "" : "s")}${f.weights.some((w) => w !== 1) ? " · weighted" : ""}${usedNames.has(f.name) ? "" : " · not used yet"}`}
                 </span>
                 {!f.error && (
                   <>
@@ -2264,13 +2605,26 @@ export default function GenerateTab({
                   href="#"
                   onClick={(e) => {
                     e.preventDefault();
-                    if (!generating) setPromptFiles((prev) => prev.filter((x) => x.path !== f.path));
+                    if (!generating) void editFile(f);
                   }}
-                  title="Remove this file (its token is left in the prompt)"
+                  title="Edit this file's lines and weights"
                   style={{ fontWeight: 600 }}
                 >
-                  Remove
+                  Edit
                 </a>
+                {!f.fromFolder && (
+                  <a
+                    href="#"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      if (!generating) setPromptFiles((prev) => prev.filter((x) => x.path !== f.path));
+                    }}
+                    title="Remove this file (its token is left in the prompt)"
+                    style={{ fontWeight: 600 }}
+                  >
+                    Remove
+                  </a>
+                )}
               </div>
               {f.partNames.length > 0 && (
                 <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", paddingLeft: 12, fontSize: 12 }}>
@@ -2309,7 +2663,174 @@ export default function GenerateTab({
                 </div>
               )}
               </div>
-            ))}
+  );
+
+  const promptFilesCard = (
+    <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <span style={{ ...cardTitleStyle, marginBottom: 0, flex: 1 }}>
+          PROMPT FILES
+          {promptFiles.length > 0 && (
+            <span style={{ fontWeight: 500 }}>
+              {" "}
+              · {promptFiles.length} loaded, {promptFiles.length - unusedCount} in use
+            </span>
+          )}
+        </span>
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            void openWildcardsDir().catch((err) => setError(String(err)));
+          }}
+          title="Open the project's wildcards folder, where prompt files live by default"
+          style={{ fontSize: 13, fontWeight: 600 }}
+        >
+          Open folder
+        </a>
+        <button
+          onClick={() => void addPromptFiles()}
+          disabled={generating}
+          style={{ ...secondaryButtonStyle, padding: "5px 14px" }}
+        >
+          Add .txt files…
+        </button>
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", fontSize: 12.5 }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontWeight: 600 }}>
+          <input
+            type="checkbox"
+            checked={wildcardFolder.enabled}
+            disabled={generating}
+            onChange={(e) => setWildcardFolder((w) => ({ ...w, enabled: e.target.checked }))}
+            style={{ accentColor: "var(--accent)" }}
+          />
+          Use whole folder
+          <HelpTip lines={[{ text: CONTROL_HELP.wholeFolder }, ...helpFor("promptFiles")]} />
+        </label>
+        {wildcardFolder.enabled && (
+          <>
+            <span
+              title={wildcardFolder.dir ?? "The project's wildcards folder"}
+              style={{ flex: 1, minWidth: 0, fontFamily: "'IBM Plex Mono', monospace", fontSize: 11.5, color: "var(--muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+            >
+              {wildcardFolder.dir ?? "wildcards (default)"} · {folderFiles.length} file{folderFiles.length === 1 ? "" : "s"}
+            </span>
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                if (!generating) void chooseWildcardFolder();
+              }}
+              style={{ fontWeight: 600 }}
+            >
+              Change…
+            </a>
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                if (!generating) void scanFolder();
+              }}
+              style={{ fontWeight: 600 }}
+            >
+              Refresh
+            </a>
+          </>
+        )}
+      </div>
+      {folderScanError && <div style={{ ...warningBoxStyle, marginTop: 0, fontSize: 12.5 }}>{folderScanError}</div>}
+      {promptFiles.length === 0 && folderFiles.length === 0 ? (
+        <div style={{ fontSize: 12.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif", lineHeight: 1.5 }}>
+          Text files with one prompt per line, kept in the project's <code>wildcards</code>{" "}
+          folder. Each file gets a token like <code>__hair__</code>; put it in any prompt,
+          undesired content or character, and every image fills it with a line from that file.
+        </div>
+      ) : (
+        <>
+          {promptFiles.length + folderFiles.length > 5 && (
+            <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", fontSize: 12.5 }}>
+              <input
+                value={fileFilter}
+                onChange={(e) => setFileFilter(e.target.value)}
+                placeholder="Filter files…"
+                spellCheck={false}
+                style={{ ...inputStyle, background: "var(--bg-page)", flex: "1 1 160px", padding: "5px 10px", fontSize: 12.5 }}
+              />
+              <label style={{ display: "flex", alignItems: "center", gap: 6, whiteSpace: "nowrap" }}>
+                <input
+                  type="checkbox"
+                  checked={usedOnly}
+                  onChange={(e) => setUsedOnly(e.target.checked)}
+                  style={{ accentColor: "var(--accent)" }}
+                />
+                In use only
+              </label>
+              {unusedCount > 0 && (
+                <a
+                  href="#"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    if (!generating) setPromptFiles((prev) => prev.filter((x) => usedNames.has(x.name)));
+                  }}
+                  title="Take every file whose token isn't in any prompt off this list (the files stay on disk)"
+                  style={{ fontWeight: 600, whiteSpace: "nowrap" }}
+                >
+                  Remove {unusedCount} unused
+                </a>
+              )}
+            </div>
+          )}
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+              maxHeight: 340,
+              overflowY: "auto",
+              paddingRight: 4,
+            }}
+          >
+            {shownFiles.length === 0 && shownFolder.length === 0 && (
+              <div style={{ fontSize: 12.5, color: "var(--muted)" }}>No files match.</div>
+            )}
+            {shownFiles.map(fileRow)}
+            {folderGroups.map(([group, files]) => {
+              const isOpen = openGroups.has(group) || filterText !== "";
+              return (
+                <div key={group} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  <button
+                    onClick={() =>
+                      setOpenGroups((g) => {
+                        const next = new Set(g);
+                        if (next.has(group)) next.delete(group);
+                        else next.add(group);
+                        return next;
+                      })
+                    }
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      padding: "2px 0",
+                      border: "none",
+                      background: "transparent",
+                      color: "var(--muted)",
+                      fontFamily: "'Space Grotesk', sans-serif",
+                      fontWeight: 600,
+                      fontSize: 12,
+                      cursor: "pointer",
+                      textAlign: "left",
+                    }}
+                  >
+                    {isOpen ? "▾" : "▸"} {group === "" ? "Wildcards folder" : `${group}/`}
+                    <span style={{ fontWeight: 500 }}>· {files.length}</span>
+                  </button>
+                  {isOpen && files.map(fileRow)}
+                </div>
+              );
+            })}
           </div>
           <div style={{ fontSize: 11.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif" }}>
             Click a token to insert it where you're typing. Each image uses one entry per file, so a
@@ -2583,6 +3104,28 @@ export default function GenerateTab({
     </div>
   );
 
+  const automationCard = (
+    <AutomationCard
+      value={automation}
+      onChange={setAutomation}
+      disabled={generating}
+      characterCount={characters.length}
+      genderPairs={genderPairs}
+      onEditPairs={(pairs) => {
+        setGenderPairs(pairs);
+        if (cardFolder) void saveGenderPairs(cardFolder, pairs).catch((e) => setError(String(e)));
+        else setError("Choose a card folder in the Character Cards tab to keep the swap table.");
+      }}
+      associationCount={cardFolder ? associations.length : null}
+      onReloadAssociations={() => void loadLibrary()}
+      onApplySwapToForm={applySwapToForm}
+      canUndoSwap={swapUndo !== null}
+      onUndoSwap={undoSwap}
+      cardStyle={cardStyle}
+      titleStyle={cardTitleStyle}
+    />
+  );
+
   // Pinned to the bottom of the window; the strip under it hides what scrolls past.
   const bottomBar = (
     <div
@@ -2679,6 +3222,17 @@ export default function GenerateTab({
               style={{ ...inputStyle, width: 64, background: "var(--bg-page)" }}
             />
           </label>
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault();
+              if (!generating) showPreview();
+            }}
+            title="See every image's prompts before anything is sent"
+            style={{ fontSize: 12.5, fontWeight: 600, whiteSpace: "nowrap" }}
+          >
+            Preview batch
+          </a>
           {runEstimate && (
             <span
               title={runEstimate.reasons.join(" ") || "Every image in this run should be free."}
@@ -2909,6 +3463,7 @@ export default function GenerateTab({
                 <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                   {promptCard}
                   {promptFilesCard}
+                  {automationCard}
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                   {charactersCard}
@@ -2923,6 +3478,7 @@ export default function GenerateTab({
                 {charactersCard}
                 {img2imgCard}
                 {promptFilesCard}
+                {automationCard}
                 {vibesCard}
                 {lastCard}
               </div>
@@ -3018,6 +3574,29 @@ export default function GenerateTab({
           </div>
         );
       })()}
+
+      {previewImages && (
+        <BatchPreview
+          images={previewImages}
+          onClose={() => setPreviewImages(null)}
+          onReroll={() => {
+            const seed = randomSeed();
+            setBatchSeed(seed);
+            showPreview(seed);
+          }}
+        />
+      )}
+      {editingFile && (
+        <PromptFileEditor
+          path={editingFile.file.path}
+          name={editingFile.file.name}
+          initial={editingFile.raw}
+          knownNames={new Set(allFiles.map((f) => f.name))}
+          loop={loops.get(editingFile.file.name) ?? null}
+          onSaved={() => void reloadFile(editingFile.file)}
+          onClose={() => setEditingFile(null)}
+        />
+      )}
 
       {importPlan && (
         <ImportConfirmModal

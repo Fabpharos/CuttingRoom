@@ -4,6 +4,7 @@ mod novelai;
 mod pdf_export;
 mod prompt_scan;
 mod character_preset;
+mod library;
 mod strip_metadata;
 
 use detection::{DetectionOutput, DetectionProgress, PixelateJob};
@@ -329,6 +330,41 @@ fn wildcards_path() -> Result<std::path::PathBuf, String> {
 }
 
 #[tauri::command]
+async fn library_read(folder: String, sub: String, name: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || library::read(&folder, &sub, &name))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn library_write(folder: String, sub: String, name: String, value: serde_json::Value) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || library::write(&folder, &sub, &name, &value))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn library_list(folder: String, sub: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || library::list(&folder, &sub))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn write_prompt_file(path: String, lines: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || library::write_prompt_file(&path, &lines))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn list_wildcard_files(dir: String) -> Result<Vec<library::WildcardFile>, String> {
+    tauri::async_runtime::spawn_blocking(move || library::list_wildcards(&dir))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 fn wildcards_dir() -> Result<String, String> {
     Ok(wildcards_path()?.to_string_lossy().into_owned())
 }
@@ -378,6 +414,11 @@ pub fn run() {
             nai_scan_upscale,
             nai_upscale_batch,
             wildcards_dir,
+            library_read,
+            library_write,
+            library_list,
+            list_wildcard_files,
+            write_prompt_file,
             open_wildcards_dir
         ])
         .run(tauri::generate_context!())
