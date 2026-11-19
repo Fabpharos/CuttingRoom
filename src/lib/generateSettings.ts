@@ -92,7 +92,13 @@ export type GenerateSettings = {
   /** Send the reference images that come with loaded character cards. */
   useCardReferences: boolean;
   creep: CreepSettings;
+  /** Fixed: every ticked vibe (up to 4). Random / next: K of the ticked ones per image. */
+  vibeRotation: VibeRotation;
+  /** Where encoded vibes are saved and the library is read from (null: the card folder's "vibes"). */
+  vibeLibraryDir: string | null;
 };
+
+export type VibeRotation = { mode: "fixed" | "random" | "next"; k: number; every: number };
 
 export const DEFAULT_SETTINGS: GenerateSettings = {
   model: MODELS[0].id,
@@ -124,6 +130,8 @@ export const DEFAULT_SETTINGS: GenerateSettings = {
   styleReference: null,
   useCardReferences: true,
   creep: DEFAULT_CREEP,
+  vibeRotation: { mode: "fixed", k: 2, every: 1 },
+  vibeLibraryDir: null,
 };
 
 const SETTINGS_KEY = "form";
@@ -138,7 +146,7 @@ const str = (v: unknown, fallback: string) => (typeof v === "string" ? v : fallb
 // corrupted file.
 const MAX_SAVED_VIBES = 32;
 
-function sanitizeVibes(raw: unknown): SavedVibe[] {
+function sanitizeVibes(raw: unknown, capEnabled = true): SavedVibe[] {
   if (!Array.isArray(raw)) return [];
   const vibes: SavedVibe[] = [];
   for (const v of raw.slice(0, MAX_SAVED_VIBES)) {
@@ -156,7 +164,9 @@ function sanitizeVibes(raw: unknown): SavedVibe[] {
       enabled: r.enabled === true,
     });
   }
-  // Never come back with more switched on than can be sent for free.
+  // Never come back with more switched on than can be sent for free (a
+  // rotating pool sends at most four per image, so it may tick more).
+  if (!capEnabled) return vibes;
   let on = 0;
   return vibes.map((v) => (v.enabled && ++on > MAX_VIBES ? { ...v, enabled: false } : v));
 }
@@ -251,7 +261,7 @@ function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy
     count: Math.round(clamp(raw.count, 1, MAX_BATCH, d.count)),
     outputDir: typeof raw.outputDir === "string" ? raw.outputDir : d.outputDir,
     promptFiles,
-    vibes: sanitizeVibes(raw.vibes),
+    vibes: sanitizeVibes(raw.vibes, (raw.vibeRotation as { mode?: unknown } | undefined)?.mode !== "random" && (raw.vibeRotation as { mode?: unknown } | undefined)?.mode !== "next"),
     automation: parseAutomation(raw.automation),
     characterAdvance: characters.map((_, i) =>
       Array.isArray(raw.characterAdvance) ? parseAdvance(raw.characterAdvance[i]) : null,
@@ -268,6 +278,15 @@ function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy
     })(),
     useCardReferences: raw.useCardReferences !== false,
     creep: parseCreep(raw.creep, SAMPLERS.map((x) => x.id), NOISE_SCHEDULES.map((x) => x.id)),
+    vibeRotation: (() => {
+      const v = (raw.vibeRotation ?? {}) as Record<string, unknown>;
+      return {
+        mode: v.mode === "random" || v.mode === "next" ? v.mode : "fixed",
+        k: Math.round(clamp(v.k, 1, MAX_VIBES, 2)),
+        every: Math.round(clamp(v.every, 1, 1000, 1)),
+      } as VibeRotation;
+    })(),
+    vibeLibraryDir: typeof raw.vibeLibraryDir === "string" ? raw.vibeLibraryDir : null,
     folderModes: (() => {
       const m = raw.folderModes;
       if (typeof m !== "object" || m === null) return {};

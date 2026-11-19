@@ -292,6 +292,24 @@ async fn nai_run_director(
 }
 
 #[tauri::command]
+async fn nai_encode_vibe(
+    run_id: String,
+    path: String,
+    model: String,
+    information_extracted: f64,
+    out_dir: String,
+) -> Result<novelai::EncodedVibe, String> {
+    novelai::encode_vibe(run_id, path, model, information_extracted, out_dir).await
+}
+
+#[tauri::command]
+async fn list_vibe_files(dir: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || novelai::list_vibe_files(&dir))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 fn nai_estimate_costs(
     requests: Vec<novelai::GenerateRequest>,
     account: Option<novelai::AccountStatus>,
@@ -420,6 +438,8 @@ pub fn run() {
             nai_generate_batch,
             nai_cancel_batch,
             nai_estimate_costs,
+            nai_encode_vibe,
+            list_vibe_files,
             nai_plan_director,
             nai_run_director,
             nai_read_image_metadata,

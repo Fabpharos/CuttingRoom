@@ -14,6 +14,8 @@ mod reference;
 pub use reference::*;
 mod director;
 pub use director::*;
+mod vibe_encode;
+pub use vibe_encode::*;
 
 const API_BASE: &str = "https://image.novelai.net";
 const KEYRING_SERVICE: &str = "CuttingRoom.NovelAI";

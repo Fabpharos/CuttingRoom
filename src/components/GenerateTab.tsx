@@ -119,7 +119,9 @@ import {
   loadGenerateSettings,
   saveGenerateSettings,
   type SavedVibe,
+  type VibeRotation,
 } from "../lib/generateSettings";
+import { invoke } from "@tauri-apps/api/core";
 import { revealFilesInExplorer } from "../lib/nativeOps";
 import type { RemixItem } from "../lib/remix";
 
@@ -636,6 +638,11 @@ export default function GenerateTab({
   const [showSavedPrompts, setShowSavedPrompts] = useState(false);
   // A saved prompt waiting on the import confirmation.
   const [pendingSnapshot, setPendingSnapshot] = useState<PromptSnapshot | null>(null);
+  const [vibeRotation, setVibeRotation] = useState<VibeRotation>({ mode: "fixed", k: 2, every: 1 });
+  const [vibeLibraryDir, setVibeLibraryDir] = useState<string | null>(null);
+  const [vibeLibrary, setVibeLibrary] = useState<string[] | null>(null);
+  // Encoding an image as a vibe (2 Anlas, once).
+  const [encoding, setEncoding] = useState<{ path: string; ie: number; busy: boolean; error: string | null } | null>(null);
   const [outputDir, setOutputDir] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   // Which run a cost confirmation is for: the form's, or the next remix batch.
@@ -680,6 +687,8 @@ export default function GenerateTab({
         setStyleReference(s.styleReference);
         setUseCardReferences(s.useCardReferences);
         setCreep(s.creep);
+        setVibeRotation(s.vibeRotation);
+        setVibeLibraryDir(s.vibeLibraryDir);
         setPoolStates((await generateStore.get<Record<string, PoolState>>("poolStates")) ?? {});
         setCount(s.count);
         setOutputDir(s.outputDir);
@@ -736,6 +745,8 @@ export default function GenerateTab({
         styleReference,
         useCardReferences,
         creep,
+        vibeRotation,
+        vibeLibraryDir,
         count,
         outputDir,
         promptFiles: promptFiles.map(({ path, name, mode }) => ({ path, name, mode })),
@@ -776,6 +787,8 @@ export default function GenerateTab({
     styleReference,
     useCardReferences,
     creep,
+    vibeRotation,
+    vibeLibraryDir,
     count,
     outputDir,
     promptFiles,
@@ -883,6 +896,7 @@ export default function GenerateTab({
   const maxChars = modelInfo.maxCharacters;
   const effectiveSteps = modelInfo.fixedSteps ?? steps;
   const vibesOn = vibes.filter((v) => v.enabled).length;
+  const rotating = vibeRotation.mode !== "fixed";
   // Only vibes already encoded for this model are sent; anything else would
   // need a paid encode. Rust checks this again against the files.
   const vibeRefs: VibeRef[] = modelInfo.vibes
@@ -1316,6 +1330,67 @@ export default function GenerateTab({
     });
   }
 
+  // The vibe library: the chosen folder, else "vibes" in the card folder.
+  const vibeDir = () => vibeLibraryDir ?? (cardFolder ? `${cardFolder}\\vibes` : null);
+
+  async function openVibeLibrary() {
+    const dir = vibeDir();
+    if (!dir) {
+      await chooseVibeLibrary();
+      return;
+    }
+    try {
+      setVibeLibrary(await invoke<string[]>("list_vibe_files", { dir }));
+    } catch {
+      setVibeLibrary([]);
+    }
+  }
+
+  async function chooseVibeLibrary() {
+    const dir = await open({ directory: true, multiple: false });
+    if (typeof dir !== "string") return;
+    setVibeLibraryDir(dir);
+    try {
+      setVibeLibrary(await invoke<string[]>("list_vibe_files", { dir }));
+    } catch {
+      setVibeLibrary([]);
+    }
+  }
+
+  async function startEncode() {
+    const file = await open({
+      directory: false,
+      multiple: false,
+      filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp"] }],
+    });
+    if (typeof file === "string") setEncoding({ path: file, ie: 1, busy: false, error: null });
+  }
+
+  async function runEncode() {
+    if (!encoding) return;
+    const dir = vibeDir() ?? encoding.path.replace(/[\\/][^\\/]*$/, "");
+    setEncoding({ ...encoding, busy: true, error: null });
+    try {
+      const out = await invoke<{ path: string; reused: boolean; anlasWarning: string | null }>("nai_encode_vibe", {
+        runId: crypto.randomUUID(),
+        path: encoding.path,
+        model,
+        informationExtracted: encoding.ie,
+        outDir: dir,
+      });
+      setEncoding(null);
+      await addVibeFiles([out.path]);
+      setBatchNotice(
+        (out.reused ? `This image was already encoded for ${modelInfo.label} at ${encoding.ie}, so the saved file was reused (no Anlas). ` : `Encoded and saved ${fileName(out.path)}. `) +
+          (out.anlasWarning ?? ""),
+      );
+      getAccountStatus().then((s) => s && setStatus(s)).catch(() => {});
+      if (vibeLibrary) void openVibeLibrary();
+    } catch (err) {
+      setEncoding((e) => (e ? { ...e, busy: false, error: String(err) } : e));
+    }
+  }
+
   function updateVibe(key: string, change: Partial<SavedVibe>) {
     setVibes((prev) => prev.map((v) => (v.key === key ? { ...v, ...change } : v)));
   }
@@ -1355,13 +1430,13 @@ export default function GenerateTab({
     scale,
     seed: 0,
     fileStem: "estimate",
-    vibes: vibeRefs,
+    vibes: rotating ? vibeRefs.slice(0, Math.min(vibeRotation.k, MAX_VIBES)) : vibeRefs,
     sampler,
     noiseSchedule,
     skipCfgAboveSigma: varietyPlus ? varietyPlusSigma(model, size.width, size.height) : null,
     preciseReferences: formReferences,
   });
-  const estimateKey = JSON.stringify([model, size, effectiveSteps, vibeRefs.length, formReferences.length, status?.isOpus, status?.usage?.isNegative]);
+  const estimateKey = JSON.stringify([model, size, effectiveSteps, vibeRefs.length, vibeRotation.mode, vibeRotation.k, formReferences.length, status?.isOpus, status?.usage?.isNegative]);
   useEffect(() => {
     if (phase !== "loggedIn") return;
     let stale = false;
@@ -1543,6 +1618,18 @@ export default function GenerateTab({
         vibes: vibeRefs,
         sourceImage: !fromRemix && sourceImage ? { path: sourceImage.path, strength: img2imgStrength } : null,
       };
+      // Rotating vibes: K of the ticked ones per image, random or in turn.
+      if (rotating && vibeRefs.length > 0) {
+        const k = Math.min(vibeRotation.k, MAX_VIBES, vibeRefs.length);
+        if (vibeRotation.mode === "random") {
+          const pool = [...vibeRefs];
+          request.vibes = Array.from({ length: k }, () => pool.splice(Math.floor(rng() * pool.length), 1)[0]);
+        } else {
+          const group = Math.floor(i / Math.max(1, vibeRotation.every));
+          const start = ((poolStates["vibes-next"]?.position ?? 0) + group * k) % vibeRefs.length;
+          request.vibes = Array.from({ length: k }, (_, n) => vibeRefs[(start + n) % vibeRefs.length]);
+        }
+      } else request.vibes = vibeRefs.slice(0, MAX_VIBES);
       const refs = referencesFor(res.slots.map((s) => (s.present ? s.link : null)));
       if (refs.length > 0) {
         // NovelAI won't take both; references win, and the card says so.
@@ -1644,6 +1731,11 @@ export default function GenerateTab({
         // Character pools and "next card" associations carry on next time.
         const states = { ...poolStates };
         for (const { adv, key } of advancing) states[key] = advancedState(adv, states[key] ?? { position: 0, seed: randomSeed() }, made);
+        if (vibeRotation.mode === "next" && vibeRefs.length > 0) {
+          const st = states["vibes-next"] ?? { position: 0, seed: 1 };
+          const k = Math.min(vibeRotation.k, MAX_VIBES, vibeRefs.length);
+          states["vibes-next"] = { ...st, position: st.position + k * Math.ceil(made / Math.max(1, vibeRotation.every)) };
+        }
         if (artists.enabled && artists.mode === "next" && usableArtists(artists, family).length > 0) {
           const st = states["artists-next"] ?? { position: 0, seed: 1 };
           states["artists-next"] = { ...st, position: st.position + Math.ceil(made / Math.max(1, artists.every)) };
@@ -3308,10 +3400,34 @@ export default function GenerateTab({
           {vibes.length > 0 && modelInfo.vibes && (
             <span style={{ fontWeight: 500 }}>
               {" "}
-              · {vibeRefs.length} of {MAX_VIBES} in use
+              · {rotating ? `${Math.min(vibeRotation.k, MAX_VIBES)} per image from ${vibeRefs.length}` : `${vibeRefs.length} of ${MAX_VIBES} in use`}
             </span>
           )}
         </span>
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            if (!generating) void openVibeLibrary();
+          }}
+          title="The vibe files in your vibe library folder"
+          style={{ fontSize: 13, fontWeight: 600 }}
+        >
+          Library…
+        </a>
+        {modelInfo.vibes && (
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault();
+              if (!generating) void startEncode();
+            }}
+            title="Encode a plain image as a vibe (2 Anlas, once; saved as a .naiv4vibe file and reused after)"
+            style={{ fontSize: 13, fontWeight: 600 }}
+          >
+            Encode image…
+          </a>
+        )}
         <button
           onClick={() => void chooseVibeFiles()}
           disabled={generating}
@@ -3320,6 +3436,115 @@ export default function GenerateTab({
           Add vibe file…
         </button>
       </div>
+
+      {vibes.length > 0 && modelInfo.vibes && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 12 }}>
+          <span style={{ fontWeight: 600, color: "var(--muted)" }}>
+            Use
+            <HelpTip
+              lines={[
+                { text: "Fixed sends every ticked vibe (up to 4, so it stays free)." },
+                { text: "Random or Next sends K of the ticked vibes per image (at most 4), picked at random or in turn every N images; tick as many as you like." },
+              ]}
+            />
+          </span>
+          <select
+            value={vibeRotation.mode}
+            disabled={generating}
+            onChange={(e) => setVibeRotation({ ...vibeRotation, mode: e.target.value as VibeRotation["mode"] })}
+            style={{ ...inputStyle, padding: "3px 6px", fontSize: 12, background: "var(--bg-page)" }}
+          >
+            <option value="fixed">every ticked vibe</option>
+            <option value="random">K at random per image</option>
+            <option value="next">the next K every N images</option>
+          </select>
+          {rotating && (
+            <>
+              K
+              <input
+                type="number"
+                min={1}
+                max={MAX_VIBES}
+                value={vibeRotation.k}
+                disabled={generating}
+                onChange={(e) => setVibeRotation({ ...vibeRotation, k: Math.max(1, Math.min(MAX_VIBES, Math.round(Number(e.target.value)) || 1)) })}
+                style={{ ...inputStyle, width: 48, padding: "3px 6px", background: "var(--bg-page)" }}
+              />
+            </>
+          )}
+          {vibeRotation.mode === "next" && (
+            <>
+              every
+              <input
+                type="number"
+                min={1}
+                value={vibeRotation.every}
+                disabled={generating}
+                onChange={(e) => setVibeRotation({ ...vibeRotation, every: Math.max(1, Math.round(Number(e.target.value)) || 1) })}
+                style={{ ...inputStyle, width: 48, padding: "3px 6px", background: "var(--bg-page)" }}
+              />
+              images
+            </>
+          )}
+        </div>
+      )}
+
+      {vibeLibrary && (
+        <div style={{ border: "1px solid var(--border)", borderRadius: 8, padding: "8px 10px", display: "flex", flexDirection: "column", gap: 6, fontSize: 12.5 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontWeight: 600, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={vibeDir() ?? ""}>
+              Vibe library · {vibeLibrary.length} file{vibeLibrary.length === 1 ? "" : "s"}
+            </span>
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                void chooseVibeLibrary();
+              }}
+              style={{ fontWeight: 600 }}
+            >
+              Change folder…
+            </a>
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                setVibeLibrary(null);
+              }}
+              style={{ fontWeight: 600 }}
+            >
+              Close
+            </a>
+          </div>
+          {vibeLibrary.length === 0 && <div style={{ color: "var(--muted)" }}>No vibe files here yet; encoded images are saved here.</div>}
+          <div style={{ display: "flex", flexDirection: "column", gap: 3, maxHeight: 180, overflowY: "auto" }}>
+            {vibeLibrary.map((p) => {
+              const listed = vibes.some((v) => v.path === p);
+              return (
+                <div key={p} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={p}>
+                    {fileName(p)}
+                  </span>
+                  {listed ? (
+                    <span style={{ color: "var(--muted)" }}>in the list</span>
+                  ) : (
+                    <a
+                      href="#"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        void addVibeFiles([p]);
+                      }}
+                      style={{ fontWeight: 600 }}
+                    >
+                      Add
+                    </a>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {vibes.length === 0 && (
         <div style={{ fontSize: 12.5, color: "var(--muted)", fontFamily: "system-ui, sans-serif" }}>
@@ -3352,10 +3577,10 @@ export default function GenerateTab({
               type="checkbox"
               checked={v.enabled}
               onChange={(e) => updateVibe(v.key, { enabled: e.target.checked })}
-              disabled={generating || (!v.enabled && vibesOn >= MAX_VIBES)}
+              disabled={generating || (!rotating && !v.enabled && vibesOn >= MAX_VIBES)}
               title={
-                !v.enabled && vibesOn >= MAX_VIBES
-                  ? `Up to ${MAX_VIBES} vibes at once; more would cost Anlas`
+                !rotating && !v.enabled && vibesOn >= MAX_VIBES
+                  ? `Up to ${MAX_VIBES} vibes at once; more would cost Anlas (or rotate them, below)`
                   : "Use this vibe"
               }
               style={{ accentColor: "var(--accent)" }}
@@ -3989,6 +4214,46 @@ export default function GenerateTab({
           }}
           onClose={() => setDirector(null)}
         />
+      )}
+      {encoding && status && (
+        <div
+          onClick={() => !encoding.busy && setEncoding(null)}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 300 }}
+        >
+          <div onClick={(e) => e.stopPropagation()} style={{ ...cardStyle, width: 460, maxWidth: "90vw", display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ fontSize: 16, fontWeight: 700 }}>Encode a vibe</div>
+            <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+              <img src={convertFileSrc(encoding.path)} alt="" style={{ width: 72, height: 72, objectFit: "contain", borderRadius: 6, background: "var(--bg-page)" }} />
+              <div style={{ fontSize: 13, wordBreak: "break-all" }}>{fileName(encoding.path)}</div>
+            </div>
+            <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12.5 }}>
+              <span style={{ fontWeight: 600, color: "var(--muted)" }}>Information extracted: {encoding.ie.toFixed(2)}</span>
+              <input
+                type="range"
+                min={0.01}
+                max={1}
+                step={0.01}
+                value={encoding.ie}
+                disabled={encoding.busy}
+                onChange={(e) => setEncoding({ ...encoding, ie: Number(e.target.value) })}
+                style={{ accentColor: "var(--accent)" }}
+              />
+            </label>
+            <div style={{ ...warningBoxStyle, marginTop: 0 }}>
+              Encoding costs 2 Anlas (one time) for {modelInfo.label} at {encoding.ie.toFixed(2)}. You have {status.anlas.toLocaleString()} Anlas.
+              The result is saved as a .naiv4vibe file and reused after, so the same image, model and setting are never paid for twice.
+            </div>
+            {encoding.error && <div style={{ fontSize: 12.5, color: "#c9482f" }}>{encoding.error}</div>}
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+              <button onClick={() => setEncoding(null)} disabled={encoding.busy} style={secondaryButtonStyle}>
+                Cancel
+              </button>
+              <button onClick={() => void runEncode()} disabled={encoding.busy} style={{ ...primaryButtonStyle, opacity: encoding.busy ? 0.5 : 1 }}>
+                {encoding.busy ? "Encoding…" : "Encode (2 Anlas)"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
       {showSavedPrompts && cardFolder && (
         <SavedPromptsDialog
