@@ -64,6 +64,8 @@ import AutomationCard, { DEFAULT_AUTOMATION, type AutomationSettings } from "./A
 import BatchPreview, { type PreviewImage } from "./BatchPreview";
 import PromptFileEditor from "./PromptFileEditor";
 import DirectorDialog from "./DirectorDialog";
+import CreepCard from "./CreepCard";
+import { DEFAULT_CREEP, listAt, numberAt, seedAt, type CreepSettings } from "../lib/creep";
 import type { DirectorTool } from "../lib/director";
 import { buildImage, findLoops, imageRng, seededRng, swapGender, type EngineFile, type EngineSettings, type Slot } from "../lib/promptEngine";
 import { helpFor } from "../lib/syntaxHelp";
@@ -614,6 +616,7 @@ export default function GenerateTab({
   // Precise Reference: a style reference here, plus each loaded card's own.
   const [styleReference, setStyleReference] = useState<PreciseReference | null>(null);
   const [useCardReferences, setUseCardReferences] = useState(true);
+  const [creep, setCreep] = useState<CreepSettings>(DEFAULT_CREEP);
   const [outputDir, setOutputDir] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   // Which run a cost confirmation is for: the form's, or the next remix batch.
@@ -657,6 +660,7 @@ export default function GenerateTab({
         setFolderModes(s.folderModes);
         setStyleReference(s.styleReference);
         setUseCardReferences(s.useCardReferences);
+        setCreep(s.creep);
         setPoolStates((await generateStore.get<Record<string, PoolState>>("poolStates")) ?? {});
         setCount(s.count);
         setOutputDir(s.outputDir);
@@ -712,6 +716,7 @@ export default function GenerateTab({
         folderModes,
         styleReference,
         useCardReferences,
+        creep,
         count,
         outputDir,
         promptFiles: promptFiles.map(({ path, name, mode }) => ({ path, name, mode })),
@@ -751,6 +756,7 @@ export default function GenerateTab({
     folderModes,
     styleReference,
     useCardReferences,
+    creep,
     count,
     outputDir,
     promptFiles,
@@ -1322,9 +1328,32 @@ export default function GenerateTab({
     const usedFiles = new Set<string>();
     // "Next card with label" associations count through the batch.
     const assocNext = new Map<string, number>();
+    // A step creep set to "stop" ends the batch at the first image past its end.
+    let stopAt = rows.length;
+    const creepRng = (i: number) => seededRng((seedBase ^ Math.imul(i + 1, 0xc2b2ae35)) >>> 0);
+    const creepFor = (i: number, w: number, h: number) => {
+      if (!creep.enabled) return null;
+      const r = creepRng(i);
+      const st = modelInfo.fixedSteps !== undefined
+        ? { value: effectiveSteps, stop: false, capped: false }
+        : numberAt(creep.steps, i, r, effectiveSteps, { min: 1, max: MAX_STEPS, decimals: 0 });
+      const gd = numberAt(creep.guidance, i, r, scale, { min: 0, max: MAX_SCALE, decimals: 1 });
+      const sg = varietyPlus
+        ? numberAt(creep.sigma, i, r, varietyPlusSigma(model, w, h), { min: 0, max: 1000, decimals: 2 })
+        : null;
+      if (st.stop || gd.stop || sg?.stop) stopAt = Math.min(stopAt, i);
+      return {
+        steps: st.value,
+        scale: gd.value,
+        sigma: sg ? sg.value : null,
+        sampler: listAt(creep.sampler, i, r) ?? sampler,
+        noiseSchedule: listAt(creep.schedule, i, r) ?? noiseSchedule,
+      };
+    };
     const images: PreviewImage[] = rows.map((row, i) => {
       const rng = imageRng(seedBase, i);
-      const seed = row.item?.seed ?? Math.floor(seededRng((seedBase ^ Math.imul(i + 1, 0x85ebca6b)) >>> 0)() * 0x1_0000_0000);
+      const batchRandom = Math.floor(seededRng((seedBase ^ Math.imul(i + 1, 0x85ebca6b)) >>> 0)() * 0x1_0000_0000);
+      const seed = row.item?.seed ?? (creep.enabled ? seedAt(creep.seed, i, batchRandom) : batchRandom);
       const slots = row.slots.map((s, j): Slot => {
         const adv = fromRemix ? null : advanceOf(j);
         if (!adv || adv.mode === "fixed") return s;
@@ -1356,8 +1385,10 @@ export default function GenerateTab({
       res.usedFiles.forEach((f) => usedFiles.add(f));
       const w = row.item?.size?.width ?? size.width;
       const h = row.item?.size?.height ?? size.height;
+      const cv = creepFor(i, w, h);
       const request: GenerateRequest = {
         ...sendSettings(w, h),
+        ...(cv ? { sampler: cv.sampler, noiseSchedule: cv.noiseSchedule, skipCfgAboveSigma: cv.sigma } : {}),
         model,
         prompt: res.prompt,
         negativePrompt: res.negative,
@@ -1366,8 +1397,8 @@ export default function GenerateTab({
         characterPositions: row.placed ? res.slots.map((s) => s.position) : null,
         width: w,
         height: h,
-        steps: effectiveSteps,
-        scale,
+        steps: cv?.steps ?? effectiveSteps,
+        scale: cv?.scale ?? scale,
         seed,
         fileStem: "",
         vibes: vibeRefs,
@@ -1381,7 +1412,7 @@ export default function GenerateTab({
       }
       return { request, log: res.log, warnings: res.warnings, cardNames: res.slots.map((s) => s.link?.name ?? null) };
     });
-    return { images, usedFiles, assocNext };
+    return { images: images.slice(0, stopAt), usedFiles, assocNext, stopped: stopAt < rows.length };
   }
 
   function showPreview(seedBase = batchSeed) {
@@ -1401,6 +1432,10 @@ export default function GenerateTab({
       built = buildBatch(fromRemix);
     } catch (err) {
       setError(String(err));
+      return;
+    }
+    if (built.images.length === 0) {
+      setError("Parameter creep stops before the first image; check its range.");
       return;
     }
     const requests: GenerateRequest[] = built.images.map((img, i) => ({
@@ -1423,7 +1458,9 @@ export default function GenerateTab({
     setBatchNotice(
       fromRemix && remixBatch.some((item) => item.characters.length > maxChars)
         ? `${modelFamily(model)} takes ${maxChars} characters, so images with more use only their first ${maxChars}.`
-        : null,
+        : built.stopped
+          ? `Parameter creep reached the end of its range, so this batch is ${requests.length} image${requests.length === 1 ? "" : "s"}.`
+          : null,
     );
     setBatchImages([]);
     setProgress({ done: 0, total: requests.length });
@@ -3279,6 +3316,21 @@ export default function GenerateTab({
     </div>
   );
 
+  const creepCard = (
+    <CreepCard
+      value={creep}
+      onChange={setCreep}
+      disabled={generating}
+      maxSteps={MAX_STEPS}
+      stepsFixed={modelInfo.fixedSteps !== undefined}
+      varietyPlus={varietyPlus}
+      samplers={SAMPLERS}
+      schedules={NOISE_SCHEDULES}
+      cardStyle={cardStyle}
+      titleStyle={cardTitleStyle}
+    />
+  );
+
   const automationCard = (
     <AutomationCard
       value={automation}
@@ -3639,6 +3691,7 @@ export default function GenerateTab({
                   {promptCard}
                   {promptFilesCard}
                   {automationCard}
+                  {creepCard}
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                   {charactersCard}
@@ -3656,6 +3709,7 @@ export default function GenerateTab({
                 {referenceCard}
                 {promptFilesCard}
                 {automationCard}
+                {creepCard}
                 {vibesCard}
                 {lastCard}
               </div>

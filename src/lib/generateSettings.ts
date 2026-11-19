@@ -26,6 +26,7 @@ import { parseCardLink, type CardLink } from "./characterCards";
 import { fileTokenName, isValidTokenName, tokenFor } from "./promptTokens";
 import { parseAutomation, DEFAULT_AUTOMATION, type AutomationSettings } from "../components/AutomationCard";
 import { parseAdvance, type SlotAdvance } from "./characterPool";
+import { DEFAULT_CREEP, parseCreep, type CreepSettings } from "./creep";
 
 // One store for everything the Generate tab saves, shared with the prompt
 // file's sequential positions. The API token is never stored here — it
@@ -90,6 +91,7 @@ export type GenerateSettings = {
   styleReference: PreciseReference | null;
   /** Send the reference images that come with loaded character cards. */
   useCardReferences: boolean;
+  creep: CreepSettings;
 };
 
 export const DEFAULT_SETTINGS: GenerateSettings = {
@@ -121,6 +123,7 @@ export const DEFAULT_SETTINGS: GenerateSettings = {
   folderModes: {},
   styleReference: null,
   useCardReferences: true,
+  creep: DEFAULT_CREEP,
 };
 
 const SETTINGS_KEY = "form";
@@ -264,6 +267,7 @@ function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy
       return { path: r.path, kind, strength: clamp(r.strength, 0, 1, 1), fidelity: clamp(r.fidelity, 0, 1, 1) };
     })(),
     useCardReferences: raw.useCardReferences !== false,
+    creep: parseCreep(raw.creep, SAMPLERS.map((x) => x.id), NOISE_SCHEDULES.map((x) => x.id)),
     folderModes: (() => {
       const m = raw.folderModes;
       if (typeof m !== "object" || m === null) return {};
