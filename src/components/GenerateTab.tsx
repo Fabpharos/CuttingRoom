@@ -27,6 +27,7 @@ import {
   DEFAULT_SAMPLER,
   DEFAULT_NOISE_SCHEDULE,
   varietyPlusSigma,
+  supportsVarietyPlus,
   VARIETY_PLUS_VERIFIED,
   estimateCosts,
   DEFAULT_STEPS,
@@ -911,6 +912,8 @@ export default function GenerateTab({
 
   const modelInfo = MODELS.find((m) => m.id === model) ?? MODELS[0];
   const maxChars = modelInfo.maxCharacters;
+  // Variety+ is only sent where the model takes it (not V5).
+  const varietyOn = varietyPlus && supportsVarietyPlus(model);
   const effectiveSteps = modelInfo.fixedSteps ?? steps;
   const vibesOn = vibes.filter((v) => v.enabled).length;
   const rotating = vibeRotation.mode !== "fixed";
@@ -1450,7 +1453,7 @@ export default function GenerateTab({
     vibes: rotating ? vibeRefs.slice(0, Math.min(vibeRotation.k, MAX_VIBES)) : vibeRefs,
     sampler,
     noiseSchedule,
-    skipCfgAboveSigma: varietyPlus ? varietyPlusSigma(model, size.width, size.height) : null,
+    skipCfgAboveSigma: varietyOn ? varietyPlusSigma(model, size.width, size.height) : null,
     preciseReferences: formReferences,
   });
   const estimateKey = JSON.stringify([model, size, effectiveSteps, vibeRefs.length, vibeRotation.mode, vibeRotation.k, formReferences.length, status?.isOpus, status?.usage?.isNegative]);
@@ -1523,7 +1526,7 @@ export default function GenerateTab({
     const sendSettings = (w: number, h: number) => ({
       sampler,
       noiseSchedule,
-      skipCfgAboveSigma: varietyPlus ? varietyPlusSigma(model, w, h) : null,
+      skipCfgAboveSigma: varietyOn ? varietyPlusSigma(model, w, h) : null,
     });
     const settings = engineSettings();
     const rows = fromRemix
@@ -1571,7 +1574,7 @@ export default function GenerateTab({
         ? { value: effectiveSteps, stop: false, capped: false }
         : numberAt(creep.steps, i, r, effectiveSteps, { min: 1, max: MAX_STEPS, decimals: 0 });
       const gd = numberAt(creep.guidance, i, r, scale, { min: 0, max: MAX_SCALE, decimals: 1 });
-      const sg = varietyPlus
+      const sg = varietyOn
         ? numberAt(creep.sigma, i, r, varietyPlusSigma(model, w, h), { min: 0, max: 1000, decimals: 2 })
         : null;
       if (st.stop || gd.stop || sg?.stop) stopAt = Math.min(stopAt, i);
@@ -2643,9 +2646,10 @@ export default function GenerateTab({
             <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, fontWeight: 600, paddingBottom: 6 }}>
               <input
                 type="checkbox"
-                checked={varietyPlus}
+                checked={varietyOn}
                 onChange={(e) => setVarietyPlus(e.target.checked)}
-                disabled={generating}
+                disabled={generating || !supportsVarietyPlus(model)}
+                title={supportsVarietyPlus(model) ? undefined : "V5 doesn't take Variety+"}
                 style={{ accentColor: "var(--accent)" }}
               />
               Variety+
@@ -2658,7 +2662,7 @@ export default function GenerateTab({
                   {
                     text: VARIETY_PLUS_VERIFIED
                       ? `Sends skip_cfg_above_sigma ${varietyPlusSigma(model, size.width, size.height).toFixed(2)} at this size.`
-                      : `Sends skip_cfg_above_sigma ${varietyPlusSigma(model, size.width, size.height).toFixed(2)} at this size (matches a V4.5 image made on novelai.net, 58 at 832×1216; other sizes scale by NovelAI's rule, and V5 isn't checked yet).`,
+                      : `Sends skip_cfg_above_sigma ${varietyPlusSigma(model, size.width, size.height).toFixed(2)} at this size (matches a V4.5 image made on novelai.net, 58 at 832×1216; other sizes scale by NovelAI's rule). V5 doesn't take Variety+.`,
                   },
                 ]}
               />
@@ -3946,7 +3950,7 @@ export default function GenerateTab({
       disabled={generating}
       maxSteps={MAX_STEPS}
       stepsFixed={modelInfo.fixedSteps !== undefined}
-      varietyPlus={varietyPlus}
+      varietyPlus={varietyOn}
       samplers={SAMPLERS}
       schedules={NOISE_SCHEDULES}
       cardStyle={cardStyle}

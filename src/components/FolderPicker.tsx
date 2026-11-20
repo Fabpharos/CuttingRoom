@@ -5,10 +5,12 @@ export default function FolderPicker({
   onChoose,
   recentFolders,
   onOpenRecent,
+  description = "Choose a folder of photos to review, tag, and arrange.",
 }: {
   onChoose: () => void;
   recentFolders: string[];
   onOpenRecent: (path: string) => void;
+  description?: string;
 }) {
   const [showRecent, setShowRecent] = useState(false);
 
@@ -38,7 +40,7 @@ export default function FolderPicker({
                 fontFamily: "system-ui, sans-serif",
               }}
             >
-              Choose a folder of photos to review, tag, and arrange.
+              {description}
             </div>
           </div>
 

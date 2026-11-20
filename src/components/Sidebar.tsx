@@ -3,6 +3,7 @@ import ThemeSwitch from "./ThemeSwitch";
 export const TAB_IDS = [
   "generate",
   "album",
+  "edit",
   "matching",
   "detection",
   "stripMetadata",
@@ -28,6 +29,24 @@ function FolderTabIcon({ color }: { color: string }) {
       strokeLinejoin="round"
     >
       <path d="M3 6.5a1 1 0 0 1 1-1h5l2 2.2h9a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6.5Z" />
+    </svg>
+  );
+}
+
+function EditTabIcon({ color }: { color: string }) {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      style={{ stroke: color }}
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M4 20l1-4L16 5a2.1 2.1 0 0 1 3 3L8 19l-4 1Z" />
+      <path d="M14 7l3 3" />
     </svg>
   );
 }
@@ -344,6 +363,13 @@ export default function Sidebar({
           active={activeTab === "album"}
           collapsed={collapsed}
           onClick={() => onSelectTab("album")}
+        />
+        <NavItem
+          icon={<EditTabIcon color={iconColorFor("edit")} />}
+          label="Edit"
+          active={activeTab === "edit"}
+          collapsed={collapsed}
+          onClick={() => onSelectTab("edit")}
         />
         <NavItem
           icon={<MatchingTabIcon color={iconColorFor("matching")} />}

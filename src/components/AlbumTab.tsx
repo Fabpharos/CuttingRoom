@@ -3,7 +3,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { readDir } from "@tauri-apps/plugin-fs";
 import { basename, join } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getThumbnailUrl, moveThumbnailCache } from "../lib/thumbnails";
+import { getThumbnailUrl, moveThumbnailCache, onFileChanged } from "../lib/thumbnails";
 import {
   copyFilesToClipboard,
   moveFilesToTrash,
@@ -57,7 +57,14 @@ type PendingPhotoRename = {
   order: string[];
 };
 
-export default function AlbumTab({ active }: { active: boolean }) {
+export default function AlbumTab({
+  active,
+  onOpenInEdit,
+}: {
+  active: boolean;
+  /** Opens the album (and, given a name, that photo) in the Edit tab. */
+  onOpenInEdit: (folder: string, file: string | null) => void;
+}) {
   const [folderPath, setFolderPath] = useState<string | null>(null);
   const [albumName, setAlbumName] = useState("");
   const [images, setImages] = useState<ImageEntry[]>([]);
@@ -134,6 +141,22 @@ export default function AlbumTab({ active }: { active: boolean }) {
   useEffect(() => {
     getRecentFolders().then(setRecentFolders);
   }, []);
+
+  // The Edit tab saved a photo in this album: show a changed one's new
+  // thumbnail, and pick up a new copy as Refresh would.
+  const fileChangedRef = useRef<(folder: string, name: string) => void>(() => {});
+  fileChangedRef.current = (folder, name) => {
+    if (folder !== folderPath) return;
+    if (images.some((img) => img.name === name)) {
+      void join(folder, name)
+        .then(getThumbnailUrl)
+        .then((src) => setImages((prev) => prev.map((img) => (img.name === name ? { ...img, src } : img))))
+        .catch(() => {});
+    } else {
+      void handleRefresh();
+    }
+  };
+  useEffect(() => onFileChanged((folder, name) => fileChangedRef.current(folder, name)), []);
 
   useEffect(() => {
     if (!folderPath || selectedNames.size === 0) {
@@ -781,6 +804,7 @@ export default function AlbumTab({ active }: { active: boolean }) {
           onRenameFiles={() => setShowRenamePreview(true)}
           onExportPdf={() => void handleExportPdf()}
           onRandomizeOrder={() => void handleRandomizeOrder()}
+          onOpenInEdit={() => onOpenInEdit(folderPath, null)}
           onCommitName={handleCommitName}
           onReorder={handleReorder}
           onToggleTag={handleToggleTag}
@@ -900,6 +924,9 @@ export default function AlbumTab({ active }: { active: boolean }) {
                 onClick: () => void setMarked(names, !allMarked),
               };
             })(),
+            ...(contextMenu.targets.size === 1
+              ? [{ label: "Edit…", onClick: () => onOpenInEdit(folderPath, [...contextMenu.targets][0]) }]
+              : []),
             ...(contextMenu.targets.size === 1
               ? (["emotion", "colorize"] as const).map((tool) => ({
                   label: tool === "emotion" ? "Change expression…" : "Colorize…",

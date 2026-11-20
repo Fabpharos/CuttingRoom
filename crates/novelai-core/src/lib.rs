@@ -257,6 +257,7 @@ pub const DEFAULT_NOISE_SCHEDULE: &str = "karras";
 /// Checked against a V4.5 image made on novelai.net with Variety+ on (58 at
 /// 832x1216). Other sizes follow the V4 scaling rule and V5 isn't checked
 /// yet, so `VARIETY_PLUS_VERIFIED` stays false until those are confirmed.
+/// V5 doesn't take Variety+ (the user found it doesn't work there).
 pub fn variety_plus_sigma(_model: &str, width: u32, height: u32) -> f64 {
     let latent = 4.0 * (width as f64 / 8.0) * (height as f64 / 8.0);
     let v = 58.0 * (latent / 63232.0).sqrt();
@@ -264,6 +265,11 @@ pub fn variety_plus_sigma(_model: &str, width: u32, height: u32) -> f64 {
 }
 /// Whether `variety_plus_sigma` has been confirmed against real images.
 pub const VARIETY_PLUS_VERIFIED: bool = false;
+
+/// Whether a model takes Variety+. V5 doesn't.
+pub fn supports_variety_plus(model: &str) -> bool {
+    !model.starts_with("nai-diffusion-5")
+}
 /// Upper bound for a hand-set Variety+ sigma (creep can raise it).
 pub const MAX_VARIETY_SIGMA: f64 = 1000.0;
 
@@ -465,6 +471,9 @@ fn request_body(req: &GenerateRequest, vibes: &[ResolvedVibe]) -> Result<serde_j
     let noise_schedule = req.noise_schedule.as_deref().unwrap_or(DEFAULT_NOISE_SCHEDULE);
     if !NOISE_SCHEDULES.contains(&noise_schedule) {
         return Err(format!("Unknown noise schedule: {noise_schedule}"));
+    }
+    if req.skip_cfg_above_sigma.is_some() && !supports_variety_plus(&req.model) {
+        return Err(format!("{} doesn't support Variety+.", model_family(&req.model)));
     }
     if let Some(sigma) = req.skip_cfg_above_sigma {
         if !(0.0..=MAX_VARIETY_SIGMA).contains(&sigma) || sigma.is_nan() {
@@ -2044,6 +2053,16 @@ mod tests {
         r.noise_schedule = None;
         r.skip_cfg_above_sigma = Some(-1.0);
         assert!(build_body(&r, &[]).is_err());
+    }
+
+    #[test]
+    fn v5_refuses_variety_plus() {
+        let mut r = request("nai-diffusion-5-full", 832, 1216, &[]);
+        r.skip_cfg_above_sigma = Some(58.0);
+        let err = build_body(&r, &[]).unwrap_err();
+        assert!(err.contains("V5"), "{err}");
+        r.model = "nai-diffusion-4-5-curated".into();
+        assert!(build_body(&r, &[]).is_ok());
     }
 
     #[test]
