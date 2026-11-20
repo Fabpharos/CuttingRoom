@@ -76,6 +76,7 @@ export default function ImageGrid({
   onRenameFiles,
   onExportPdf,
   onRandomizeOrder,
+  onOpenInEdit,
   onCommitName,
   onReorder,
   onToggleTag,
@@ -109,6 +110,7 @@ export default function ImageGrid({
   onRenameFiles: () => void;
   onExportPdf: () => void;
   onRandomizeOrder: () => void;
+  onOpenInEdit: () => void;
   onCommitName: (newName: string) => void;
   onReorder: (newOrder: string[]) => void;
   onToggleTag: (name: string) => void;
@@ -197,6 +199,7 @@ export default function ImageGrid({
         onRenameFiles={onRenameFiles}
         onExportPdf={onExportPdf}
         onRandomizeOrder={onRandomizeOrder}
+        onOpenInEdit={onOpenInEdit}
         onCommitName={onCommitName}
         revertToken={nameRevertToken}
       />

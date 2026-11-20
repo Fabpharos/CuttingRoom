@@ -64,3 +64,19 @@ export function moveThumbnailCache(pairs: { oldPath: string; newPath: string }[]
     if (entry) cache.set(newPath, entry);
   });
 }
+
+// The Edit tab tells other tabs when it writes a file, so Album can show the
+// new or changed photo without a manual refresh.
+type FileChangeListener = (folder: string, name: string) => void;
+const fileListeners = new Set<FileChangeListener>();
+
+/** Drops `path`'s cached thumbnail and tells listeners `name` in `folder` changed or appeared. */
+export function notifyFileChanged(folder: string, name: string, path: string): void {
+  cache.delete(path);
+  for (const l of fileListeners) l(folder, name);
+}
+
+export function onFileChanged(listener: FileChangeListener): () => void {
+  fileListeners.add(listener);
+  return () => fileListeners.delete(listener);
+}

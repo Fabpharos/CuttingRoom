@@ -1,4 +1,5 @@
 mod detection;
+mod edit;
 mod matching;
 mod novelai;
 mod pdf_export;
@@ -39,6 +40,53 @@ fn copy_files_to_clipboard(paths: Vec<String>) -> Result<(), String> {
 #[tauri::command]
 fn move_files_to_trash(paths: Vec<String>) -> Result<(), String> {
     trash::delete_all(&paths).map_err(|e| e.to_string())
+}
+
+/// Percent-decodes a header value (the path is sent with encodeURIComponent,
+/// since headers have to be ASCII).
+fn percent_decode(s: &str) -> Result<String, String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hex = s.get(i + 1..i + 3).ok_or("Bad path encoding.")?;
+            out.push(u8::from_str_radix(hex, 16).map_err(|_| "Bad path encoding.")?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| "Bad path encoding.".to_string())
+}
+
+/// Saves an image edited in the Edit tab. The body is the encoded image;
+/// the headers say which original it belongs to (`x-path`), its format
+/// (`x-ext`) and whether to replace the original (`x-overwrite: 1`, which
+/// sends the original to the Recycle Bin first). Returns the path written.
+#[tauri::command]
+async fn edit_save_image(request: tauri::ipc::Request<'_>) -> Result<String, String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("Expected the image bytes.".into());
+    };
+    let header = |name: &str| -> Result<String, String> {
+        request
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string())
+            .ok_or_else(|| format!("Missing {name}."))
+    };
+    let path = percent_decode(&header("x-path")?)?;
+    let ext = header("x-ext")?;
+    let overwrite = header("x-overwrite")? == "1";
+    let bytes = bytes.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        edit::save(std::path::Path::new(&path), &ext, overwrite, &bytes).map(|p| p.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -432,6 +480,7 @@ pub fn run() {
             copy_files_to_clipboard,
             move_files_to_trash,
             get_file_sizes,
+            edit_save_image,
             find_image_matches,
             cancel_match,
             copy_files_to_folder,

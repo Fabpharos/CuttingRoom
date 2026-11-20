@@ -4,6 +4,7 @@ import Sidebar, { TAB_IDS, type TabId } from "./components/Sidebar";
 import { loadLastTab, saveLastTab } from "./lib/appSettings";
 import AlbumTab from "./components/AlbumTab";
 import MatchingTab from "./components/MatchingTab";
+import EditTab, { type EditRequest } from "./components/EditTab";
 import DetectionTab from "./components/DetectionTab";
 import StripMetadataTab from "./components/StripMetadataTab";
 import GenerateTab, { type IncomingSettings, type RemixJob } from "./components/GenerateTab";
@@ -37,6 +38,8 @@ export default function App() {
   // A prompt sent from Convert to Generate; the id makes each send new.
   const [sentToGenerate, setSentToGenerate] = useState<IncomingSettings | null>(null);
   const [remixJob, setRemixJob] = useState<RemixJob | null>(null);
+  // A folder (and maybe one image) sent from Album to Edit.
+  const [editRequest, setEditRequest] = useState<EditRequest | null>(null);
 
   // Reopen the tab that was showing last time; Generate on a first launch.
   useEffect(() => {
@@ -78,7 +81,16 @@ export default function App() {
           <GenerateTab active={activeTab === "generate"} incoming={sentToGenerate} remix={remixJob} />
         </TabPanel>
         <TabPanel active={activeTab === "album"}>
-          <AlbumTab active={activeTab === "album"} />
+          <AlbumTab
+            active={activeTab === "album"}
+            onOpenInEdit={(folder, file) => {
+              setEditRequest((prev) => ({ id: (prev?.id ?? 0) + 1, folder, file }));
+              setActiveTab("edit");
+            }}
+          />
+        </TabPanel>
+        <TabPanel active={activeTab === "edit"}>
+          <EditTab active={activeTab === "edit"} request={editRequest} />
         </TabPanel>
         <TabPanel active={activeTab === "matching"}>
           <MatchingTab />

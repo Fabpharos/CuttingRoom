@@ -128,3 +128,67 @@ a:hover {
 .context-menu-item:hover {
   background: var(--border);
 }
+
+/* Edit tab */
+.edit-btn {
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text);
+  font-family: "Space Grotesk", sans-serif;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.edit-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.edit-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.edit-btn-on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.edit-btn-primary {
+  border: none;
+  background: var(--accent);
+  color: var(--accent-contrast);
+}
+.edit-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 8px;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.edit-hint {
+  font-size: 11.5px;
+  color: var(--muted);
+  font-family: system-ui, sans-serif;
+  line-height: 1.45;
+  margin-top: 6px;
+}
+.edit-mono {
+  font-size: 11.5px;
+  color: var(--muted);
+  font-family: "IBM Plex Mono", monospace;
+  white-space: nowrap;
+}
+.edit-number {
+  width: 56px;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-page);
+  color: var(--text);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+}
