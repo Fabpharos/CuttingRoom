@@ -327,7 +327,7 @@ pub struct GenerateRequest {
     /// Variety+: guidance is skipped above this noise level. None leaves it off.
     #[serde(default)]
     pub skip_cfg_above_sigma: Option<f64>,
-    /// Precise Reference images (V4.5; 5 Anlas each per image).
+    /// Precise Reference images (V4.5 and V5; 5 Anlas each per image).
     #[serde(default)]
     pub precise_references: Vec<PreciseReference>,
 }
@@ -704,7 +704,7 @@ fn validate_batch(requests: &[GenerateRequest]) -> Result<Vec<serde_json::Value>
                 }
                 images.push(references[&pr.path].clone());
             }
-            add_references(&mut body, &r.precise_references, &images);
+            add_references(&mut body, &r.model, &r.precise_references, &images);
             if let Some(src) = &r.source_image {
                 let key = (src.path.clone(), r.width, r.height);
                 if !sources.contains_key(&key) {
@@ -1038,7 +1038,8 @@ fn model_from_source(source: &str) -> Option<&'static str> {
     let hash = source.rsplit(' ').next().unwrap_or("");
     if source.contains("NovelAI Diffusion V5") {
         return Some(match hash {
-            "657484A5" | "0ADF9AB7" => "nai-diffusion-5-full",
+            // 81E2A1BD: V5 Full images made with Precise Reference (the user's samples).
+            "657484A5" | "0ADF9AB7" | "81E2A1BD" => "nai-diffusion-5-full",
             "93F4BD30" | "70AB5786" => "nai-diffusion-5-full-medium",
             _ => "nai-diffusion-5-curated",
         });
@@ -2210,6 +2211,7 @@ mod tests {
     #[test]
     fn maps_model_hashes_like_novelais_site() {
         assert_eq!(model_from_source("NovelAI Diffusion V5 0ADF9AB7"), Some("nai-diffusion-5-full"));
+        assert_eq!(model_from_source("NovelAI Diffusion V5 81E2A1BD"), Some("nai-diffusion-5-full"));
         assert_eq!(model_from_source("NovelAI Diffusion V5 70AB5786"), Some("nai-diffusion-5-full-medium"));
         assert_eq!(model_from_source("NovelAI Diffusion V4.5 4BDE2A90"), Some("nai-diffusion-4-5-full"));
         assert_eq!(model_from_source("NovelAI Diffusion V4.5 5AB81C7C"), Some("nai-diffusion-4-5-curated"));

@@ -50,6 +50,10 @@ import {
   type ReferenceKind,
   PRECISE_REFERENCE_COST,
   MAX_PRECISE_REFERENCES,
+  REFERENCE_KIND_LABELS,
+  referenceKinds,
+  maxReferenceStrength,
+  takesPreferSameOutfit,
   type ImportPlan,
   type ImportedSettings,
   type VibeInfo,
@@ -428,6 +432,11 @@ const cardStyle: React.CSSProperties = {
   padding: "14px 16px",
 };
 
+/** A note when some references are set above what this model takes (V4.5 caps at 1). */
+function r5Note(max: number, refs: PreciseReference[]): string {
+  return refs.some((r) => r.strength > max) ? ` Strength above ${max} is sent as ${max} on this model.` : "";
+}
+
 const cardTitleStyle: React.CSSProperties = {
   fontSize: 12,
   fontWeight: 600,
@@ -634,7 +643,7 @@ export default function GenerateTab({
   const [previewImages, setPreviewImages] = useState<PreviewImage[] | null>(null);
   const [director, setDirector] = useState<{ path: string; tool: DirectorTool } | null>(null);
   // Precise Reference: a style reference here, plus each loaded card's own.
-  const [styleReference, setStyleReference] = useState<PreciseReference | null>(null);
+  const [references, setReferences] = useState<PreciseReference[]>([]);
   const [useCardReferences, setUseCardReferences] = useState(true);
   const [creep, setCreep] = useState<CreepSettings>(DEFAULT_CREEP);
   const [artists, setArtists] = useState<ArtistLibrary>(DEFAULT_ARTISTS);
@@ -699,7 +708,7 @@ export default function GenerateTab({
         setCharacterAdvance(s.characterAdvance);
         setWildcardFolder(s.wildcardFolder);
         setFolderModes(s.folderModes);
-        setStyleReference(s.styleReference);
+        setReferences(s.references);
         setUseCardReferences(s.useCardReferences);
         setCreep(s.creep);
         setVibeRotation(s.vibeRotation);
@@ -758,7 +767,7 @@ export default function GenerateTab({
         characterAdvance: characters.map((_, i) => advanceOf(i)),
         wildcardFolder,
         folderModes,
-        styleReference,
+        references,
         useCardReferences,
         creep,
         vibeRotation,
@@ -801,7 +810,7 @@ export default function GenerateTab({
     characterAdvance,
     wildcardFolder,
     folderModes,
-    styleReference,
+    references,
     useCardReferences,
     creep,
     vibeRotation,
@@ -1165,7 +1174,7 @@ export default function GenerateTab({
     noiseSchedule,
     varietyPlus,
     vibes: vibes.map(({ path, index, strength, informationExtracted, enabled }) => ({ path, index, strength, informationExtracted, enabled })),
-    styleReference,
+    references,
     seed: lastResult?.seed ?? null,
   });
 
@@ -1218,7 +1227,7 @@ export default function GenerateTab({
     setSampler(s.sampler);
     setNoiseSchedule(s.noiseSchedule);
     setVarietyPlus(s.varietyPlus);
-    setStyleReference(s.styleReference);
+    setReferences(s.references ?? []);
     if (s.vibes.length > 0) void loadVibeEntries(s.vibes).then(setVibes);
     else setVibes([]);
     setPendingSnapshot(null);
@@ -1250,7 +1259,7 @@ export default function GenerateTab({
       noiseSchedule: v.noiseSchedule ?? noiseSchedule,
       varietyPlus: v.varietyPlus ?? false,
       vibes: [],
-      styleReference: null,
+      references: [],
       seed: meta.seed !== null && meta.seed <= 0xffff_ffff ? meta.seed : null,
     };
   }
@@ -1420,15 +1429,24 @@ export default function GenerateTab({
     if (typeof dir === "string") setOutputDir(dir);
   }
 
-  // The references an image sends: the style reference, then each present
-  // carded character's own, up to the limit. None on models without it.
+  // The references an image sends: the form's, then each present carded
+  // character's own, up to the limit. None on models without it; types the
+  // model doesn't take (outfit on V4.5) are left out, and strength is capped
+  // at the model's highest (1 on V4.5).
   const referencesFor = (links: (CardLink | null)[]): PreciseReference[] => {
     if (!modelInfo.preciseReference) return [];
-    const refs: PreciseReference[] = styleReference ? [styleReference] : [];
+    const kinds = referenceKinds(model);
+    const max = maxReferenceStrength(model);
+    const fit = (r: PreciseReference): PreciseReference => ({
+      ...r,
+      strength: Math.min(r.strength, max),
+      preferSameOutfit: takesPreferSameOutfit(model, r.kind) && r.preferSameOutfit === true,
+    });
+    const refs: PreciseReference[] = references.filter((r) => kinds.includes(r.kind)).map(fit);
     if (useCardReferences) {
       for (const l of links) {
         const r = l?.reference;
-        if (r) refs.push({ path: r.path, kind: r.type, strength: r.strength, fidelity: r.fidelity });
+        if (r) refs.push(fit({ path: r.path, kind: r.type, strength: r.strength, fidelity: r.fidelity, preferSameOutfit: r.preferSameOutfit }));
       }
     }
     return refs.slice(0, MAX_PRECISE_REFERENCES);
@@ -3491,26 +3509,44 @@ export default function GenerateTab({
     </div>
   );
 
-  async function chooseStyleReference() {
+  async function addReference(kind: ReferenceKind) {
     const file = await open({
       directory: false,
       multiple: false,
       filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp"] }],
     });
     if (typeof file !== "string") return;
-    setStyleReference((r) => ({ kind: "style", strength: 1, fidelity: 1, ...r, path: file }));
+    setReferences((rs) => [...rs, { path: file, kind, strength: 1, fidelity: 1, preferSameOutfit: false }]);
   }
+  const updateReference = (i: number, patch: Partial<PreciseReference>) =>
+    setReferences((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
   const cardRefCount = cardLinks.filter((l) => l?.reference).length;
+  const modelKinds = referenceKinds(model);
+  const maxStrength = maxReferenceStrength(model);
+  const isV5References = maxStrength > 1;
+  const leftOutKinds = [...new Set(references.filter((r) => !modelKinds.includes(r.kind)).map((r) => REFERENCE_KIND_LABELS[r.kind]))];
+  const wantedReferences = references.filter((r) => modelKinds.includes(r.kind)).length + (useCardReferences ? cardRefCount : 0);
+  const chip = (on: boolean): React.CSSProperties => ({
+    padding: "3px 10px",
+    borderRadius: 999,
+    border: `1px solid ${on ? "var(--accent)" : "var(--border)"}`,
+    background: on ? "var(--accent)" : "transparent",
+    color: on ? "var(--accent-contrast)" : "var(--text)",
+    fontWeight: 600,
+    fontSize: 12,
+    cursor: "pointer",
+  });
   const referenceCard = (
     <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 12 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
         <span style={{ ...cardTitleStyle, marginBottom: 0, flex: 1 }}>
           PRECISE REFERENCE
           <HelpTip
             lines={[
-              { text: "A reference image for a character's look, a style, or both. Character cards can carry their own (set in Character Cards)." },
+              { text: "Reference images for a character's look, a style, or both, and on V5 an outfit too. Add as many as you need (up to " + MAX_PRECISE_REFERENCES + "). Character cards can carry their own (set in Character Cards)." },
               { text: `NovelAI charges ${PRECISE_REFERENCE_COST} Anlas per image for each reference; Generate shows the run's price and asks first.` },
-              { text: "V4.5 only for now; it can't be used with Vibe Transfer, so vibes are left out while references are on." },
+              { text: "V5: strength goes up to 5 (raise it first if a reference isn't picked up enough), there's no fidelity, and Character references can prefer the same outfit." },
+              { text: "V4.5: strength 0–1 plus fidelity. Can't be used with Vibe Transfer, so vibes are left out while references are on." },
             ]}
           />
           {formReferences.length > 0 && (
@@ -3520,76 +3556,114 @@ export default function GenerateTab({
             </span>
           )}
         </span>
-        <button onClick={() => void chooseStyleReference()} disabled={generating} style={{ ...secondaryButtonStyle, padding: "6px 14px" }}>
-          {styleReference ? "Change image…" : "Add reference…"}
-        </button>
+        {modelKinds
+          .filter((k) => k !== "character&style")
+          .map((k) => (
+            <button
+              key={k}
+              onClick={() => void addReference(k)}
+              disabled={generating}
+              style={{ ...secondaryButtonStyle, padding: "6px 12px" }}
+              title={`Add a${k === "outfit" ? "n" : ""} ${REFERENCE_KIND_LABELS[k].toLowerCase()} reference image`}
+            >
+              + {REFERENCE_KIND_LABELS[k]}
+            </button>
+          ))}
       </div>
-      {!modelInfo.preciseReference && (styleReference || cardRefCount > 0) && (
+      {!modelInfo.preciseReference && (references.length > 0 || cardRefCount > 0) && (
         <div style={{ ...warningBoxStyle, marginTop: 0 }}>
-          {modelFamily(model)} doesn't support Precise Reference yet, so no references are sent. Switch to V4.5 to use them.
+          {modelFamily(model)} doesn't support Precise Reference, so no references are sent. Switch to V5 or V4.5 to use them.
+        </div>
+      )}
+      {modelInfo.preciseReference && leftOutKinds.length > 0 && (
+        <div style={{ ...warningBoxStyle, marginTop: 0 }}>
+          {modelFamily(model)} doesn't take {leftOutKinds.join(" or ")} references, so they're left out. They work on V5.
+        </div>
+      )}
+      {modelInfo.preciseReference && wantedReferences > MAX_PRECISE_REFERENCES && (
+        <div style={{ ...warningBoxStyle, marginTop: 0 }}>
+          Only the first {MAX_PRECISE_REFERENCES} references are sent ({wantedReferences} set, counting the cards').
         </div>
       )}
       {modelInfo.preciseReference && formReferences.length > 0 && vibeRefs.length > 0 && (
         <div style={{ ...warningBoxStyle, marginTop: 0 }}>Vibe Transfer can't be used with Precise Reference, so the vibes are left out.</div>
       )}
-      {styleReference && (
-        <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
-          <img
-            src={convertFileSrc(styleReference.path)}
-            alt=""
-            style={{ width: 80, height: 80, objectFit: "contain", borderRadius: 6, background: "var(--bg-page)", flexShrink: 0 }}
-          />
-          <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 6, fontSize: 12.5 }}>
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-              {(["style", "character", "character&style"] as ReferenceKind[]).map((k) => (
-                <button
-                  key={k}
-                  disabled={generating}
-                  onClick={() => setStyleReference({ ...styleReference, kind: k })}
-                  style={{
-                    padding: "3px 10px",
-                    borderRadius: 999,
-                    border: `1px solid ${styleReference.kind === k ? "var(--accent)" : "var(--border)"}`,
-                    background: styleReference.kind === k ? "var(--accent)" : "transparent",
-                    color: styleReference.kind === k ? "var(--accent-contrast)" : "var(--text)",
-                    fontWeight: 600,
-                    fontSize: 12,
-                    cursor: "pointer",
+      {references.map((r, i) => {
+        const usable = modelKinds.includes(r.kind);
+        return (
+          <div key={i} style={{ display: "flex", gap: 14, alignItems: "flex-start", opacity: usable ? 1 : 0.55 }}>
+            <img
+              src={convertFileSrc(r.path)}
+              alt=""
+              title={r.path}
+              style={{ width: 80, height: 80, objectFit: "contain", borderRadius: 6, background: "var(--bg-page)", flexShrink: 0 }}
+            />
+            <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 6, fontSize: 12.5 }}>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                {(usable ? modelKinds : [...modelKinds, r.kind]).map((k) => (
+                  <button key={k} disabled={generating} onClick={() => updateReference(i, { kind: k })} style={chip(r.kind === k)}>
+                    {REFERENCE_KIND_LABELS[k]}
+                  </button>
+                ))}
+                <a
+                  href="#"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    if (!generating) setReferences((rs) => rs.filter((_, j) => j !== i));
                   }}
+                  style={{ fontWeight: 600, marginLeft: "auto" }}
                 >
-                  {k === "style" ? "Style" : k === "character" ? "Character" : "Character & Style"}
-                </button>
-              ))}
-              <a
-                href="#"
-                onClick={(e) => {
-                  e.preventDefault();
-                  if (!generating) setStyleReference(null);
-                }}
-                style={{ fontWeight: 600, marginLeft: "auto" }}
-              >
-                Remove
-              </a>
-            </div>
-            {(["strength", "fidelity"] as const).map((k) => (
-              <label key={k} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span style={{ minWidth: 92 }}>
-                  {k === "strength" ? "Strength" : "Fidelity"} {styleReference[k].toFixed(2)}
-                </span>
+                  Remove
+                </a>
+              </div>
+              <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ minWidth: 92 }}>Strength {Math.min(r.strength, maxStrength).toFixed(2)}</span>
                 <input
                   type="range"
                   min={0}
-                  max={1}
+                  max={maxStrength}
                   step={0.05}
-                  value={styleReference[k]}
+                  value={Math.min(r.strength, maxStrength)}
                   disabled={generating}
-                  onChange={(e) => setStyleReference({ ...styleReference, [k]: Number(e.target.value) })}
+                  onChange={(e) => updateReference(i, { strength: Number(e.target.value) })}
                   style={{ flex: 1, accentColor: "var(--accent)" }}
                 />
               </label>
-            ))}
-            <div style={{ fontSize: 11.5, color: "var(--muted)" }}>Sent padded to 1024×1536, 1536×1024 or 1472×1472, whichever fits its shape.</div>
+              {!isV5References && (
+                <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ minWidth: 92 }}>Fidelity {r.fidelity.toFixed(2)}</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={r.fidelity}
+                    disabled={generating}
+                    onChange={(e) => updateReference(i, { fidelity: Number(e.target.value) })}
+                    style={{ flex: 1, accentColor: "var(--accent)" }}
+                  />
+                </label>
+              )}
+              {takesPreferSameOutfit(model, r.kind) && (
+                <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <input
+                    type="checkbox"
+                    checked={r.preferSameOutfit === true}
+                    disabled={generating}
+                    onChange={(e) => updateReference(i, { preferSameOutfit: e.target.checked })}
+                    style={{ accentColor: "var(--accent)" }}
+                  />
+                  Prefer same outfit
+                </label>
+              )}
+            </div>
           </div>
+        );
+      })}
+      {references.length > 0 && (
+        <div style={{ fontSize: 11.5, color: "var(--muted)" }}>
+          Each image is sent padded to 1024×1536, 1536×1024 or 1472×1472, whichever fits its shape.
+          {r5Note(maxStrength, references)}
         </div>
       )}
       <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5 }}>

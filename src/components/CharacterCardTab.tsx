@@ -355,7 +355,7 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
       filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp"] }],
     });
     if (typeof picked !== "string" || !draft) return;
-    edit({ reference: { type: "character", strength: 1, fidelity: 1, ...draft.reference, path: picked } });
+    edit({ reference: { type: "character", strength: 1, fidelity: 1, preferSameOutfit: false, ...draft.reference, path: picked } });
   }
 
   async function runDelete(file: CardFile) {
@@ -767,13 +767,13 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
                     </div>
                     {(["strength", "fidelity"] as const).map((k) => (
                       <label key={k} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <span style={{ minWidth: 92 }}>
-                          {k === "strength" ? "Strength" : "Fidelity"} {draft.reference![k].toFixed(2)}
+                        <span style={{ minWidth: 128 }}>
+                          {k === "strength" ? "Strength" : "Fidelity (V4.5)"} {draft.reference![k].toFixed(2)}
                         </span>
                         <input
                           type="range"
                           min={0}
-                          max={1}
+                          max={k === "strength" ? 5 : 1}
                           step={0.05}
                           value={draft.reference![k]}
                           onChange={(e) => edit({ reference: { ...draft.reference!, [k]: Number(e.target.value) } })}
@@ -781,6 +781,18 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
                         />
                       </label>
                     ))}
+                    <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <input
+                        type="checkbox"
+                        checked={draft.reference.preferSameOutfit}
+                        onChange={(e) => edit({ reference: { ...draft.reference!, preferSameOutfit: e.target.checked } })}
+                        style={{ accentColor: "var(--accent)" }}
+                      />
+                      Prefer same outfit (V5, Character references)
+                    </label>
+                    <div style={{ fontSize: 11.5, color: "var(--muted)" }}>
+                      Strength above 1 is for V5; V4.5 uses at most 1. Fidelity is V4.5 only.
+                    </div>
                     <div style={{ display: "flex", gap: 12 }}>
                       <a
                         href="#"
