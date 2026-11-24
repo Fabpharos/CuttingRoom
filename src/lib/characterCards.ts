@@ -31,14 +31,16 @@ export const GENDERS: { key: Gender; label: string }[] = [
 /** A tag swap the card asks for: `$c1 swap: from$` becomes `to`. */
 export type CardSwap = { from: string; to: string };
 
-/** A Precise Reference image that comes with the card (V4.5 for now). */
+/** A Precise Reference image that comes with the card (V4.5 and V5). */
 export type CardReference = {
   path: string;
   type: "character" | "character&style";
-  /** 0–1. */
+  /** 0–5; V4.5 takes at most 1, so it's capped there. */
   strength: number;
-  /** 0–1. */
+  /** 0–1, V4.5 only. */
   fidelity: number;
+  /** V5: follow the character's outfit more closely. */
+  preferSameOutfit: boolean;
 };
 
 export type CharacterCard = {
@@ -86,8 +88,9 @@ function parseReference(raw: unknown): CardReference | null {
   return {
     path: r.path,
     type: r.type === "character&style" ? "character&style" : "character",
-    strength: unit(r.strength, 1),
+    strength: typeof r.strength === "number" && Number.isFinite(r.strength) ? Math.min(5, Math.max(0, r.strength)) : 1,
     fidelity: unit(r.fidelity, 1),
+    preferSameOutfit: r.preferSameOutfit === true,
   };
 }
 

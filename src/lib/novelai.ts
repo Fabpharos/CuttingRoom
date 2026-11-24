@@ -50,14 +50,14 @@ export type ModelInfo = {
   vibes: boolean;
   /** How many character prompts NovelAI takes: 22 on V5, 6 on V4/V4.5. */
   maxCharacters: number;
-  /** Supports Precise Reference (V4.5 only so far; V5 later). */
+  /** Supports Precise Reference (V4.5 and V5). */
   preciseReference: boolean;
 };
 
 // Mirrors the Rust-side allowlist; the backend validates these again.
 // When NovelAI adds a feature to a model, flip its flag here and in
 // novelai-core.
-const V5 = { usageLimited: true, vibes: false, maxCharacters: 22, preciseReference: false };
+const V5 = { usageLimited: true, vibes: false, maxCharacters: 22, preciseReference: true };
 const V45 = { usageLimited: false, vibes: true, maxCharacters: 6, preciseReference: true };
 const V4 = { usageLimited: false, vibes: true, maxCharacters: 6, preciseReference: false };
 export const MODELS: ModelInfo[] = [
@@ -273,15 +273,51 @@ export type GenerateRequest = {
   noiseSchedule?: string | null;
   /** Variety+: set to `varietyPlusSigma(...)`; null leaves it off. */
   skipCfgAboveSigma?: number | null;
-  /** Precise Reference images (V4.5; NovelAI charges 5 Anlas each per image). */
+  /** Precise Reference images (V4.5 and V5; NovelAI charges 5 Anlas each per image). */
   preciseReferences?: PreciseReference[];
 };
 
-export type ReferenceKind = "character" | "style" | "character&style";
-export type PreciseReference = { path: string; kind: ReferenceKind; strength: number; fidelity: number };
+export type ReferenceKind = "character" | "style" | "outfit" | "character&style";
+export type PreciseReference = {
+  path: string;
+  kind: ReferenceKind;
+  /** 0–1 on V4.5, 0–5 on V5. */
+  strength: number;
+  /** V4.5 only (V5 has no fidelity). */
+  fidelity: number;
+  /** V5: follow the reference character's outfit more closely (Character and Character & Style). */
+  preferSameOutfit?: boolean;
+};
 /** NovelAI's charge per reference per image. */
 export const PRECISE_REFERENCE_COST = 5;
-export const MAX_PRECISE_REFERENCES = 4;
+export const MAX_PRECISE_REFERENCES = 6;
+export const REFERENCE_KIND_LABELS: Record<ReferenceKind, string> = {
+  character: "Character",
+  style: "Style",
+  outfit: "Outfit",
+  "character&style": "Character & Style",
+};
+
+/** The reference types a model takes (outfit is V5 only). Mirrors Rust's `reference_kinds`. */
+export function referenceKinds(model: string): ReferenceKind[] {
+  return model.startsWith("nai-diffusion-5")
+    ? ["character", "style", "outfit", "character&style"]
+    : ["character", "style", "character&style"];
+}
+
+/** The highest reference strength a model takes: 1 on V4.5, 5 on V5. */
+export function maxReferenceStrength(model: string): number {
+  return model.startsWith("nai-diffusion-5") ? 5 : 1;
+}
+
+/**
+ * Whether "Prefer same outfit" applies: V5 Character references. (NovelAI's
+ * site shows it on Character & Style too, but records the same request either
+ * way, so it isn't offered there.)
+ */
+export function takesPreferSameOutfit(model: string, kind: ReferenceKind): boolean {
+  return model.startsWith("nai-diffusion-5") && kind === "character";
+}
 
 /** What a request should cost; `anlas` is null when it can't be priced. */
 export type CostEstimate = { free: boolean; anlas: number | null; reasons: string[] };

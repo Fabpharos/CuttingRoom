@@ -89,7 +89,8 @@ export type GenerateSettings = {
   /** Random or sequential, for files found in the wildcards folder (random when absent). */
   folderModes: Record<string, PromptFileMode>;
   /** A free-standing Precise Reference (a style, usually). */
-  styleReference: PreciseReference | null;
+  /** Precise References set in the form (character cards can bring their own). */
+  references: PreciseReference[];
   /** Send the reference images that come with loaded character cards. */
   useCardReferences: boolean;
   creep: CreepSettings;
@@ -129,7 +130,7 @@ export const DEFAULT_SETTINGS: GenerateSettings = {
   characterAdvance: [],
   wildcardFolder: { enabled: false, dir: null },
   folderModes: {},
-  styleReference: null,
+  references: [],
   useCardReferences: true,
   creep: DEFAULT_CREEP,
   vibeRotation: { mode: "fixed", k: 2, every: 1 },
@@ -138,6 +139,25 @@ export const DEFAULT_SETTINGS: GenerateSettings = {
 };
 
 const SETTINGS_KEY = "form";
+
+/** Saved Precise References, dropping any that aren't readable. */
+export function parseReferences(raw: unknown): PreciseReference[] {
+  if (!Array.isArray(raw)) return [];
+  const kinds: PreciseReference["kind"][] = ["character", "style", "outfit", "character&style"];
+  return raw.flatMap((x): PreciseReference[] => {
+    const r = x as Record<string, unknown> | null;
+    if (!r || typeof r !== "object" || typeof r.path !== "string" || !r.path) return [];
+    return [
+      {
+        path: r.path,
+        kind: kinds.includes(r.kind as PreciseReference["kind"]) ? (r.kind as PreciseReference["kind"]) : "style",
+        strength: clamp(r.strength, 0, 5, 1),
+        fidelity: clamp(r.fidelity, 0, 1, 1),
+        preferSameOutfit: r.preferSameOutfit === true,
+      },
+    ];
+  });
+}
 
 const clamp = (n: unknown, min: number, max: number, fallback: number) =>
   typeof n === "number" && Number.isFinite(n) ? Math.min(Math.max(n, min), max) : fallback;
@@ -197,7 +217,7 @@ function sanitizePromptFiles(raw: unknown): SavedPromptFile[] {
 // or one character), with optional text before and after its line. That
 // becomes a file whose token stands in that field between the same text, so
 // an existing setup keeps generating exactly what it did.
-type Legacy = { promptFilePath?: unknown; fileTarget?: unknown; fileMode?: unknown; fileBefore?: unknown; fileAfter?: unknown };
+type Legacy = { promptFilePath?: unknown; fileTarget?: unknown; fileMode?: unknown; fileBefore?: unknown; fileAfter?: unknown; styleReference?: unknown };
 
 function migrateLegacyFile(raw: Legacy, prompt: string, characters: string[]) {
   if (typeof raw.promptFilePath !== "string") return null;
@@ -273,12 +293,8 @@ function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy
       const w = (raw.wildcardFolder ?? {}) as Record<string, unknown>;
       return { enabled: w.enabled === true, dir: typeof w.dir === "string" ? w.dir : null };
     })(),
-    styleReference: (() => {
-      const r = raw.styleReference as Record<string, unknown> | null | undefined;
-      if (!r || typeof r !== "object" || typeof r.path !== "string") return null;
-      const kind = r.kind === "character" || r.kind === "character&style" ? r.kind : "style";
-      return { path: r.path, kind, strength: clamp(r.strength, 0, 1, 1), fidelity: clamp(r.fidelity, 0, 1, 1) };
-    })(),
+    // `styleReference` is the single reference saved before V5 allowed several.
+    references: parseReferences(raw.references ?? (raw.styleReference ? [raw.styleReference] : [])),
     useCardReferences: raw.useCardReferences !== false,
     creep: parseCreep(raw.creep, SAMPLERS.map((x) => x.id), NOISE_SCHEDULES.map((x) => x.id)),
     vibeRotation: (() => {

@@ -1,7 +1,7 @@
 // Saved prompts and the artist library, kept in the library (card) folder.
 
 import { libraryFileName, listLibrary, readLibrary, writeLibrary } from "./library";
-import type { GenerateSettings } from "./generateSettings";
+import { parseReferences, type GenerateSettings } from "./generateSettings";
 import type { Rng } from "./promptEngine";
 
 /** The parts of the Generate form a saved prompt keeps. */
@@ -24,7 +24,7 @@ export type PromptSnapshot = Pick<
   | "noiseSchedule"
   | "varietyPlus"
   | "vibes"
-  | "styleReference"
+  | "references"
 > & { seed: number | null };
 
 export type SavedPrompt = { version: 1; name: string; savedAt: string; snapshot: PromptSnapshot };
@@ -35,7 +35,11 @@ export async function listSavedPrompts(folder: string): Promise<string[]> {
 
 export async function readSavedPrompt(folder: string, name: string): Promise<SavedPrompt | null> {
   const raw = await readLibrary<SavedPrompt>(folder, "prompts", `${name}.json`);
-  return raw && typeof raw === "object" && raw.snapshot && typeof raw.snapshot.prompt === "string" ? raw : null;
+  if (!(raw && typeof raw === "object" && raw.snapshot && typeof raw.snapshot.prompt === "string")) return null;
+  // Saved before several references: one `styleReference`.
+  const old = (raw.snapshot as { styleReference?: unknown }).styleReference;
+  raw.snapshot.references = parseReferences(raw.snapshot.references ?? (old ? [old] : []));
+  return raw;
 }
 
 /** Saves under `name` (an existing one of that name is replaced; the caller asks first). */
