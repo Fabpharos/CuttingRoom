@@ -287,6 +287,8 @@ export type PreciseReference = {
   fidelity: number;
   /** V5: follow the reference character's outfit more closely (Character and Character & Style). */
   preferSameOutfit?: boolean;
+  /** Form only: false keeps it in the list without sending it. Never sent to Rust. */
+  enabled?: boolean;
 };
 /** NovelAI's charge per reference per image. */
 export const PRECISE_REFERENCE_COST = 5;

@@ -5,13 +5,13 @@ import { maxReferenceStrength, referenceKinds, takesPreferSameOutfit } from "./n
 
 test("saved references are read, clamped and given defaults", () => {
   const refs = parseReferences([
-    { path: "a.png", kind: "outfit", strength: 9, fidelity: 0.4, preferSameOutfit: true },
+    { path: "a.png", kind: "outfit", strength: 9, fidelity: 0.4, preferSameOutfit: true, enabled: false },
     { path: "b.png", kind: "nonsense" },
     { kind: "style" },
   ]);
   assert.deepEqual(refs, [
-    { path: "a.png", kind: "outfit", strength: 5, fidelity: 0.4, preferSameOutfit: true },
-    { path: "b.png", kind: "style", strength: 1, fidelity: 1, preferSameOutfit: false },
+    { path: "a.png", kind: "outfit", strength: 5, fidelity: 0.4, preferSameOutfit: true, enabled: false },
+    { path: "b.png", kind: "style", strength: 1, fidelity: 1, preferSameOutfit: false, enabled: true },
   ]);
   assert.deepEqual(parseReferences(null), []);
 });

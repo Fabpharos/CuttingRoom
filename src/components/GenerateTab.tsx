@@ -309,9 +309,130 @@ function TokenPreview({ text }: { text: string }) {
   );
 }
 
-// A small board for placing one character, shaped like the image. Other
+// The board characters are placed on, shaped like the image. Other
 // characters show faintly for reference. On V4 and V4.5 it shows NovelAI's
-// 5x5 grid and places on it.
+// 5x5 grid and places on it. `long` is the length of its longer side.
+function PositionBoard({
+  index,
+  positions,
+  model,
+  aspect,
+  long,
+  disabled,
+  highlight = null,
+  onPlace,
+  onPick,
+}: {
+  index: number;
+  positions: CharacterPosition[];
+  model: string;
+  aspect: number;
+  long: number;
+  disabled: boolean;
+  highlight?: number | null;
+  /** Click or drag on the board; null when the board only opens the zoomed view. */
+  onPlace: ((p: CharacterPosition) => void) | null;
+  /** The zoomed board: clicking another character's dot picks it. */
+  onPick?: (j: number) => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const free = freeCharacterPositions(model);
+  const width = aspect >= 1 ? long : Math.round(long * aspect);
+  const height = aspect >= 1 ? Math.round(long / aspect) : long;
+  const big = long > 200;
+  function place(e: React.PointerEvent) {
+    const r = ref.current?.getBoundingClientRect();
+    if (!r || disabled || !onPlace) return;
+    const clamp = (v: number) => Math.min(1, Math.max(0, v));
+    onPlace(positionForModel(model, { x: clamp((e.clientX - r.left) / r.width), y: clamp((e.clientY - r.top) / r.height) }));
+  }
+  const shown = (p: CharacterPosition) => positionForModel(model, p);
+  // Dot sizes: the character being placed, then the others.
+  const small = positions.length > 8;
+  const mineSize = big ? 30 : 16;
+  const otherSize = big ? (small ? 20 : 24) : small ? 8 : 11;
+  const lines = "linear-gradient(var(--border) 1px, transparent 1px), linear-gradient(90deg, var(--border) 1px, transparent 1px)";
+  return (
+    <div
+      ref={ref}
+      role="slider"
+      aria-label={`Position of character ${index + 1}`}
+      title={onPlace ? "Click or drag to place this character" : "Click to zoom in and place this character"}
+      onPointerDown={(e) => {
+        if (!onPlace) return;
+        e.currentTarget.setPointerCapture(e.pointerId);
+        place(e);
+      }}
+      onPointerMove={(e) => {
+        if (e.buttons === 1) place(e);
+      }}
+      style={{
+        position: "relative",
+        width,
+        height,
+        borderRadius: big ? 10 : 6,
+        border: "1px solid var(--border)",
+        background: "var(--bg-page)",
+        cursor: disabled ? "default" : onPlace ? "crosshair" : "zoom-in",
+        opacity: disabled ? 0.6 : 1,
+        touchAction: "none",
+        flexShrink: 0,
+        // V4/V4.5: NovelAI's 5x5 grid. V5 places anywhere; the zoomed board
+        // gets a light 10% grid to aim by.
+        backgroundImage: free && !big ? "none" : lines,
+        backgroundSize: free ? `${width / 10}px ${height / 10}px` : `${width / 5}px ${height / 5}px`,
+      }}
+    >
+      {positions.map((p, j) => {
+        const at = shown(p);
+        const mine = j === index;
+        const lit = !mine && j === highlight;
+        const d = mine ? mineSize : otherSize;
+        const pickable = big && !mine && !!onPick && !disabled;
+        return (
+          <span
+            key={j}
+            onPointerDown={
+              pickable
+                ? (e) => {
+                    e.stopPropagation();
+                    onPick!(j);
+                  }
+                : undefined
+            }
+            title={pickable ? `Place character ${j + 1}` : undefined}
+            style={{
+              position: "absolute",
+              left: `${at.x * 100}%`,
+              top: `${at.y * 100}%`,
+              transform: "translate(-50%, -50%)",
+              width: d,
+              height: d,
+              borderRadius: "50%",
+              background: mine ? "var(--accent)" : "var(--muted)",
+              color: mine ? "var(--accent-contrast)" : "var(--bg-card)",
+              opacity: mine || lit ? 1 : big ? 0.7 : 0.45,
+              outline: lit ? "2px solid var(--accent)" : "none",
+              fontSize: big ? (mine ? 14 : 11) : mine ? 10 : small ? 0 : 7,
+              fontWeight: 700,
+              lineHeight: `${d}px`,
+              textAlign: "center",
+              pointerEvents: pickable ? "auto" : "none",
+              cursor: pickable ? "pointer" : undefined,
+              zIndex: mine ? 1 : 0,
+              boxShadow: big && mine ? "0 1px 6px rgba(0,0,0,.35)" : "none",
+            }}
+          >
+            {j + 1}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+// A small board for one character in its row; clicking it opens a zoomed
+// board where any character can be placed precisely.
 function PositionPicker({
   index,
   positions,
@@ -328,87 +449,135 @@ function PositionPicker({
   disabled: boolean;
   /** A character whose row is hovered, shown outlined. */
   highlight?: number | null;
-  onChange: (p: CharacterPosition) => void;
+  /** Moves character `j` (the zoomed board can place any of them). */
+  onChange: (p: CharacterPosition, j: number) => void;
 }) {
-  const ref = useRef<HTMLDivElement>(null);
+  const [zoomed, setZoomed] = useState<number | null>(null);
   const free = freeCharacterPositions(model);
-  const width = aspect >= 1 ? 84 : Math.round(84 * aspect);
-  const height = aspect >= 1 ? Math.round(84 / aspect) : 84;
-  function place(e: React.PointerEvent) {
-    const r = ref.current?.getBoundingClientRect();
-    if (!r || disabled) return;
-    const clamp = (v: number) => Math.min(1, Math.max(0, v));
-    onChange(positionForModel(model, { x: clamp((e.clientX - r.left) / r.width), y: clamp((e.clientY - r.top) / r.height) }));
-  }
-  const shown = (p: CharacterPosition) => positionForModel(model, p);
-  const own = shown(positions[index] ?? CENTER);
+  const label = (p: CharacterPosition) => {
+    const at = positionForModel(model, p);
+    return free ? `${Math.round(at.x * 100)}%, ${Math.round(at.y * 100)}%` : gridLabel(at);
+  };
+  useEffect(() => {
+    if (zoomed === null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" || e.key === "Enter") setZoomed(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [zoomed]);
+  // As large as fits: up to 640 pixels on the long side, inside the window.
+  const long = Math.max(240, Math.min(640, Math.round(window.innerHeight * 0.62), Math.round(window.innerWidth * 0.8)));
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3, flexShrink: 0 }}>
-      <div
-        ref={ref}
-        role="slider"
-        aria-label={`Position of character ${index + 1}`}
-        title="Click or drag to place this character"
-        onPointerDown={(e) => {
-          e.currentTarget.setPointerCapture(e.pointerId);
-          place(e);
-        }}
-        onPointerMove={(e) => {
-          if (e.buttons === 1) place(e);
-        }}
-        style={{
-          position: "relative",
-          width,
-          height,
-          borderRadius: 6,
-          border: "1px solid var(--border)",
-          background: "var(--bg-page)",
-          cursor: disabled ? "default" : "crosshair",
-          opacity: disabled ? 0.6 : 1,
-          touchAction: "none",
-          backgroundImage: free
-            ? "none"
-            : "linear-gradient(var(--border) 1px, transparent 1px), linear-gradient(90deg, var(--border) 1px, transparent 1px)",
-          backgroundSize: free ? undefined : `${width / 5}px ${height / 5}px`,
-        }}
-      >
-        {positions.map((p, j) => {
-          const at = shown(p);
-          const mine = j === index;
-          const lit = !mine && j === highlight;
-          // With many characters, the others shrink so the board stays readable.
-          const small = positions.length > 8;
-          return (
-            <span
-              key={j}
-              style={{
-                position: "absolute",
-                left: `${at.x * 100}%`,
-                top: `${at.y * 100}%`,
-                transform: "translate(-50%, -50%)",
-                width: mine ? 16 : small ? 8 : 11,
-                height: mine ? 16 : small ? 8 : 11,
-                borderRadius: "50%",
-                background: mine ? "var(--accent)" : "var(--muted)",
-                color: mine ? "var(--accent-contrast)" : "var(--bg-card)",
-                opacity: mine || lit ? 1 : 0.45,
-                outline: lit ? "2px solid var(--accent)" : "none",
-                fontSize: mine ? 10 : small ? 0 : 7,
-                fontWeight: 700,
-                lineHeight: mine ? "16px" : small ? "8px" : "11px",
-                textAlign: "center",
-                pointerEvents: "none",
-                zIndex: mine ? 1 : 0,
-              }}
-            >
-              {j + 1}
-            </span>
-          );
-        })}
+      <div onClick={() => !disabled && setZoomed(index)}>
+        <PositionBoard
+          index={index}
+          positions={positions}
+          model={model}
+          aspect={aspect}
+          long={84}
+          disabled={disabled}
+          highlight={highlight}
+          onPlace={null}
+        />
       </div>
       <span style={{ fontSize: 10.5, fontFamily: "'IBM Plex Mono', monospace", color: "var(--muted)" }}>
-        {free ? `${Math.round(own.x * 100)}%, ${Math.round(own.y * 100)}%` : gridLabel(own)}
+        {label(positions[index] ?? CENTER)}
       </span>
+      {zoomed !== null && (
+        <div
+          onClick={() => setZoomed(null)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,.5)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 300,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: "var(--bg-card)",
+              border: "1px solid var(--border)",
+              borderRadius: 12,
+              padding: "16px 18px",
+              boxShadow: "0 12px 32px rgba(0,0,0,.3)",
+              display: "flex",
+              flexDirection: "column",
+              gap: 12,
+              maxWidth: "94vw",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+              <span style={{ fontSize: 15, fontWeight: 700, flex: 1 }}>Place character {zoomed + 1}</span>
+              <span style={{ fontSize: 12, fontFamily: "'IBM Plex Mono', monospace", color: "var(--muted)" }}>
+                {label(positions[zoomed] ?? CENTER)}
+              </span>
+            </div>
+            {positions.length > 1 && (
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap", maxWidth: long }}>
+                {positions.map((_, j) => (
+                  <button
+                    key={j}
+                    onClick={() => setZoomed(j)}
+                    title={`Place character ${j + 1}`}
+                    style={{
+                      minWidth: 30,
+                      padding: "3px 8px",
+                      borderRadius: 999,
+                      border: `1px solid ${j === zoomed ? "var(--accent)" : "var(--border)"}`,
+                      background: j === zoomed ? "var(--accent)" : "transparent",
+                      color: j === zoomed ? "var(--accent-contrast)" : "var(--text)",
+                      fontWeight: 600,
+                      fontSize: 12,
+                      cursor: "pointer",
+                    }}
+                  >
+                    {j + 1}
+                  </button>
+                ))}
+              </div>
+            )}
+            <div style={{ display: "flex", justifyContent: "center" }}>
+              <PositionBoard
+                index={zoomed}
+                positions={positions}
+                model={model}
+                aspect={aspect}
+                long={long}
+                disabled={disabled}
+                onPlace={(p) => onChange(p, zoomed)}
+                onPick={setZoomed}
+              />
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, maxWidth: Math.max(long, 320) }}>
+              <span style={{ fontSize: 12, color: "var(--muted)", flex: 1 }}>
+                Click or drag to place. Click another dot, or a number above, to move that character.
+                {free ? "" : " V4 and V4.5 snap to NovelAI's 5×5 grid."}
+              </span>
+              <button
+                onClick={() => setZoomed(null)}
+                style={{
+                  padding: "7px 16px",
+                  border: "none",
+                  borderRadius: 999,
+                  background: "var(--accent)",
+                  color: "var(--accent-contrast)",
+                  fontWeight: 600,
+                  fontSize: 13,
+                  cursor: "pointer",
+                }}
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -431,6 +600,34 @@ const cardStyle: React.CSSProperties = {
   borderRadius: 10,
   padding: "14px 16px",
 };
+
+/** Which loaded card a reference switch belongs to: its file, or its name. */
+const cardRefKey = (l: CardLink) => l.path ?? l.name;
+
+/** A labelled on/off box for one reference or vibe: off keeps it in the list but doesn't send it. */
+function UseSwitch({
+  on,
+  onChange,
+  disabled,
+  what,
+  title,
+}: {
+  on: boolean;
+  onChange: (on: boolean) => void;
+  disabled?: boolean;
+  what: string;
+  title?: string;
+}) {
+  return (
+    <label
+      title={title ?? (on ? `Sent with each image. Untick to keep this ${what} here without sending it.` : `Not sent. Tick to use this ${what} again.`)}
+      style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, fontSize: 11, color: "var(--muted)", cursor: disabled ? "default" : "pointer", flexShrink: 0, userSelect: "none" }}
+    >
+      <input type="checkbox" checked={on} disabled={disabled} onChange={(e) => onChange(e.target.checked)} style={{ accentColor: "var(--accent)", margin: 0 }} />
+      Use
+    </label>
+  );
+}
 
 /** A note when some references are set above what this model takes (V4.5 caps at 1). */
 function r5Note(max: number, refs: PreciseReference[]): string {
@@ -645,6 +842,7 @@ export default function GenerateTab({
   // Precise Reference: a style reference here, plus each loaded card's own.
   const [references, setReferences] = useState<PreciseReference[]>([]);
   const [useCardReferences, setUseCardReferences] = useState(true);
+  const [cardReferencesOff, setCardReferencesOff] = useState<string[]>([]);
   const [creep, setCreep] = useState<CreepSettings>(DEFAULT_CREEP);
   const [artists, setArtists] = useState<ArtistLibrary>(DEFAULT_ARTISTS);
   const artistsLoadedRef = useRef(false);
@@ -710,6 +908,7 @@ export default function GenerateTab({
         setFolderModes(s.folderModes);
         setReferences(s.references);
         setUseCardReferences(s.useCardReferences);
+        setCardReferencesOff(s.cardReferencesOff);
         setCreep(s.creep);
         setVibeRotation(s.vibeRotation);
         setVibeLibraryDir(s.vibeLibraryDir);
@@ -769,6 +968,7 @@ export default function GenerateTab({
         folderModes,
         references,
         useCardReferences,
+        cardReferencesOff,
         creep,
         vibeRotation,
         vibeLibraryDir,
@@ -812,6 +1012,7 @@ export default function GenerateTab({
     folderModes,
     references,
     useCardReferences,
+    cardReferencesOff,
     creep,
     vibeRotation,
     vibeLibraryDir,
@@ -1437,16 +1638,17 @@ export default function GenerateTab({
     if (!modelInfo.preciseReference) return [];
     const kinds = referenceKinds(model);
     const max = maxReferenceStrength(model);
-    const fit = (r: PreciseReference): PreciseReference => ({
+    // `enabled` is the form's own switch and isn't sent.
+    const fit = ({ enabled: _on, ...r }: PreciseReference): PreciseReference => ({
       ...r,
       strength: Math.min(r.strength, max),
       preferSameOutfit: takesPreferSameOutfit(model, r.kind) && r.preferSameOutfit === true,
     });
-    const refs: PreciseReference[] = references.filter((r) => kinds.includes(r.kind)).map(fit);
+    const refs: PreciseReference[] = references.filter((r) => r.enabled !== false && kinds.includes(r.kind)).map(fit);
     if (useCardReferences) {
       for (const l of links) {
         const r = l?.reference;
-        if (r) refs.push(fit({ path: r.path, kind: r.type, strength: r.strength, fidelity: r.fidelity, preferSameOutfit: r.preferSameOutfit }));
+        if (r && !cardReferencesOff.includes(cardRefKey(l))) refs.push(fit({ path: r.path, kind: r.type, strength: r.strength, fidelity: r.fidelity, preferSameOutfit: r.preferSameOutfit }));
       }
     }
     return refs.slice(0, MAX_PRECISE_REFERENCES);
@@ -2862,7 +3064,7 @@ export default function GenerateTab({
               aspect={size.width / size.height}
               disabled={generating}
               highlight={hoveredChar}
-              onChange={(p) => setCharacterPositions((prev) => prev.map((q, j) => (j === i ? p : q)))}
+              onChange={(p, k) => setCharacterPositions((prev) => prev.map((q, j) => (j === k ? p : q)))}
             />
           )}
         </div>
@@ -3516,16 +3718,22 @@ export default function GenerateTab({
       filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp"] }],
     });
     if (typeof file !== "string") return;
-    setReferences((rs) => [...rs, { path: file, kind, strength: 1, fidelity: 1, preferSameOutfit: false }]);
+    setReferences((rs) => [...rs, { path: file, kind, strength: 1, fidelity: 1, preferSameOutfit: false, enabled: true }]);
   }
   const updateReference = (i: number, patch: Partial<PreciseReference>) =>
     setReferences((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
   const cardRefCount = cardLinks.filter((l) => l?.reference).length;
+  // The loaded cards with a reference, once each.
+  const cardRefLinks = cardLinks.filter((l, i): l is CardLink => !!l?.reference && cardLinks.findIndex((m) => m && cardRefKey(m) === cardRefKey(l)) === i);
+  const cardRefsOn = cardRefLinks.filter((l) => !cardReferencesOff.includes(cardRefKey(l))).length;
   const modelKinds = referenceKinds(model);
   const maxStrength = maxReferenceStrength(model);
   const isV5References = maxStrength > 1;
-  const leftOutKinds = [...new Set(references.filter((r) => !modelKinds.includes(r.kind)).map((r) => REFERENCE_KIND_LABELS[r.kind]))];
-  const wantedReferences = references.filter((r) => modelKinds.includes(r.kind)).length + (useCardReferences ? cardRefCount : 0);
+  const leftOutKinds = [
+    ...new Set(references.filter((r) => r.enabled !== false && !modelKinds.includes(r.kind)).map((r) => REFERENCE_KIND_LABELS[r.kind])),
+  ];
+  const wantedReferences =
+    references.filter((r) => r.enabled !== false && modelKinds.includes(r.kind)).length + (useCardReferences ? cardRefsOn : 0);
   const chip = (on: boolean): React.CSSProperties => ({
     padding: "3px 10px",
     borderRadius: 999,
@@ -3590,8 +3798,11 @@ export default function GenerateTab({
       )}
       {references.map((r, i) => {
         const usable = modelKinds.includes(r.kind);
+        const on = r.enabled !== false;
         return (
-          <div key={i} style={{ display: "flex", gap: 14, alignItems: "flex-start", opacity: usable ? 1 : 0.55 }}>
+          <div key={i} style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+            <UseSwitch on={on} disabled={generating} onChange={(v) => updateReference(i, { enabled: v })} what="reference" />
+            <div style={{ display: "flex", gap: 14, alignItems: "flex-start", flex: 1, minWidth: 0, opacity: on && usable ? 1 : 0.5 }}>
             <img
               src={convertFileSrc(r.path)}
               alt=""
@@ -3657,6 +3868,7 @@ export default function GenerateTab({
                 </label>
               )}
             </div>
+            </div>
           </div>
         );
       })}
@@ -3679,6 +3891,34 @@ export default function GenerateTab({
           ({cardRefCount} loaded card{cardRefCount === 1 ? " has" : "s have"} one)
         </span>
       </label>
+      {useCardReferences && cardRefLinks.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, paddingLeft: 22 }}>
+          {cardRefLinks.map((l) => {
+            const key = cardRefKey(l);
+            const on = !cardReferencesOff.includes(key);
+            const r = l.reference!;
+            return (
+              <div key={key} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12.5 }}>
+                <UseSwitch
+                  on={on}
+                  disabled={generating}
+                  what={`${l.name}'s reference`}
+                  onChange={(v) => setCardReferencesOff((off) => (v ? off.filter((k) => k !== key) : [...off, key]))}
+                />
+                <img
+                  src={convertFileSrc(r.path)}
+                  alt=""
+                  title={r.path}
+                  style={{ width: 36, height: 36, objectFit: "contain", borderRadius: 4, background: "var(--bg-page)", flexShrink: 0, opacity: on ? 1 : 0.5 }}
+                />
+                <span style={{ opacity: on ? 1 : 0.5 }}>
+                  <b>{l.name}</b> · {REFERENCE_KIND_LABELS[r.type]} · strength {Math.min(r.strength, maxStrength).toFixed(2)}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 
@@ -3863,17 +4103,16 @@ export default function GenerateTab({
               : `Not encoded for ${modelInfo.label}, so it isn't used. Encoding it would cost Anlas.`;
         return (
           <div key={v.key} style={{ display: "flex", gap: 10, alignItems: "center" }}>
-            <input
-              type="checkbox"
-              checked={v.enabled}
-              onChange={(e) => updateVibe(v.key, { enabled: e.target.checked })}
+            <UseSwitch
+              on={v.enabled}
+              onChange={(on) => updateVibe(v.key, { enabled: on })}
               disabled={generating || (!rotating && !v.enabled && vibesOn >= MAX_VIBES)}
+              what="vibe"
               title={
                 !rotating && !v.enabled && vibesOn >= MAX_VIBES
                   ? `Up to ${MAX_VIBES} vibes at once; more would cost Anlas (or rotate them, below)`
-                  : "Use this vibe"
+                  : undefined
               }
-              style={{ accentColor: "var(--accent)" }}
             />
             {v.info?.thumbnail ? (
               <img
