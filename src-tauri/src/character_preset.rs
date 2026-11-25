@@ -1,5 +1,5 @@
 //! Character cards: NovelAI character prompt presets, each saved as a small
-//! PNG (a thumbnail of the image it was made from) in a folder the user
+//! PNG (the image it was made from, at full size) in a folder the user
 //! picks. The card itself is JSON, base64-encoded, in a `cutting-room-character`
 //! tEXt chunk. The frontend owns the card's fields; Rust only checks that it's
 //! a JSON object and stores it.
@@ -18,8 +18,6 @@ use std::path::{Path, PathBuf};
 
 pub const CARD_KEY: &str = "cutting-room-character";
 const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-/// The longest side of a card's thumbnail.
-const THUMB_SIDE: u32 = 512;
 
 /// Folders in the card folder that belong to the library, not to cards.
 const LIBRARY_DIRS: [&str; 4] = ["prompts", "plans", "artists", "vibes"];
@@ -205,9 +203,10 @@ fn read_card(png: &[u8]) -> Option<Value> {
 
 /// Saves `card` as `<name>.png` in `folder` and returns its path.
 ///
-/// A new card takes its picture from `image`, shrunk to a thumbnail and
-/// re-encoded (so none of the image's metadata comes along). An edited card
-/// passes its current file as `existing`: its picture is kept, and the file
+/// A new card takes its picture from `image` at full size, re-encoded as a
+/// PNG (so none of the image's metadata comes along), so the card itself can
+/// be a Precise Reference. An edited card passes its current file as
+/// `existing`: its picture is kept unless `image` replaces it, and the file
 /// is renamed when the name changed. Never overwrites a different card.
 pub fn save(
     folder: &str,
@@ -233,7 +232,7 @@ pub fn save(
     }
 
     let png = match (image, existing.as_deref()) {
-        (Some(image), _) => thumbnail_png(image)?,
+        (Some(image), _) => picture_png(image)?,
         (None, Some(existing)) => std::fs::read(existing).map_err(|e| format!("couldn't read the card: {e}"))?,
         (None, None) => return Err("A new card needs an image.".into()),
     };
@@ -283,22 +282,22 @@ fn check_name(name: &str) -> Result<&str, String> {
     Ok(name)
 }
 
-fn thumbnail_png(path: &str) -> Result<Vec<u8>, String> {
+/// The image at full size as a plain PNG (no metadata).
+fn picture_png(path: &str) -> Result<Vec<u8>, String> {
     let img = image::ImageReader::open(path)
         .map_err(|e| format!("couldn't open the image: {e}"))?
         .with_guessed_format()
         .map_err(|e| format!("couldn't open the image: {e}"))?
         .decode()
         .map_err(|e| format!("couldn't read the image: {e}"))?;
-    let img = if img.width() > THUMB_SIDE || img.height() > THUMB_SIDE {
-        img.thumbnail(THUMB_SIDE, THUMB_SIDE)
+    let img = if img.color().has_alpha() {
+        image::DynamicImage::ImageRgba8(img.to_rgba8())
     } else {
-        img
+        image::DynamicImage::ImageRgb8(img.to_rgb8())
     };
-    let img = image::DynamicImage::ImageRgba8(img.to_rgba8());
     let mut out = Vec::new();
     img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
-        .map_err(|e| format!("couldn't make the thumbnail: {e}"))?;
+        .map_err(|e| format!("couldn't save the picture: {e}"))?;
     Ok(out)
 }
 
@@ -383,8 +382,9 @@ mod tests {
 
         let path = save(folder, "Sparkle", card.clone(), Some(&image), None).unwrap();
         assert!(path.ends_with("Sparkle.png"));
-        let thumb = image::open(&path).unwrap();
-        assert_eq!((thumb.width(), thumb.height()), (512, 350));
+        // Full size, so the card can be a Precise Reference itself.
+        let picture = image::open(&path).unwrap();
+        assert_eq!((picture.width(), picture.height()), (1216, 832));
 
         // Only cards are listed; the source image has no card.
         let cards = list(folder).unwrap();
@@ -400,7 +400,15 @@ mod tests {
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].path, renamed);
         assert_eq!(cards[0].card, edited);
-        assert_eq!(image::open(&renamed).unwrap().width(), 512);
+        assert_eq!(image::open(&renamed).unwrap().width(), 1216);
+
+        // A new picture replaces the old one and keeps the card.
+        let bigger = dir.join("bigger.png");
+        image::RgbImage::from_pixel(832, 1216, image::Rgb([1, 2, 3])).save(&bigger).unwrap();
+        let replaced = save(folder, "Sparkle 2", edited.clone(), Some(bigger.to_str().unwrap()), Some(&renamed)).unwrap();
+        assert_eq!(replaced, renamed);
+        assert_eq!(image::open(&replaced).unwrap().width(), 832);
+        assert_eq!(list(folder).unwrap()[0].card, edited);
 
         // Renaming onto another card is refused.
         save(folder, "Other", card.clone(), Some(&image), None).unwrap();

@@ -6,8 +6,8 @@
 
 import { useState } from "react";
 import { DndContext, DragOverlay, PointerSensor, useDraggable, useDroppable, useSensor, useSensors, type DragEndEvent } from "@dnd-kit/core";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import RefMarker from "./RefMarker";
+import CardPicture from "./CardPicture";
 import type { CardFile } from "../lib/characterCards";
 
 const parentOf = (rel: string) => rel.split("/").slice(0, -1).join("/");
@@ -121,12 +121,7 @@ function CardRow({
 function CardThumb({ card, version }: { card: CardFile; version: number }) {
   return (
     <span style={{ position: "relative", width: 40, height: 40, flexShrink: 0 }}>
-      <img
-        src={`${convertFileSrc(card.path)}?v=${version}`}
-        alt=""
-        draggable={false}
-        style={{ width: 40, height: 40, objectFit: "cover", borderRadius: 6, display: "block" }}
-      />
+      <CardPicture path={card.path} version={version} size={40} />
       <RefMarker reference={card.card.reference} />
     </span>
   );

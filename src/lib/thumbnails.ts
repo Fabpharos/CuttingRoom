@@ -44,6 +44,11 @@ export function getThumbnailUrl(path: string): Promise<string> {
   return entry;
 }
 
+/** Drops `path`'s cached thumbnail, so the next request reads the file again. */
+export function forgetThumbnail(path: string): void {
+  cache.delete(path);
+}
+
 // A folder/photo rename doesn't change the image bytes, just its path — move
 // the cached thumbnail rather than re-reading and re-decoding the file.
 //

@@ -43,7 +43,10 @@ export const CARD_REFERENCE_TYPES: { key: CardReferenceType; label: string; shor
 
 /** A Precise Reference image that comes with the card (V4.5 and V5; Outfit is V5 only). */
 export type CardReference = {
+  /** The image; for `self`, the card's own file (filled in when cards are listed). */
   path: string;
+  /** The card's own picture is the reference, wherever the card is moved or renamed. */
+  self?: boolean;
   type: CardReferenceType;
   /** 0–5; V4.5 takes at most 1, so it's capped there. */
   strength: number;
@@ -95,9 +98,11 @@ const unit = (v: unknown, fallback: number) =>
 function parseReference(raw: unknown): CardReference | null {
   if (typeof raw !== "object" || raw === null) return null;
   const r = raw as Record<string, unknown>;
-  if (typeof r.path !== "string" || !r.path) return null;
+  const self = r.self === true;
+  if (typeof r.path !== "string" || (!r.path && !self)) return null;
   return {
     path: r.path,
+    ...(self ? { self } : {}),
     type: CARD_REFERENCE_TYPES.some((t) => t.key === r.type) ? (r.type as CardReferenceType) : "character",
     strength: typeof r.strength === "number" && Number.isFinite(r.strength) ? Math.min(5, Math.max(0, r.strength)) : 1,
     fidelity: unit(r.fidelity, 1),
@@ -142,6 +147,8 @@ export async function listCards(folder: string): Promise<CardFile[]> {
   return raw
     .flatMap((f) => {
       const card = parseCard(f.card);
+      // A card that is its own reference points at its file as it is now.
+      if (card?.reference?.self) card.reference = { ...card.reference, path: f.path };
       return card ? [{ path: f.path, card, folder: typeof f.folder === "string" ? f.folder : "" }] : [];
     })
     .sort((a, b) => a.card.name.localeCompare(b.card.name, undefined, { numeric: true, sensitivity: "base" }));
@@ -155,14 +162,17 @@ export async function listCards(folder: string): Promise<CardFile[]> {
 export function saveCard(
   folder: string,
   card: CharacterCard,
-  source: { image: string } | { existing: string },
+  /** `image` gives a new card its picture, or replaces an existing card's. */
+  source: { image?: string | null; existing?: string | null },
 ): Promise<string> {
+  // A card that is its own reference doesn't store a path that goes stale.
+  const reference = card.reference?.self ? { ...card.reference, path: "" } : card.reference;
   return invoke("save_character_card", {
     folder,
     name: card.name,
-    card,
-    image: "image" in source ? source.image : null,
-    existing: "existing" in source ? source.existing : null,
+    card: { ...card, reference },
+    image: source.image ?? null,
+    existing: source.existing ?? null,
   });
 }
 
@@ -477,7 +487,9 @@ export function parseCardLink(raw: unknown, depth = 0): CardLink | null {
     gender: full?.gender,
     labels: full?.labels ?? [],
     swaps: full?.swaps ?? [],
-    reference: full?.reference ?? null,
+    // A card that is its own reference uses the card file the link points at.
+    reference:
+      full?.reference?.self && typeof r.path === "string" ? { ...full.reference, path: r.path } : (full?.reference ?? null),
     negative: typeof r.negative === "string" ? r.negative : undefined,
     path: typeof r.path === "string" ? r.path : undefined,
     // Added cards are one level deep.

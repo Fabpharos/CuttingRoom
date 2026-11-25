@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import RefMarker from "./RefMarker";
+import CardPicture from "./CardPicture";
 import {
   PARTS,
   SHOW_OPTIONS,
@@ -278,11 +278,7 @@ export default function CharacterCardDialog({
                     }}
                   >
                     <span style={{ position: "relative", width: 80, height: 80 }}>
-                      <img
-                        src={convertFileSrc(c.path)}
-                        alt=""
-                        style={{ width: 80, height: 80, objectFit: "cover", borderRadius: 6, display: "block" }}
-                      />
+                      <CardPicture path={c.path} size={80} />
                       <RefMarker reference={c.card.reference} size="large" />
                     </span>
                     <span
