@@ -84,6 +84,8 @@ export type GenerateSettings = {
   automation: AutomationSettings;
   /** Each character's auto-advance (null: fixed), the same length as `characters`. */
   characterAdvance: (SlotAdvance | null)[];
+  /** Characters switched off: kept in the form, left out of what's sent. */
+  characterOff: boolean[];
   /** Use every .txt in a wildcards folder without adding them one by one. */
   wildcardFolder: { enabled: boolean; dir: string | null };
   /** Random or sequential, for files found in the wildcards folder (random when absent). */
@@ -130,6 +132,7 @@ export const DEFAULT_SETTINGS: GenerateSettings = {
   vibes: [],
   automation: DEFAULT_AUTOMATION,
   characterAdvance: [],
+  characterOff: [],
   wildcardFolder: { enabled: false, dir: null },
   folderModes: {},
   references: [],
@@ -290,6 +293,7 @@ function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy
     promptFiles,
     vibes: sanitizeVibes(raw.vibes, (raw.vibeRotation as { mode?: unknown } | undefined)?.mode !== "random" && (raw.vibeRotation as { mode?: unknown } | undefined)?.mode !== "next"),
     automation: parseAutomation(raw.automation),
+    characterOff: characters.map((_, i) => Array.isArray(raw.characterOff) && raw.characterOff[i] === true),
     characterAdvance: characters.map((_, i) =>
       Array.isArray(raw.characterAdvance) ? parseAdvance(raw.characterAdvance[i]) : null,
     ),

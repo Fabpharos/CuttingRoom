@@ -13,6 +13,8 @@ export type SlotSummary = {
   position: CharacterPosition;
   cardName: string | null;
   hasReference: boolean;
+  /** Switched off: kept in the list, not sent. */
+  off?: boolean;
 };
 
 // A short summary of a prompt: its first few tags.
@@ -29,11 +31,13 @@ function Row({
   header,
   body,
   expanded,
+  off,
 }: {
   id: string;
   header: (handle: Record<string, unknown>) => ReactNode;
   body: ReactNode;
   expanded: boolean;
+  off?: boolean;
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id });
   return (
@@ -49,7 +53,8 @@ function Row({
         display: "flex",
         flexDirection: "column",
         gap: 6,
-        background: "var(--bg-card)",
+        background: off ? "var(--bg-page)" : "var(--bg-card)",
+        borderStyle: off ? "dashed" : "solid",
       }}
     >
       {header({ ...attributes, ...listeners })}
@@ -174,7 +179,10 @@ export default function CharacterSlots({
                       }}
                     >
                       <span style={{ color: "var(--muted)", fontSize: 10 }}>{open ? "▾" : "▸"}</span>
-                      <span style={{ fontWeight: 600, whiteSpace: "nowrap" }}>{s.cardName ?? `Character ${i + 1}`}</span>
+                      <span style={{ fontWeight: 600, whiteSpace: "nowrap", opacity: s.off ? 0.5 : 1 }}>
+                        {s.cardName ?? `Character ${i + 1}`}
+                        {s.off && <span style={{ fontWeight: 500, color: "var(--muted)" }}> · off</span>}
+                      </span>
                       {!open && (
                         <span
                           style={{
@@ -213,6 +221,7 @@ export default function CharacterSlots({
                   </div>
                 )}
                 body={open ? renderBody(i) : null}
+                off={s.off}
               />
             );
           })}
