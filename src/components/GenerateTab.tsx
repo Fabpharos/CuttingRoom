@@ -142,7 +142,7 @@ import {
   type VibeRotation,
 } from "../lib/generateSettings";
 import { invoke } from "@tauri-apps/api/core";
-import { revealFilesInExplorer } from "../lib/nativeOps";
+import { findMissingFiles, revealFilesInExplorer } from "../lib/nativeOps";
 import type { RemixItem } from "../lib/remix";
 
 type AccountPhase = "unchecked" | "checking" | "loggedOut" | "loggedIn";
@@ -881,6 +881,9 @@ export default function GenerateTab({
   const [director, setDirector] = useState<{ path: string; tool: DirectorTool } | null>(null);
   // Precise Reference: a style reference here, plus each loaded card's own.
   const [references, setReferences] = useState<PreciseReference[]>([]);
+  // Precise Reference images that weren't found when a run was started.
+  const [missingRefs, setMissingRefs] = useState<string[] | null>(null);
+  const checkingRefs = useRef(false);
   const [useCardReferences, setUseCardReferences] = useState(true);
   const [cardReferencesOff, setCardReferencesOff] = useState<string[]>([]);
   const [creep, setCreep] = useState<CreepSettings>(DEFAULT_CREEP);
@@ -1762,8 +1765,33 @@ export default function GenerateTab({
   const needsConfirm = costsAnlas || (runEstimate !== null && !runEstimate.free);
   const guardAnlas = !costsAnlas && runEstimate?.anlas !== null;
 
-  function requestGenerate() {
+  /**
+   * Checks that every Precise Reference image the requests send is still on
+   * disk; if not, shows which and returns false so nothing is sent.
+   */
+  async function referencesFound(requests: { preciseReferences?: PreciseReference[] | null }[]): Promise<boolean> {
+    // A second click while a check is running starts nothing.
+    if (checkingRefs.current) return false;
+    const paths = [...new Set(requests.flatMap((r) => (r.preciseReferences ?? []).map((x) => x.path)))];
+    if (paths.length === 0) return true;
+    let missing: string[];
+    checkingRefs.current = true;
+    try {
+      missing = await findMissingFiles(paths);
+    } catch {
+      // Rust re-reads every reference when sending anyway.
+      return true;
+    } finally {
+      checkingRefs.current = false;
+    }
+    if (missing.length === 0) return true;
+    setMissingRefs(missing);
+    return false;
+  }
+
+  async function requestGenerate() {
     if (!canGenerate || !status) return;
+    if (!(await referencesFound([{ preciseReferences: formReferences }]))) return;
     if (needsConfirm) setConfirmCost("form");
     else void runGenerate();
   }
@@ -1777,8 +1805,9 @@ export default function GenerateTab({
     remixBatch.length > 0 &&
     (sizeError === null || remixBatch.every((item) => item.size !== null));
 
-  function requestRemix() {
+  async function requestRemix() {
     if (!canRemix || !status) return;
+    if (!(await referencesFound([{ preciseReferences: formReferences }]))) return;
     if (needsConfirm) setConfirmCost("remix");
     else void runGenerate(true);
   }
@@ -2035,7 +2064,7 @@ export default function GenerateTab({
     });
 
   /** Builds the whole plan up front and asks before the first part runs. */
-  function startPlan() {
+  async function startPlan() {
     if (!outputDir || !canGenerate) return;
     const p = workflow;
     let built: ReturnType<typeof buildBatch>;
@@ -2045,6 +2074,7 @@ export default function GenerateTab({
       setError(String(err));
       return;
     }
+    if (!(await referencesFound(built.images.map((img) => img.request)))) return;
     const now = new Date();
     const pad = (n: number) => String(n).padStart(2, "0");
     const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}-${pad(now.getMinutes())}`;
@@ -2172,6 +2202,8 @@ export default function GenerateTab({
       ...img.request,
       fileStem: fileStemFor(img.request.seed, i, batchStart),
     }));
+    // Cards that auto-advance can bring references the form didn't show.
+    if (!(await referencesFound(requests))) return;
     const advancing = fromRemix
       ? []
       : characters.flatMap((_, j) => {
@@ -4902,6 +4934,38 @@ export default function GenerateTab({
           }}
           onCancel={() => setConfirmCost(null)}
         />
+        );
+      })()}
+
+      {missingRefs && (() => {
+        const loaded = cardLinks.flatMap((l) => (l ? cardsOf(l) : []));
+        const whose = (path: string) => {
+          const form = references.find((r) => r.path === path);
+          if (form) return `Precise Reference (${REFERENCE_KIND_LABELS[form.kind]})`;
+          const card = loaded.find((c) => c.reference?.path === path);
+          return card ? `${card.name}'s card reference` : "a card's reference";
+        };
+        const offForm = references.some((r) => missingRefs.includes(r.path));
+        const offCards = loaded.filter((c) => c.reference && missingRefs.includes(c.reference.path)).map(cardRefKey);
+        const canTurnOff = offForm || offCards.length > 0;
+        const n = missingRefs.length;
+        return (
+          <ConfirmModal
+            title={n === 1 ? "Reference image not found" : `${n} reference images not found`}
+            message={
+              `Nothing was sent. ${n === 1 ? "This Precise Reference image is" : "These Precise Reference images are"} missing — moved, renamed or deleted:\n\n` +
+              missingRefs.map((p) => `• ${p.split(/[\\/]/).pop()} — ${whose(p)}\n   ${p}`).join("\n") +
+              `\n\n${canTurnOff ? "Pick the image again, or turn the reference off to generate without it." : "Pick the image again, or update the card."}`
+            }
+            confirmLabel={canTurnOff ? "Turn off" : "OK"}
+            cancelLabel={canTurnOff ? "Close" : ""}
+            onConfirm={() => {
+              if (offForm) setReferences((rs) => rs.map((r) => (missingRefs.includes(r.path) ? { ...r, enabled: false } : r)));
+              if (offCards.length > 0) setCardReferencesOff((off) => [...new Set([...off, ...offCards])]);
+              setMissingRefs(null);
+            }}
+            onCancel={() => setMissingRefs(null)}
+          />
         );
       })()}
 
