@@ -21,11 +21,18 @@ Images record exactly those names (**confirmed**, V4.5 and V5). NovelAI's API sp
 | Reference type in NovelAI's UI | V4.5 | V5 |
 |---|---|---|
 | Character | `character` | `character` (**confirmed**) |
-| Character, "Prefer same outfit" ticked | (no such option) | `character_mainoutfit` (**confirmed**) |
 | Style | `style` | `style` (**confirmed**) |
 | Character & Style | `character&style` | `character&style` (**confirmed**) |
-| Character & Style, "Prefer same outfit" ticked | (no such option) | `character&style`, unchanged (**confirmed**: the site records the same caption whether it's ticked or not) |
 | Outfit | (no such type) | `costume` (**confirmed**; not `outfit`) |
+
+On V5, Character and Character & Style references also have a **Prefer same outfit** checkbox (V4.5 doesn't):
+
+| Type | Unticked | Ticked |
+|---|---|---|
+| Character | `character` (**confirmed**) | `character_mainoutfit` (**confirmed**) |
+| Character & Style | `character&style_anyoutfit` (**confirmed**) | `character&style` (**confirmed**) |
+
+The two go opposite ways: Character gets a suffix when it's ticked, Character & Style when it isn't. So plain `character&style` on V5 means "prefer the same outfit".
 
 Several references of the same or different types can go in one request: a Character and a Style reference as two separate entries is **confirmed** on V5.
 

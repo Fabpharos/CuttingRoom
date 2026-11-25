@@ -22,8 +22,7 @@ test("outfit references, strength above 1 and Prefer same outfit are V5 only", (
   assert.equal(maxReferenceStrength("nai-diffusion-5-full"), 5);
   assert.equal(maxReferenceStrength("nai-diffusion-4-5-full"), 1);
   assert.ok(takesPreferSameOutfit("nai-diffusion-5-full", "character"));
-  // NovelAI records Character & Style the same with or without it.
-  assert.ok(!takesPreferSameOutfit("nai-diffusion-5-full", "character&style"));
+  assert.ok(takesPreferSameOutfit("nai-diffusion-5-full", "character&style"));
   assert.ok(!takesPreferSameOutfit("nai-diffusion-5-full", "outfit"));
   assert.ok(!takesPreferSameOutfit("nai-diffusion-4-5-full", "character"));
 });

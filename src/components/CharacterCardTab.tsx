@@ -788,7 +788,7 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
                         onChange={(e) => edit({ reference: { ...draft.reference!, preferSameOutfit: e.target.checked } })}
                         style={{ accentColor: "var(--accent)" }}
                       />
-                      Prefer same outfit (V5, Character references)
+                      Prefer same outfit (V5)
                     </label>
                     <div style={{ fontSize: 11.5, color: "var(--muted)" }}>
                       Strength above 1 is for V5; V4.5 uses at most 1. Fidelity is V4.5 only.
