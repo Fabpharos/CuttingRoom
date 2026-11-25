@@ -5,7 +5,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import ConfirmModal from "./ConfirmModal";
 import TagSuggestions from "./TagSuggestions";
 import { readImageMetadata } from "../lib/novelai";
-import { moveFilesToTrash } from "../lib/nativeOps";
+import { moveFilesToTrash, revealFilesInExplorer } from "../lib/nativeOps";
 import { guessName } from "../lib/characterTags";
 import {
   PARTS,
@@ -35,7 +35,7 @@ import {
 } from "../lib/characterCards";
 import HelpTip from "./HelpTip";
 import AssociationsDialog from "./AssociationsDialog";
-import RefMarker from "./RefMarker";
+import CardTree from "./CardTree";
 
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "webp"];
 
@@ -404,17 +404,6 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
     }
   }
 
-  // The cards in the open folder, and how many cards each folder holds (its subfolders' too).
-  const shownCards = cards.filter((c) => c.folder === subfolder);
-  const folderCounts = new Map<string, number>();
-  for (const c of cards) {
-    const parts = c.folder ? c.folder.split("/") : [];
-    for (let i = 1; i <= parts.length; i++) {
-      const key = parts.slice(0, i).join("/");
-      folderCounts.set(key, (folderCounts.get(key) ?? 0) + 1);
-    }
-  }
-
   async function runFolderPrompt() {
     if (!folder || !folderPrompt) return;
     const name = folderPrompt.value.trim();
@@ -461,14 +450,30 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
       setDraft({ ...draft, folder: to });
       return;
     }
+    await moveCardTo(draft.path, to);
+  }
+
+  /** Moves a saved card (dragged onto a folder, or from its Folder drop-down). */
+  async function moveCardTo(path: string, to: string) {
+    if (!folder) return;
     try {
-      const path = await moveCard(folder, draft.path, to);
-      setDraft({ ...draft, path, folder: to });
-      setMessage(`Moved ${draft.name || fileName(path)} to ${to || "the card folder"}.`);
+      const moved = await moveCard(folder, path, to);
+      // The open card follows its file.
+      setDraft((d) => (d && d.path === path ? { ...d, path: moved, folder: to } : d));
+      setMessage(`Moved ${fileName(moved)} to ${to ? to.replace(/\//g, " › ") : "the card folder"}.`);
       setError(null);
       await refresh(folder);
     } catch (err) {
       setError(String(err));
+    }
+  }
+
+  /** Shows a card or folder in File Explorer. */
+  async function reveal(path: string) {
+    try {
+      await revealFilesInExplorer([path]);
+    } catch (err) {
+      setError(`Couldn't open Explorer: ${String(err)}`);
     }
   }
 
@@ -556,56 +561,25 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
               Choose a folder to keep your cards in.
             </div>
           )}
+          {folder && cards.length === 0 && folders.length === 0 && (
+            <div style={{ fontSize: 12.5, color: "var(--muted)", lineHeight: 1.5 }}>No cards in this folder yet.</div>
+          )}
           {folder && (
-            <FolderNav
-              current={subfolder}
+            <CardTree
+              cards={cards}
               folders={folders}
-              counts={folderCounts}
-              onOpen={setSubfolder}
-              onNew={() => setFolderPrompt({ mode: "new", value: "" })}
+              selected={subfolder}
+              openPath={draft?.path ?? null}
+              version={version}
+              onSelect={setSubfolder}
+              onOpenCard={openCard}
+              onMove={(c, to) => void moveCardTo(c.path, to)}
+              onNewFolder={() => setFolderPrompt({ mode: "new", value: "" })}
               onRename={() => setFolderPrompt({ mode: "rename", value: subfolder.split("/").pop() ?? "" })}
               onRemove={() => void runRemoveFolder()}
+              onReveal={() => void reveal(folderPath(folder, subfolder))}
             />
           )}
-          {folder && shownCards.length === 0 && (
-            <div style={{ fontSize: 12.5, color: "var(--muted)", lineHeight: 1.5 }}>
-              {subfolder ? "No cards in this folder yet." : cards.length === 0 ? "No cards in this folder yet." : "No cards here; open a folder above."}
-            </div>
-          )}
-          {shownCards.map((c) => {
-            const isOpen = draft?.path === c.path;
-            return (
-              <button
-                key={c.path}
-                onClick={() => openCard(c)}
-                title={fileName(c.path)}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 10,
-                  padding: 6,
-                  border: `1px solid ${isOpen ? "var(--accent)" : "transparent"}`,
-                  borderRadius: 8,
-                  background: isOpen ? "var(--bg-page)" : "transparent",
-                  color: "var(--text)",
-                  cursor: "pointer",
-                  textAlign: "left",
-                }}
-              >
-                <span style={{ position: "relative", width: 44, height: 44, flexShrink: 0 }}>
-                  <img
-                    src={`${convertFileSrc(c.path)}?v=${version}`}
-                    alt=""
-                    style={{ width: 44, height: 44, objectFit: "cover", borderRadius: 6, display: "block" }}
-                  />
-                  <RefMarker reference={c.card.reference} />
-                </span>
-                <span style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis" }}>
-                  {c.card.name}
-                </span>
-              </button>
-            );
-          })}
         </div>
 
         {draft && (
@@ -1005,6 +979,11 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
                 </button>
               )}
               {draft.path && (
+                <button style={secondaryButtonStyle} onClick={() => void reveal(draft.path!)} title="Show this card's file in File Explorer">
+                  Show in Explorer
+                </button>
+              )}
+              {draft.path && (
                 <button
                   style={secondaryButtonStyle}
                   onClick={() => {
@@ -1096,147 +1075,6 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
           onCancel={() => setPendingDelete(null)}
         />
       )}
-    </div>
-  );
-}
-
-function FolderIconSmall() {
-  return (
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinejoin="round" style={{ flexShrink: 0 }}>
-      <path d="M3 6.5a1 1 0 0 1 1-1h5l2 2.2h9a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6.5Z" />
-    </svg>
-  );
-}
-
-/**
- * The card list's folder bar: where you are (each step clickable), the
- * folders inside it, and small New / Rename / Remove links.
- */
-function FolderNav({
-  current,
-  folders,
-  counts,
-  onOpen,
-  onNew,
-  onRename,
-  onRemove,
-}: {
-  current: string;
-  folders: string[];
-  counts: Map<string, number>;
-  onOpen: (rel: string) => void;
-  onNew: () => void;
-  onRename: () => void;
-  onRemove: () => void;
-}) {
-  const steps = current ? current.split("/") : [];
-  const children = folders.filter((f) => {
-    if (current === "") return !f.includes("/");
-    return f.startsWith(`${current}/`) && !f.slice(current.length + 1).includes("/");
-  });
-  const link: React.CSSProperties = { fontSize: 12, fontWeight: 600 };
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 2, paddingBottom: 6, borderBottom: "1px solid var(--border)" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap", fontSize: 12, minHeight: 22 }}>
-        <a
-          href="#"
-          onClick={(e) => {
-            e.preventDefault();
-            onOpen("");
-          }}
-          style={{ ...link, color: current ? "var(--accent)" : "var(--text)" }}
-        >
-          All cards
-        </a>
-        {steps.map((s, i) => {
-          const rel = steps.slice(0, i + 1).join("/");
-          const last = i === steps.length - 1;
-          return (
-            <span key={rel} style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              <span style={{ color: "var(--muted)" }}>›</span>
-              {last ? (
-                <span style={{ fontWeight: 600 }}>{s}</span>
-              ) : (
-                <a
-                  href="#"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    onOpen(rel);
-                  }}
-                  style={link}
-                >
-                  {s}
-                </a>
-              )}
-            </span>
-          );
-        })}
-      </div>
-      {children.map((f) => (
-        <button
-          key={f}
-          onClick={() => onOpen(f)}
-          title={f}
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            padding: "5px 6px",
-            border: "none",
-            borderRadius: 6,
-            background: "transparent",
-            color: "var(--text)",
-            cursor: "pointer",
-            textAlign: "left",
-            fontSize: 13,
-          }}
-        >
-          <span style={{ color: "var(--muted)", display: "flex" }}>
-            <FolderIconSmall />
-          </span>
-          <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600 }}>
-            {f.split("/").pop()}
-          </span>
-          <span style={{ fontSize: 11, color: "var(--muted)", fontFamily: "'IBM Plex Mono', monospace" }}>{counts.get(f) ?? 0}</span>
-        </button>
-      ))}
-      <div style={{ display: "flex", gap: 12, paddingTop: 2 }}>
-        <a
-          href="#"
-          onClick={(e) => {
-            e.preventDefault();
-            onNew();
-          }}
-          style={link}
-        >
-          + New folder
-        </a>
-        {current && (
-          <>
-            <a
-              href="#"
-              onClick={(e) => {
-                e.preventDefault();
-                onRename();
-              }}
-              style={link}
-            >
-              Rename
-            </a>
-            <a
-              href="#"
-              onClick={(e) => {
-                e.preventDefault();
-                onRemove();
-              }}
-              title="Remove this folder (only when it's empty)"
-              style={link}
-            >
-              Remove
-            </a>
-          </>
-        )}
-      </div>
     </div>
   );
 }
