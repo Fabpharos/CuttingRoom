@@ -16,48 +16,61 @@ const swimsuit: CardLink = {
   name: "Swimsuit",
   tags: [
     { text: "1girl", part: "other" },
-    { text: "green eyes", part: "eyes" },
+    { text: "sun hat", part: "other" },
     { text: "bikini top", part: "upperBody" },
     { text: "sarong", part: "lowerBody" },
   ],
+  negative: "jacket",
 };
 const mikaText = "1girl, blue eyes, short hair, hoodie, jeans";
 
-test("an outfit card replaces the character's outfit and nothing else", () => {
-  const r = addCardToCharacter(mikaText, mika, swimsuit, "outfit");
-  assert.equal(r.text, "1girl, blue eyes, short hair, bikini top, sarong");
+test("an outfit card replaces the character's outfit and brings all its tags and undesired content", () => {
+  const r = addCardToCharacter(mikaText, mika, swimsuit, "outfit", new Set(), "bad hands");
+  assert.equal(r.text, "1girl, blue eyes, short hair, sun hat, bikini top, sarong");
+  assert.equal(r.negative, "bad hands, jacket");
   assert.equal(r.link.extras?.length, 1);
   assert.equal(r.link.extras?.[0].mode, "outfit");
-  // The outfit card's own eyes don't come along.
-  assert.ok(!r.text.includes("green eyes"));
+  // 1girl was already there, so it isn't recorded as added.
+  assert.deepEqual(r.link.extras?.[0].added, ["sun hat", "bikini top", "sarong"]);
 });
 
 test("a second outfit replaces the first; taking it off brings the card's own outfit back", () => {
-  const coat: CardLink = { name: "Coat", tags: [{ text: "trench coat", part: "upperBody" }] };
-  const once = addCardToCharacter(mikaText, mika, swimsuit, "outfit");
-  const twice = addCardToCharacter(once.text, once.link, coat, "outfit");
+  const coat: CardLink = { name: "Coat", tags: [{ text: "trench coat", part: "upperBody" }, { text: "1girl", part: "other" }] };
+  const once = addCardToCharacter(mikaText, mika, swimsuit, "outfit", new Set(), "bad hands");
+  const twice = addCardToCharacter(once.text, once.link, coat, "outfit", new Set(), once.negative);
   assert.equal(twice.text, "1girl, blue eyes, short hair, trench coat");
+  assert.equal(twice.negative, "bad hands");
   assert.equal(twice.link.extras?.length, 1);
-  const off = removeExtraCard(twice.text, twice.link, 0);
+  const off = removeExtraCard(twice.text, twice.link, 0, twice.negative);
+  // The character's own 1girl stays: the coat card didn't add it.
   assert.equal(off.text, "1girl, blue eyes, short hair, hoodie, jeans");
+  assert.equal(off.negative, "bad hands");
   assert.equal(off.link.extras, undefined);
+});
+
+test("taking an outfit off removes its undesired content too", () => {
+  const on = addCardToCharacter(mikaText, mika, swimsuit, "outfit", new Set(), "");
+  const off = removeExtraCard(on.text, on.link, 0, on.negative);
+  assert.equal(off.text, "1girl, blue eyes, short hair, hoodie, jeans");
+  assert.equal(off.negative, "");
 });
 
 test("adding with all tags adds only what's missing", () => {
   const r = addCardToCharacter(mikaText, mika, swimsuit, "all");
-  assert.equal(r.text, "1girl, blue eyes, short hair, hoodie, jeans, green eyes, bikini top, sarong");
+  assert.equal(r.text, "1girl, blue eyes, short hair, hoodie, jeans, sun hat, bikini top, sarong");
+  assert.equal(r.negative, "jacket");
 });
 
 test("hidden parts stay out, and view tags drop an added card's tags too", () => {
   const r = addCardToCharacter(mikaText, mika, swimsuit, "outfit", new Set(["lowerBody"]));
-  assert.equal(r.text, "1girl, blue eyes, short hair, bikini top");
+  assert.equal(r.text, "1girl, blue eyes, short hair, sun hat, bikini top");
   const full = addCardToCharacter(mikaText, mika, swimsuit, "outfit");
   assert.deepEqual(
     linkTags(full.link).map((t) => t.text),
-    ["1girl", "blue eyes", "short hair", "bikini top", "sarong"],
+    ["1girl", "blue eyes", "short hair", "1girl", "sun hat", "bikini top", "sarong"],
   );
   const adapted = adaptCardCharacter(full.text, full.link, "beach, upper body");
-  assert.equal(adapted.text, "1girl, blue eyes, short hair, bikini top");
+  assert.equal(adapted.text, "1girl, blue eyes, short hair, sun hat, bikini top");
 });
 
 test("added cards survive saving and reading back", () => {
@@ -65,6 +78,7 @@ test("added cards survive saving and reading back", () => {
   const back = parseCardLink(JSON.parse(JSON.stringify(r.link)));
   assert.equal(back?.extras?.[0].link.name, "Swimsuit");
   assert.equal(back?.extras?.[0].mode, "outfit");
+  assert.deepEqual(back?.extras?.[0].added, ["sun hat", "bikini top", "sarong"]);
 });
 
 test("a card that is its own reference follows its file", () => {

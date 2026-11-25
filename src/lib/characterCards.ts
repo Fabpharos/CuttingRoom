@@ -306,18 +306,42 @@ export type CardLink = {
 
 /**
  * A card added to a character that already has one, so both describe the
- * same NovelAI character. "outfit" takes only the card's upper and lower body
- * tags, in place of the character's own; "all" adds every tag of it.
+ * same NovelAI character. Both bring every tag of the card the character
+ * doesn't have yet, and its undesired content; "outfit" also takes the
+ * character's own upper and lower body tags (or an earlier outfit card's)
+ * out first. `added` / `addedNegative` are the tags it actually put in, so
+ * taking it off removes only those (missing on links saved before 1.7.4).
  */
-export type CardExtra = { link: CardLink; mode: "outfit" | "all" };
+export type CardExtra = {
+  link: CardLink;
+  mode: "outfit" | "all";
+  added?: string[];
+  addedNegative?: string[];
+};
 
 /** The parts an outfit covers. */
 export const OUTFIT_PARTS: Part[] = ["upperBody", "lowerBody"];
 
-/** The tags an extra card brings to the character. */
+/** The tags an extra card brings to the character: all of them. */
 export function extraTags(extra: CardExtra): CardTag[] {
-  return extra.mode === "outfit" ? extra.link.tags.filter((t) => OUTFIT_PARTS.includes(t.part)) : extra.link.tags;
+  return extra.link.tags;
 }
+
+/** `tags` without one of each tag in `gone` (compared without weights). */
+function withoutTags(tags: string[], gone: string[]): string[] {
+  const drop = new Map<string, number>();
+  for (const t of gone) drop.set(bareTag(t), (drop.get(bareTag(t)) ?? 0) + 1);
+  return tags.filter((tag) => {
+    const k = bareTag(tag);
+    const n = drop.get(k) ?? 0;
+    if (n === 0) return true;
+    drop.set(k, n - 1);
+    return false;
+  });
+}
+
+/** What an added card put in: its record, or (older links) every tag it has. */
+const addedBy = (extra: CardExtra): string[] => extra.added ?? extraTags(extra).map((t) => t.text);
 
 /**
  * Every tag a character's prompt may hold from its cards, with its part: the
@@ -332,12 +356,13 @@ export function linkTags(link: CardLink): CardTag[] {
 }
 
 /**
- * Adds `card` to a character whose prompt is `text` and whose card is
- * `link`. As an outfit, the tags of the character's current outfit (its own
- * card's, or an earlier outfit card's) leave the prompt and the new card's
- * upper and lower body tags go in; an earlier outfit card is replaced. With
- * "all", every tag the prompt doesn't have yet is added. `hidden` parts are
- * left out, as when loading a card.
+ * Adds `card` to a character whose prompt is `text`, whose undesired content
+ * is `negative` and whose card is `link`. Every tag of the card the prompt
+ * doesn't have yet goes in, and likewise its undesired content. As an
+ * outfit, the character's current outfit (its own card's upper and lower
+ * body tags, or an earlier outfit card's tags) leaves the prompt first; an
+ * earlier outfit card is replaced. `hidden` parts are left out, as when
+ * loading a card.
  */
 export function addCardToCharacter(
   text: string,
@@ -345,50 +370,57 @@ export function addCardToCharacter(
   card: CardLink,
   mode: CardExtra["mode"],
   hidden: Set<Part> = new Set(),
-): { text: string; link: CardLink } {
+  negative = "",
+): { text: string; negative: string; link: CardLink } {
   let tags = splitTags(text);
+  let negs = splitTags(negative);
   let extras = link.extras ?? [];
   if (mode === "outfit") {
-    // What the character wears now: an earlier outfit card's, or its own card's.
-    const current = extras.some((e) => e.mode === "outfit")
-      ? extras.filter((e) => e.mode === "outfit").flatMap(extraTags)
-      : link.tags.filter((t) => OUTFIT_PARTS.includes(t.part));
-    const drop = new Map<string, number>();
-    for (const t of current) drop.set(bareTag(t.text), (drop.get(bareTag(t.text)) ?? 0) + 1);
-    tags = tags.filter((tag) => {
-      const k = bareTag(tag);
-      const n = drop.get(k) ?? 0;
-      if (n === 0) return true;
-      drop.set(k, n - 1);
-      return false;
-    });
+    const earlier = extras.filter((e) => e.mode === "outfit");
+    if (earlier.length > 0) {
+      tags = withoutTags(tags, earlier.flatMap(addedBy));
+      negs = withoutTags(negs, earlier.flatMap((e) => e.addedNegative ?? []));
+    } else {
+      tags = withoutTags(tags, link.tags.filter((t) => OUTFIT_PARTS.includes(t.part)).map((t) => t.text));
+    }
     extras = extras.filter((e) => e.mode !== "outfit");
   }
-  const extra: CardExtra = { link: { ...card, extras: undefined }, mode };
+  const added: string[] = [];
   const have = new Set(tags.map(bareTag));
-  for (const t of extraTags(extra)) {
+  for (const t of card.tags) {
     if (t.part !== "other" && hidden.has(t.part)) continue;
     if (have.has(bareTag(t.text))) continue;
     have.add(bareTag(t.text));
     tags.push(t.text);
+    added.push(t.text);
   }
-  return { text: tags.join(", "), link: { ...link, extras: [...extras, extra] } };
+  const addedNegative: string[] = [];
+  const haveNeg = new Set(negs.map(bareTag));
+  for (const t of splitTags(card.negative ?? "")) {
+    if (haveNeg.has(bareTag(t))) continue;
+    haveNeg.add(bareTag(t));
+    negs.push(t);
+    addedNegative.push(t);
+  }
+  const extra: CardExtra = { link: { ...card, extras: undefined }, mode, added, addedNegative };
+  return { text: tags.join(", "), negative: negs.join(", "), link: { ...link, extras: [...extras, extra] } };
 }
 
-/** Takes an added card back off a character: its tags leave the prompt (an outfit card's give way to the main card's outfit). */
-export function removeExtraCard(text: string, link: CardLink, index: number): { text: string; link: CardLink } {
+/**
+ * Takes an added card back off a character: the tags and undesired content
+ * it put in leave (an outfit card's give way to the main card's outfit).
+ */
+export function removeExtraCard(
+  text: string,
+  link: CardLink,
+  index: number,
+  negative = "",
+): { text: string; negative: string; link: CardLink } {
   const extras = link.extras ?? [];
   const gone = extras[index];
-  if (!gone) return { text, link };
-  const drop = new Map<string, number>();
-  for (const t of extraTags(gone)) drop.set(bareTag(t.text), (drop.get(bareTag(t.text)) ?? 0) + 1);
-  const tags = splitTags(text).filter((tag) => {
-    const k = bareTag(tag);
-    const n = drop.get(k) ?? 0;
-    if (n === 0) return true;
-    drop.set(k, n - 1);
-    return false;
-  });
+  if (!gone) return { text, negative, link };
+  const tags = withoutTags(splitTags(text), addedBy(gone));
+  const negs = withoutTags(splitTags(negative), gone.addedNegative ?? []);
   const rest = extras.filter((_, i) => i !== index);
   if (gone.mode === "outfit") {
     const have = new Set(tags.map(bareTag));
@@ -399,7 +431,11 @@ export function removeExtraCard(text: string, link: CardLink, index: number): { 
       }
     }
   }
-  return { text: tags.join(", "), link: { ...link, extras: rest.length > 0 ? rest : undefined } };
+  return {
+    text: tags.join(", "),
+    negative: gone.addedNegative ? negs.join(", ") : negative,
+    link: { ...link, extras: rest.length > 0 ? rest : undefined },
+  };
 }
 
 /** The link a character keeps to `card`. */
@@ -498,7 +534,11 @@ export function parseCardLink(raw: unknown, depth = 0): CardLink | null {
         ? r.extras.flatMap((x): CardExtra[] => {
             const e = x as Record<string, unknown> | null;
             const link = e ? parseCardLink(e.link, 1) : null;
-            return link && (e!.mode === "outfit" || e!.mode === "all") ? [{ link, mode: e!.mode }] : [];
+            if (!link || (e!.mode !== "outfit" && e!.mode !== "all")) return [];
+            const strings = (v: unknown) => (Array.isArray(v) ? v.filter((t): t is string => typeof t === "string") : undefined);
+            const added = strings(e!.added);
+            const addedNegative = strings(e!.addedNegative);
+            return [{ link, mode: e!.mode, ...(added ? { added } : {}), ...(addedNegative ? { addedNegative } : {}) }];
           })
         : undefined,
   };

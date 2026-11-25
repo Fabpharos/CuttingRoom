@@ -372,8 +372,8 @@ export default function CharacterCardDialog({
             {target.kind === "add" && (
               <div style={{ fontSize: 12, color: "var(--muted)", lineHeight: 1.5, marginTop: -6 }}>
                 {target.mode === "outfit"
-                  ? "Only this card's upper and lower body tags go in, replacing the character's own outfit. "
-                  : "Every tag of this card that the character doesn't have yet goes in. "}
+                  ? "The character's own upper and lower body tags come out, and every tag of this card it doesn't have yet goes in, with the card's undesired content. "
+                  : "Every tag of this card that the character doesn't have yet goes in, with the card's undesired content. "}
                 Both cards stay linked to the character, so view tags and references keep working.
                 {card?.reference?.type === "character" || card?.reference?.type === "character&style"
                   ? target.mode === "outfit"

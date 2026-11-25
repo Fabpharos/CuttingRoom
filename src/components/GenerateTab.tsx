@@ -2516,21 +2516,18 @@ export default function GenerateTab({
     setShowCardDialog(false);
     const link = cardLinks[index];
     if (!link) return;
-    const next = addCardToCharacter(characters[index] ?? "", link, card, mode, hidden);
+    const next = addCardToCharacter(characters[index] ?? "", link, card, mode, hidden, characterNegatives[index] ?? "");
     setCharacters((prev) => prev.map((c, j) => (j === index ? next.text : c)));
-    if (mode === "all" && card.negative?.trim()) {
-      setCharacterNegatives((prev) =>
-        prev.map((n, j) => (j === index ? (n.trim() ? `${n.replace(/[\s,]+$/, "")}, ${card.negative}` : card.negative!) : n)),
-      );
-    }
+    setCharacterNegatives((prev) => prev.map((n, j) => (j === index ? next.negative : n)));
     setCharacterCardLinks(cardLinks.map((l, j) => (j === index ? next.link : l)));
   }
 
   function removeAddedCard(index: number, extra: number) {
     const link = cardLinks[index];
     if (!link) return;
-    const next = removeExtraCard(characters[index] ?? "", link, extra);
+    const next = removeExtraCard(characters[index] ?? "", link, extra, characterNegatives[index] ?? "");
     setCharacters((prev) => prev.map((c, j) => (j === index ? next.text : c)));
+    setCharacterNegatives((prev) => prev.map((n, j) => (j === index ? next.negative : n)));
     setCharacterCardLinks(cardLinks.map((l, j) => (j === index ? next.link : l)));
   }
 
