@@ -97,6 +97,15 @@ fn get_file_sizes(paths: Vec<String>) -> Vec<u64> {
         .collect()
 }
 
+/// The paths that aren't an existing file (e.g. a moved Precise Reference image).
+#[tauri::command]
+fn missing_files(paths: Vec<String>) -> Vec<String> {
+    paths
+        .into_iter()
+        .filter(|p| !std::path::Path::new(p).is_file())
+        .collect()
+}
+
 #[tauri::command]
 async fn find_image_matches(
     app: tauri::AppHandle,
@@ -507,6 +516,7 @@ pub fn run() {
             copy_files_to_clipboard,
             move_files_to_trash,
             get_file_sizes,
+            missing_files,
             edit_save_image,
             find_image_matches,
             cancel_match,

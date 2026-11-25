@@ -58,6 +58,7 @@ export default function ConfirmModal({
           {message}
         </div>
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+          {cancelLabel && (
           <button
             onClick={onCancel}
             style={{
@@ -74,6 +75,7 @@ export default function ConfirmModal({
           >
             {cancelLabel}
           </button>
+          )}
           {middleLabel && onMiddle && (
             <button
               onClick={onMiddle}

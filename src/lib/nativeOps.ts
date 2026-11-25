@@ -19,6 +19,11 @@ export async function getFileSizes(paths: string[]): Promise<number[]> {
   return invoke("get_file_sizes", { paths });
 }
 
+/** The paths that aren't an existing file. */
+export async function findMissingFiles(paths: string[]): Promise<string[]> {
+  return invoke("missing_files", { paths });
+}
+
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   const units = ["KB", "MB", "GB", "TB"];
