@@ -219,6 +219,10 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
       ...CARD_V2_DEFAULTS,
       gender: guessGender(tags),
       labels: "",
+      // The image the card is made from is its reference unless the user
+      // removes it or picks another (it only costs anything when Generate
+      // sends it, which shows the price and asks first).
+      reference: { path: image, type: "character", strength: 1, fidelity: 1, preferSameOutfit: false },
       choices,
       choice: 0,
     });
@@ -346,6 +350,13 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
     } finally {
       setSaving(false);
     }
+  }
+
+  /** Uses the card's own picture as its reference: the source image of a new card, or the saved card's thumbnail. */
+  function useOwnImage() {
+    const path = draft?.image ?? draft?.path;
+    if (!draft || !path) return;
+    edit({ reference: { type: "character", strength: 1, fidelity: 1, preferSameOutfit: false, ...draft.reference, path } });
   }
 
   async function chooseReference() {
@@ -734,8 +745,8 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
                 Precise Reference
                 <HelpTip
                   lines={[
-                    { text: "A reference image that comes with the card, so faces stay the same across images." },
-                    { text: "V4.5 only for now. NovelAI charges 5 Anlas per image for each reference; Generate shows the price and asks first." },
+                    { text: "A reference image that comes with the card, so the character stays the same across images. A new card uses the image it's made from; Remove it to make a card without one." },
+                    { text: "V5 and V4.5. NovelAI charges 5 Anlas per image for each reference; Generate shows the price and asks first." },
                   ]}
                 />
               </span>
@@ -818,16 +829,31 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
                   </div>
                 </div>
               ) : (
-                <a
-                  href="#"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    void chooseReference();
-                  }}
-                  style={{ fontSize: 12.5, fontWeight: 600, alignSelf: "flex-start" }}
-                >
-                  Choose reference image…
-                </a>
+                <div style={{ display: "flex", gap: 14, fontSize: 12.5, flexWrap: "wrap" }}>
+                  {(draft.image ?? draft.path) && (
+                    <a
+                      href="#"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        useOwnImage();
+                      }}
+                      title={draft.image ? "Use the image this card is made from" : "Use this card's picture (its saved thumbnail, up to 512 pixels)"}
+                      style={{ fontWeight: 600 }}
+                    >
+                      {draft.image ? "Use this image" : "Use the card's picture"}
+                    </a>
+                  )}
+                  <a
+                    href="#"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      void chooseReference();
+                    }}
+                    style={{ fontWeight: 600 }}
+                  >
+                    Choose reference image…
+                  </a>
+                </div>
               )}
             </div>
 
