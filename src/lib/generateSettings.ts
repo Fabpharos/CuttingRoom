@@ -93,6 +93,8 @@ export type GenerateSettings = {
   references: PreciseReference[];
   /** Send the reference images that come with loaded character cards. */
   useCardReferences: boolean;
+  /** Character cards (by file, or name) whose reference is switched off. */
+  cardReferencesOff: string[];
   creep: CreepSettings;
   /** Fixed: every ticked vibe (up to 4). Random / next: K of the ticked ones per image. */
   vibeRotation: VibeRotation;
@@ -132,6 +134,7 @@ export const DEFAULT_SETTINGS: GenerateSettings = {
   folderModes: {},
   references: [],
   useCardReferences: true,
+  cardReferencesOff: [],
   creep: DEFAULT_CREEP,
   vibeRotation: { mode: "fixed", k: 2, every: 1 },
   vibeLibraryDir: null,
@@ -154,6 +157,7 @@ export function parseReferences(raw: unknown): PreciseReference[] {
         strength: clamp(r.strength, 0, 5, 1),
         fidelity: clamp(r.fidelity, 0, 1, 1),
         preferSameOutfit: r.preferSameOutfit === true,
+        enabled: r.enabled !== false,
       },
     ];
   });
@@ -296,6 +300,9 @@ function sanitize(raw: Partial<Record<keyof GenerateSettings, unknown>> & Legacy
     // `styleReference` is the single reference saved before V5 allowed several.
     references: parseReferences(raw.references ?? (raw.styleReference ? [raw.styleReference] : [])),
     useCardReferences: raw.useCardReferences !== false,
+    cardReferencesOff: Array.isArray(raw.cardReferencesOff)
+      ? raw.cardReferencesOff.filter((k): k is string => typeof k === "string")
+      : [],
     creep: parseCreep(raw.creep, SAMPLERS.map((x) => x.id), NOISE_SCHEDULES.map((x) => x.id)),
     vibeRotation: (() => {
       const v = (raw.vibeRotation ?? {}) as Record<string, unknown>;

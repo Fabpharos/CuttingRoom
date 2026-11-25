@@ -1,6 +1,6 @@
 [package]
 name = "tauri-app"
-version = "1.6.2"
+version = "1.6.3"
 description = "Cutting Room — local photo album organizer, image matching, and bulk object detection/pixelation"
 authors = ["Samuel Hudson"]
 edition = "2021"
@@ -31,5 +31,5 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 pdf-writer = "0.15.0"
 miniz_oxide = "0.9.1"
 base64 = "0.22"
-novelai-core = { version = "1.6.2", path = "../crates/novelai-core" }
+novelai-core = { version = "1.6.3", path = "../crates/novelai-core" }
 
