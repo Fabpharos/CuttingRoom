@@ -827,6 +827,9 @@ export default function GenerateTab({
   // Each character's auto-advance (null: fixed), kept the same length as `characters`.
   const [characterAdvance, setCharacterAdvance] = useState<(SlotAdvance | null)[]>([]);
   const advanceOf = (i: number) => characterAdvance[i] ?? null;
+  // Characters switched off (by index, kept in step with the other lists).
+  const [characterOff, setCharacterOff] = useState<boolean[]>([]);
+  const offOf = (i: number) => characterOff[i] === true;
   const [poolStates, setPoolStates] = useState<Record<string, PoolState>>({});
   // Every .txt in a wildcards folder, usable without adding it.
   const [wildcardFolder, setWildcardFolder] = useState<{ enabled: boolean; dir: string | null }>({ enabled: false, dir: null });
@@ -904,6 +907,7 @@ export default function GenerateTab({
         setVarietyPlus(s.varietyPlus);
         setAutomation(s.automation);
         setCharacterAdvance(s.characterAdvance);
+        setCharacterOff(s.characterOff);
         setWildcardFolder(s.wildcardFolder);
         setFolderModes(s.folderModes);
         setReferences(s.references);
@@ -964,6 +968,7 @@ export default function GenerateTab({
         varietyPlus,
         automation,
         characterAdvance: characters.map((_, i) => advanceOf(i)),
+        characterOff: characters.map((_, i) => offOf(i)),
         wildcardFolder,
         folderModes,
         references,
@@ -1008,6 +1013,7 @@ export default function GenerateTab({
     varietyPlus,
     automation,
     characterAdvance,
+    characterOff,
     wildcardFolder,
     folderModes,
     references,
@@ -1423,6 +1429,7 @@ export default function GenerateTab({
     setCharacterPositions(s.characterPositions);
     setCharacterCardLinks(s.characterCardLinks);
     setCharacterAdvance([]);
+    setCharacterOff([]);
     setSteps(s.steps);
     setScale(s.scale);
     setSampler(s.sampler);
@@ -1505,6 +1512,7 @@ export default function GenerateTab({
     setCharacters(v.characters);
     setCharacterNegatives(v.characterNegatives);
     setCharacterCardLinks([]);
+    setCharacterOff([]);
     setUseCoords(v.characterPositions !== null);
     setCharacterPositions(v.characterPositions ?? v.characters.map(() => CENTER));
     setImportPlan(null);
@@ -1653,7 +1661,7 @@ export default function GenerateTab({
     }
     return refs.slice(0, MAX_PRECISE_REFERENCES);
   };
-  const formReferences = referencesFor(cardLinks);
+  const formReferences = referencesFor(cardLinks.map((l, i) => (offOf(i) ? null : l)));
 
   // The cost of one image as the form stands. Prompts don't change the
   // price, so a request without tokens filled is enough.
@@ -1775,7 +1783,8 @@ export default function GenerateTab({
               negative: characterNegatives[j] ?? "",
               position: characterPositions[j] ?? CENTER,
               link: cardLinks[j],
-              present: true,
+              // Switched off: kept in the form, not sent.
+              present: !offOf(j),
             }),
           ),
           placed: useCoords,
@@ -2425,6 +2434,7 @@ export default function GenerateTab({
     setCharacterPositions((prev) => prev.filter((_, j) => j !== index));
     setCharacterCardLinks(cardLinks.filter((_, j) => j !== index));
     setCharacterAdvance(characters.map((_, i) => advanceOf(i)).filter((_, j) => j !== index));
+    setCharacterOff(characters.map((_, i) => offOf(i)).filter((_, j) => j !== index));
     setCharacterKeys((prev) => prev.filter((_, j) => j !== index));
     if (typeof lastFieldRef.current?.field === "object") lastFieldRef.current = null;
   }
@@ -2437,6 +2447,7 @@ export default function GenerateTab({
     setCharacterPositions((prev) => pick(prev, CENTER));
     setCharacterCardLinks(pick(cardLinks, null));
     setCharacterAdvance(pick(characters.map((_, i) => advanceOf(i)), null));
+    setCharacterOff(pick(characters.map((_, i) => offOf(i)), false));
     setCharacterKeys((prev) => pick(prev, ""));
     if (typeof lastFieldRef.current?.field === "object") lastFieldRef.current = null;
   }
@@ -2498,12 +2509,14 @@ export default function GenerateTab({
       position: characterPositions[i] ?? CENTER,
       link: cardLinks[i],
       key: characterKeys[i] ?? crypto.randomUUID(),
+      off: offOf(i),
     }));
     // Put each back where it was, as far as the list allows.
     for (const item of [...stashedChars.items].sort((a, b) => a.index - b.index)) {
       if (rows.length >= max) break;
-      rows.splice(Math.min(item.index, rows.length), 0, { ...item, key: crypto.randomUUID() });
+      rows.splice(Math.min(item.index, rows.length), 0, { ...item, key: crypto.randomUUID(), off: false });
     }
+    setCharacterOff(rows.map((r) => r.off));
     setCharacters(rows.map((r) => r.text));
     setCharacterNegatives(rows.map((r) => r.negative));
     setCharacterPositions(rows.map((r) => r.position));
@@ -2931,8 +2944,9 @@ export default function GenerateTab({
     position: characterPositions[i] ?? CENTER,
     cardName: advanceOf(i) ? `${{ next: "Next", random: "Random", shuffle: "Shuffle" }[advanceOf(i)!.mode as "next"]} card` : (cardLinks[i]?.name ?? null),
     hasReference: !!cardLinks[i]?.reference,
+    off: offOf(i),
   }));
-  const tokensUsed = [prompt, ...characters].reduce((n, t) => n + roughTokens(t), 0);
+  const tokensUsed = [prompt, ...characters.filter((_, i) => !offOf(i))].reduce((n, t) => n + roughTokens(t), 0);
   const tokenMax = tokenLimit(model);
   const setAdvance = (i: number, a: SlotAdvance | null) =>
     setCharacterAdvance(characters.map((_, j) => (j === i ? a : advanceOf(j))));
@@ -3218,6 +3232,20 @@ export default function GenerateTab({
           onHover={setHoveredChar}
           renderBody={characterBody}
           renderActions={(i) => (
+            <>
+            <label
+              title={offOf(i) ? "Not sent. Tick to use this character again." : "Sent with each image. Untick to keep this character here without sending it."}
+              style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "var(--muted)", cursor: generating ? "default" : "pointer", userSelect: "none" }}
+            >
+              <input
+                type="checkbox"
+                checked={!offOf(i)}
+                disabled={generating}
+                onChange={(e) => setCharacterOff(characters.map((_, j) => (j === i ? !e.target.checked : offOf(j))))}
+                style={{ accentColor: "var(--accent)", margin: 0 }}
+              />
+              Use
+            </label>
             <a
               href="#"
               onClick={(e) => {
@@ -3229,6 +3257,7 @@ export default function GenerateTab({
             >
               Remove
             </a>
+            </>
           )}
         />
       )}
@@ -3722,9 +3751,12 @@ export default function GenerateTab({
   }
   const updateReference = (i: number, patch: Partial<PreciseReference>) =>
     setReferences((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
-  const cardRefCount = cardLinks.filter((l) => l?.reference).length;
+  const cardRefCount = cardLinks.filter((l, i) => l?.reference && !offOf(i)).length;
   // The loaded cards with a reference, once each.
-  const cardRefLinks = cardLinks.filter((l, i): l is CardLink => !!l?.reference && cardLinks.findIndex((m) => m && cardRefKey(m) === cardRefKey(l)) === i);
+  const cardRefLinks = cardLinks.filter(
+    (l, i): l is CardLink =>
+      !!l?.reference && !offOf(i) && cardLinks.findIndex((m, k) => m && !offOf(k) && cardRefKey(m) === cardRefKey(l)) === i,
+  );
   const cardRefsOn = cardRefLinks.filter((l) => !cardReferencesOff.includes(cardRefKey(l))).length;
   const modelKinds = referenceKinds(model);
   const maxStrength = maxReferenceStrength(model);
