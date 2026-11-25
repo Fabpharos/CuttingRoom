@@ -64,7 +64,19 @@ import HelpTip from "./HelpTip";
 import AccountBars from "./AccountBars";
 import CharacterSlots, { roughTokens, spreadPositions, tokenLimit, type SlotSummary } from "./CharacterSlots";
 import CharacterCardDialog from "./CharacterCardDialog";
-import { PARTS, adaptCardCharacter, linkFor, listCards, loadCardFolder, type CardFile, type CardLink } from "../lib/characterCards";
+import {
+  PARTS,
+  adaptCardCharacter,
+  addCardToCharacter,
+  linkFor,
+  listCards,
+  loadCardFolder,
+  removeExtraCard,
+  type CardExtra,
+  type CardFile,
+  type CardLink,
+  type Part,
+} from "../lib/characterCards";
 import AutomationCard, { DEFAULT_AUTOMATION, type AutomationSettings } from "./AutomationCard";
 import BatchPreview, { type PreviewImage } from "./BatchPreview";
 import PromptFileEditor from "./PromptFileEditor";
@@ -601,8 +613,33 @@ const cardStyle: React.CSSProperties = {
   padding: "14px 16px",
 };
 
+/** The optional cards the Sections row shows or hides. */
+type SectionId = "img2img" | "reference" | "vibes" | "files" | "automation" | "artists" | "creep" | "workflow";
+const SECTIONS: { id: SectionId; label: string }[] = [
+  { id: "files", label: "Prompt files" },
+  { id: "automation", label: "Automation" },
+  { id: "artists", label: "Artists" },
+  { id: "img2img", label: "Image to image" },
+  { id: "reference", label: "Precise Reference" },
+  { id: "vibes", label: "Vibes" },
+  { id: "creep", label: "Creep" },
+  { id: "workflow", label: "Workflow" },
+];
+
 /** Which loaded card a reference switch belongs to: its file, or its name. */
 const cardRefKey = (l: CardLink) => l.path ?? l.name;
+
+/**
+ * A character's cards whose references can be sent: its own, and each added
+ * one. An outfit card only brings an Outfit or Style reference (a Character
+ * reference would pull in that card's character).
+ */
+function cardsOf(link: CardLink): CardLink[] {
+  const added = (link.extras ?? [])
+    .filter((x) => x.mode === "all" || (x.link.reference && (x.link.reference.type === "outfit" || x.link.reference.type === "style")))
+    .map((x) => x.link);
+  return [link, ...added];
+}
 
 /** A labelled on/off box for one reference or vibe: off keeps it in the list but doesn't send it. */
 function UseSwitch({
@@ -887,6 +924,9 @@ export default function GenerateTab({
   const lastFieldRef = useRef<{ field: PromptField; el: HTMLTextAreaElement } | null>(null);
   const [vibes, setVibes] = useState<VibeEntry[]>([]);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
+  // Which optional cards are shown (null until read; then the saved choice,
+  // or the ones in use the first time).
+  const [shownSections, setShownSections] = useState<SectionId[] | null>(null);
 
   // Restores the form from the last session. It's a local file, so unlike
   // the account check this is fine to do at launch.
@@ -1246,6 +1286,24 @@ export default function GenerateTab({
     return (
       <div style={{ fontSize: 12, color: "var(--muted)", fontFamily: "system-ui, sans-serif", lineHeight: 1.5 }}>
         From card <strong style={{ color: "var(--text)" }}>{link.name}</strong>
+        {(link.extras ?? []).map((x, k) => (
+          <span key={k}>
+            {" + "}
+            <strong style={{ color: "var(--text)" }}>{x.link.name}</strong>
+            {x.mode === "outfit" ? " (outfit)" : ""}{" "}
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                if (!generating) removeAddedCard(i, k);
+              }}
+              title={x.mode === "outfit" ? "Take this outfit off; the character's own outfit comes back" : "Take this card's tags off the character"}
+              style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600 }}
+            >
+              ×
+            </a>
+          </span>
+        ))}
         {parts.length > 0
           ? ` · the next image leaves out its ${parts.join(", ")} tags (${next.views.join(", ")})`
           : " · leaves out what an image's view tags hide (facing away, closed eyes, upper body, lower body, POV…)"}
@@ -1655,8 +1713,11 @@ export default function GenerateTab({
     const refs: PreciseReference[] = references.filter((r) => r.enabled !== false && kinds.includes(r.kind)).map(fit);
     if (useCardReferences) {
       for (const l of links) {
-        const r = l?.reference;
-        if (r && !cardReferencesOff.includes(cardRefKey(l))) refs.push(fit({ path: r.path, kind: r.type, strength: r.strength, fidelity: r.fidelity, preferSameOutfit: r.preferSameOutfit }));
+        for (const c of l ? cardsOf(l) : []) {
+          const r = c.reference;
+          if (!r || cardReferencesOff.includes(cardRefKey(c)) || !kinds.includes(r.type)) continue;
+          refs.push(fit({ path: r.path, kind: r.type, strength: r.strength, fidelity: r.fidelity, preferSameOutfit: r.preferSameOutfit }));
+        }
       }
     }
     return refs.slice(0, MAX_PRECISE_REFERENCES);
@@ -2418,6 +2479,29 @@ export default function GenerateTab({
     if (items.length > room) setError(`There's room for ${room} more character${room === 1 ? "" : "s"}, so only the first ${room} were added.`);
   }
 
+  /** Adds a card to character `index` (which already has one), as its outfit or with all its tags. */
+  function addCardTo(index: number, card: CardLink, mode: CardExtra["mode"], hidden: Set<Part>) {
+    setShowCardDialog(false);
+    const link = cardLinks[index];
+    if (!link) return;
+    const next = addCardToCharacter(characters[index] ?? "", link, card, mode, hidden);
+    setCharacters((prev) => prev.map((c, j) => (j === index ? next.text : c)));
+    if (mode === "all" && card.negative?.trim()) {
+      setCharacterNegatives((prev) =>
+        prev.map((n, j) => (j === index ? (n.trim() ? `${n.replace(/[\s,]+$/, "")}, ${card.negative}` : card.negative!) : n)),
+      );
+    }
+    setCharacterCardLinks(cardLinks.map((l, j) => (j === index ? next.link : l)));
+  }
+
+  function removeAddedCard(index: number, extra: number) {
+    const link = cardLinks[index];
+    if (!link) return;
+    const next = removeExtraCard(characters[index] ?? "", link, extra);
+    setCharacters((prev) => prev.map((c, j) => (j === index ? next.text : c)));
+    setCharacterCardLinks(cardLinks.map((l, j) => (j === index ? next.link : l)));
+  }
+
   function unlinkCard(index: number) {
     setCharacterCardLinks(cardLinks.map((l, i) => (i === index ? null : l)));
   }
@@ -2942,8 +3026,12 @@ export default function GenerateTab({
     text: c,
     negative: characterNegatives[i] ?? "",
     position: characterPositions[i] ?? CENTER,
-    cardName: advanceOf(i) ? `${{ next: "Next", random: "Random", shuffle: "Shuffle" }[advanceOf(i)!.mode as "next"]} card` : (cardLinks[i]?.name ?? null),
-    hasReference: !!cardLinks[i]?.reference,
+    cardName: advanceOf(i)
+      ? `${{ next: "Next", random: "Random", shuffle: "Shuffle" }[advanceOf(i)!.mode as "next"]} card`
+      : cardLinks[i]
+        ? [cardLinks[i]!.name, ...(cardLinks[i]!.extras ?? []).map((x) => x.link.name)].join(" + ")
+        : null,
+    hasReference: !!cardLinks[i] && cardsOf(cardLinks[i]!).some((c) => c.reference),
     off: offOf(i),
   }));
   const tokensUsed = [prompt, ...characters.filter((_, i) => !offOf(i))].reduce((n, t) => n + roughTokens(t), 0);
@@ -3281,6 +3369,8 @@ export default function GenerateTab({
         <CharacterCardDialog
           characterCount={characters.length}
           maxCharacters={maxChars}
+          cardNames={characters.map((_, i) => cardLinks[i]?.name ?? null)}
+          onAdd={addCardTo}
           onLoad={loadCharacterCard}
           onLoadMany={loadManyCards}
           onClose={() => setShowCardDialog(false)}
@@ -3751,12 +3841,11 @@ export default function GenerateTab({
   }
   const updateReference = (i: number, patch: Partial<PreciseReference>) =>
     setReferences((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
-  const cardRefCount = cardLinks.filter((l, i) => l?.reference && !offOf(i)).length;
+  // Every card on a switched-on character (its added cards too) that brings a reference.
+  const onCards = cardLinks.flatMap((l, i) => (l && !offOf(i) ? cardsOf(l) : [])).filter((c) => c.reference);
+  const cardRefCount = onCards.length;
   // The loaded cards with a reference, once each.
-  const cardRefLinks = cardLinks.filter(
-    (l, i): l is CardLink =>
-      !!l?.reference && !offOf(i) && cardLinks.findIndex((m, k) => m && !offOf(k) && cardRefKey(m) === cardRefKey(l)) === i,
-  );
+  const cardRefLinks = onCards.filter((l, i) => onCards.findIndex((m) => cardRefKey(m) === cardRefKey(l)) === i);
   const cardRefsOn = cardRefLinks.filter((l) => !cardReferencesOff.includes(cardRefKey(l))).length;
   const modelKinds = referenceKinds(model);
   const maxStrength = maxReferenceStrength(model);
@@ -4325,6 +4414,97 @@ export default function GenerateTab({
     />
   );
 
+  // ---- Sections: the optional cards, shown or hidden from one row ----
+  // Each section's state when it's doing something ("2", "on"), or null.
+  const sectionStatus: Record<SectionId, string | null> = {
+    img2img: sourceImage ? "on" : null,
+    reference: modelInfo.preciseReference && formReferences.length > 0 ? String(formReferences.length) : null,
+    vibes: modelInfo.vibes && vibesOn > 0 && formReferences.length === 0 ? String(vibesOn) : null,
+    files: promptFiles.length > 0 || wildcardFolder.enabled ? String(promptFiles.length + (wildcardFolder.enabled ? folderFiles.length : 0)) : null,
+    automation:
+      automation.scramble.main ||
+      automation.scramble.mainNegative ||
+      automation.scramble.characters ||
+      automation.scramble.characterNegatives ||
+      automation.genderSwap.mode !== "off" ||
+      (automation.useAssociations && associations.length > 0)
+        ? "on"
+        : null,
+    artists: artists.enabled ? "on" : null,
+    creep: creep.enabled ? "on" : null,
+    workflow: planRun ? "running" : null,
+  };
+  // Read the saved choice once; the first time, show what's in use.
+  useEffect(() => {
+    if (!settingsLoaded || shownSections !== null) return;
+    void generateStore
+      .get<string[]>("sections")
+      .then((saved) => {
+        const valid = Array.isArray(saved) ? saved.filter((s): s is SectionId => SECTIONS.some((x) => x.id === s)) : null;
+        setShownSections(valid ?? SECTIONS.filter((x) => sectionStatus[x.id] !== null).map((x) => x.id));
+      })
+      .catch(() => setShownSections(SECTIONS.filter((x) => sectionStatus[x.id] !== null).map((x) => x.id)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingsLoaded]);
+  const isShown = (id: SectionId) => shownSections?.includes(id) ?? false;
+  function toggleSection(id: SectionId) {
+    const next = isShown(id) ? (shownSections ?? []).filter((s) => s !== id) : [...(shownSections ?? []), id];
+    setShownSections(next);
+    void generateStore.set("sections", next).catch(() => {});
+  }
+  const sectionsBar = (
+    <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", marginTop: 12 }}>
+      <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", marginRight: 4 }}>
+        Sections
+        <HelpTip
+          lines={[
+            { text: "Show or hide the optional cards. Hiding one doesn't turn it off: a hidden section that's doing something is marked with a dot." },
+          ]}
+        />
+      </span>
+      {SECTIONS.map(({ id, label }) => {
+        const shown = isShown(id);
+        const status = sectionStatus[id];
+        return (
+          <button
+            key={id}
+            onClick={() => toggleSection(id)}
+            title={
+              shown
+                ? `Hide ${label}${status ? " (it stays on)" : ""}`
+                : status
+                  ? `${label} is on (${status}) but hidden. Click to show it.`
+                  : `Show ${label}`
+            }
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 5,
+              padding: "3px 10px",
+              borderRadius: 999,
+              border: `1px solid ${shown ? "var(--accent)" : "var(--border)"}`,
+              background: shown ? "var(--accent)" : "transparent",
+              color: shown ? "var(--accent-contrast)" : "var(--text)",
+              fontFamily: "'Space Grotesk', sans-serif",
+              fontWeight: 600,
+              fontSize: 12,
+              cursor: "pointer",
+            }}
+          >
+            {!shown && status && (
+              <span style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--accent)", flexShrink: 0 }} />
+            )}
+            {label}
+            {status && (
+              <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 10.5, opacity: 0.85 }}>{status}</span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+  const section = (id: SectionId, card: React.ReactNode) => (isShown(id) ? card : null);
+
   // Pinned to the bottom of the window; the strip under it hides what scrolls past.
   const bottomBar = (
     <div
@@ -4649,6 +4829,7 @@ export default function GenerateTab({
         {phase === "loggedIn" && (
           <>
             {settingsCard}
+            {sectionsBar}
             {wide ? (
               <div
                 style={{
@@ -4661,17 +4842,17 @@ export default function GenerateTab({
               >
                 <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                   {promptCard}
-                  {promptFilesCard}
-                  {automationCard}
-                  {artistCard}
-                  {creepCard}
-                  {workflowCard}
+                  {section("files", promptFilesCard)}
+                  {section("automation", automationCard)}
+                  {section("artists", artistCard)}
+                  {section("creep", creepCard)}
+                  {section("workflow", workflowCard)}
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                   {charactersCard}
-                  {img2imgCard}
-                  {referenceCard}
-                  {vibesCard}
+                  {section("img2img", img2imgCard)}
+                  {section("reference", referenceCard)}
+                  {section("vibes", vibesCard)}
                   {lastCard}
                 </div>
               </div>
@@ -4679,14 +4860,14 @@ export default function GenerateTab({
               <div style={{ display: "flex", flexDirection: "column", gap: 16, marginTop: 16 }}>
                 {promptCard}
                 {charactersCard}
-                {img2imgCard}
-                {referenceCard}
-                {promptFilesCard}
-                {automationCard}
-                {artistCard}
-                {creepCard}
-                {workflowCard}
-                {vibesCard}
+                {section("img2img", img2imgCard)}
+                {section("reference", referenceCard)}
+                {section("files", promptFilesCard)}
+                {section("automation", automationCard)}
+                {section("artists", artistCard)}
+                {section("creep", creepCard)}
+                {section("workflow", workflowCard)}
+                {section("vibes", vibesCard)}
                 {lastCard}
               </div>
             )}

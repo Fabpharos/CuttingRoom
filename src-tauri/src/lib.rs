@@ -310,6 +310,33 @@ async fn list_character_cards(folder: String) -> Result<Vec<character_preset::Ca
 }
 
 #[tauri::command]
+async fn list_card_folders(folder: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || character_preset::list_folders(&folder))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn create_card_folder(folder: String, rel: String) -> Result<(), String> {
+    character_preset::create_folder(&folder, &rel)
+}
+
+#[tauri::command]
+fn rename_card_folder(folder: String, from: String, to: String) -> Result<(), String> {
+    character_preset::rename_folder(&folder, &from, &to)
+}
+
+#[tauri::command]
+fn remove_card_folder(folder: String, rel: String) -> Result<(), String> {
+    character_preset::remove_folder(&folder, &rel)
+}
+
+#[tauri::command]
+fn move_character_card(folder: String, card: String, to: String) -> Result<String, String> {
+    character_preset::move_card(&folder, &card, &to)
+}
+
+#[tauri::command]
 async fn save_character_card(
     folder: String,
     name: String,
@@ -506,6 +533,11 @@ pub fn run() {
             scan_image_prompt,
             list_character_cards,
             save_character_card,
+            list_card_folders,
+            create_card_folder,
+            rename_card_folder,
+            remove_card_folder,
+            move_character_card,
             nai_read_prompt_file,
             nai_read_vibe_file,
             nai_scan_upscale,

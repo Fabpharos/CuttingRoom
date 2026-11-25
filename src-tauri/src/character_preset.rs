@@ -3,6 +3,11 @@
 //! picks. The card itself is JSON, base64-encoded, in a `cutting-room-character`
 //! tEXt chunk. The frontend owns the card's fields; Rust only checks that it's
 //! a JSON object and stores it.
+//!
+//! Cards can be sorted into subfolders of the card folder (up to
+//! `MAX_DEPTH` deep). The library's own folders (`LIBRARY_DIRS`) and hidden
+//! ones are never card folders. Moving a card never overwrites another, and
+//! only an empty folder can be removed.
 
 use crate::novelai;
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -16,29 +21,179 @@ const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n
 /// The longest side of a card's thumbnail.
 const THUMB_SIDE: u32 = 512;
 
+/// Folders in the card folder that belong to the library, not to cards.
+const LIBRARY_DIRS: [&str; 4] = ["prompts", "plans", "artists", "vibes"];
+/// How deep card subfolders go.
+const MAX_DEPTH: usize = 4;
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CardFile {
     pub path: String,
     pub card: Value,
+    /// The subfolder it's in, relative to the card folder ("" for the card
+    /// folder itself, "Outfits/Summer" for a nested one).
+    pub folder: String,
 }
 
-/// Every card in `folder` (not its subfolders). PNGs without a card are skipped.
-pub fn list(folder: &str) -> Result<Vec<CardFile>, String> {
-    let entries = std::fs::read_dir(folder).map_err(|e| format!("couldn't read the card folder: {e}"))?;
-    let mut cards = Vec::new();
+/// The subfolders of `dir` that can hold cards, with their relative paths.
+fn card_subfolders(dir: &Path, rel: &str, depth: usize) -> Vec<(PathBuf, String)> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        let is_png = path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("png"));
-        if !is_png || !path.is_file() {
+        if !path.is_dir() {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&path) else { continue };
-        if let Some(card) = read_card(&bytes) {
-            cards.push(CardFile { path: path.to_string_lossy().into_owned(), card });
+        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else { continue };
+        if name.starts_with('.') || (depth == 0 && LIBRARY_DIRS.iter().any(|l| l.eq_ignore_ascii_case(&name))) {
+            continue;
+        }
+        let sub = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+        if depth + 1 < MAX_DEPTH {
+            out.extend(card_subfolders(&path, &sub, depth + 1));
+        }
+        out.push((path, sub));
+    }
+    out
+}
+
+/// Every card in `folder` and its card subfolders. PNGs without a card are skipped.
+pub fn list(folder: &str) -> Result<Vec<CardFile>, String> {
+    let root = Path::new(folder);
+    if !root.is_dir() {
+        return Err("couldn't read the card folder: it doesn't exist".into());
+    }
+    let mut dirs = vec![(root.to_path_buf(), String::new())];
+    dirs.extend(card_subfolders(root, "", 0));
+    let mut cards = Vec::new();
+    for (dir, rel) in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_png = path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("png"));
+            if !is_png || !path.is_file() {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            if let Some(card) = read_card(&bytes) {
+                cards.push(CardFile { path: path.to_string_lossy().into_owned(), card, folder: rel.clone() });
+            }
         }
     }
     Ok(cards)
+}
+
+/// Every card subfolder of `folder` (empty ones too), as relative paths.
+pub fn list_folders(folder: &str) -> Result<Vec<String>, String> {
+    let root = Path::new(folder);
+    if !root.is_dir() {
+        return Err("couldn't read the card folder: it doesn't exist".into());
+    }
+    let mut out: Vec<String> = card_subfolders(root, "", 0).into_iter().map(|(_, rel)| rel).collect();
+    out.sort_by_key(|r| r.to_lowercase());
+    Ok(out)
+}
+
+/// The directory for a relative card subfolder ("" is the card folder),
+/// after checking every part of it.
+fn subfolder_path(folder: &str, rel: &str) -> Result<PathBuf, String> {
+    let root = Path::new(folder);
+    if !root.is_dir() {
+        return Err("The card folder doesn't exist any more. Choose it again.".into());
+    }
+    let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.len() > MAX_DEPTH {
+        return Err(format!("Folders can be at most {MAX_DEPTH} deep."));
+    }
+    let mut path = root.to_path_buf();
+    for (i, part) in parts.iter().enumerate() {
+        let name = check_name(part).map_err(|e| e.replace("Card names", "Folder names").replace("the card", "the folder"))?;
+        if name != *part || name.starts_with('.') {
+            return Err(format!("\"{part}\" isn't a usable folder name."));
+        }
+        if i == 0 && LIBRARY_DIRS.iter().any(|l| l.eq_ignore_ascii_case(name)) {
+            return Err(format!("\"{name}\" is used by the library; pick another name."));
+        }
+        path.push(name);
+    }
+    Ok(path)
+}
+
+/// Makes the card subfolder `rel` (and any missing parents).
+pub fn create_folder(folder: &str, rel: &str) -> Result<(), String> {
+    let path = subfolder_path(folder, rel)?;
+    if rel.trim_matches('/').is_empty() {
+        return Err("Give the folder a name.".into());
+    }
+    if path.exists() {
+        return Err(format!("A folder named \"{rel}\" already exists."));
+    }
+    std::fs::create_dir_all(&path).map_err(|e| format!("couldn't make the folder: {e}"))
+}
+
+/// Renames the card subfolder `from` to `to` (both relative). Refuses to
+/// replace an existing folder.
+pub fn rename_folder(folder: &str, from: &str, to: &str) -> Result<(), String> {
+    let src = subfolder_path(folder, from)?;
+    let dest = subfolder_path(folder, to)?;
+    if from.trim_matches('/').is_empty() || to.trim_matches('/').is_empty() {
+        return Err("The card folder itself can't be renamed here.".into());
+    }
+    if !src.is_dir() {
+        return Err(format!("\"{from}\" doesn't exist any more."));
+    }
+    if dest.exists() && src.to_string_lossy().to_lowercase() != dest.to_string_lossy().to_lowercase() {
+        return Err(format!("A folder named \"{to}\" already exists."));
+    }
+    if dest.starts_with(&src) && dest != src {
+        return Err("A folder can't be moved inside itself.".into());
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("couldn't rename the folder: {e}"))?;
+    }
+    std::fs::rename(&src, &dest).map_err(|e| format!("couldn't rename the folder: {e}"))
+}
+
+/// Removes the card subfolder `rel`, only when it's empty.
+pub fn remove_folder(folder: &str, rel: &str) -> Result<(), String> {
+    if rel.trim_matches('/').is_empty() {
+        return Err("The card folder itself can't be removed here.".into());
+    }
+    let path = subfolder_path(folder, rel)?;
+    let empty = std::fs::read_dir(&path).map_err(|e| format!("couldn't read the folder: {e}"))?.next().is_none();
+    if !empty {
+        return Err("Only an empty folder can be removed. Move its cards out first.".into());
+    }
+    std::fs::remove_dir(&path).map_err(|e| format!("couldn't remove the folder: {e}"))
+}
+
+/// Moves the card at `card` into the card subfolder `to`. Returns its new
+/// path. The card must be in the card folder, and nothing is overwritten.
+pub fn move_card(folder: &str, card: &str, to: &str) -> Result<String, String> {
+    let root = std::fs::canonicalize(folder).map_err(|_| "The card folder doesn't exist any more.".to_string())?;
+    let src = std::fs::canonicalize(card).map_err(|_| "That card doesn't exist any more.".to_string())?;
+    if !src.starts_with(&root) || src.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) != Some("png".into()) {
+        return Err("That isn't a card in the card folder.".into());
+    }
+    let bytes = std::fs::read(&src).map_err(|e| format!("couldn't read the card: {e}"))?;
+    if read_card(&bytes).is_none() {
+        return Err("That file isn't a character card.".into());
+    }
+    let dir = subfolder_path(folder, to)?;
+    if !dir.is_dir() {
+        return Err(format!("The folder \"{to}\" doesn't exist."));
+    }
+    let dest = dir.join(src.file_name().ok_or("The card has no file name.")?);
+    if dest.exists() {
+        let same = std::fs::canonicalize(&dest).map(|d| d == src).unwrap_or(false);
+        if same {
+            return Ok(dest.to_string_lossy().into_owned());
+        }
+        return Err(format!("A card with that name is already in \"{}\".", if to.is_empty() { "the card folder" } else { to }));
+    }
+    std::fs::rename(&src, &dest).map_err(|e| format!("couldn't move the card: {e}"))?;
+    Ok(dest.to_string_lossy().into_owned())
 }
 
 fn read_card(png: &[u8]) -> Option<Value> {
@@ -250,6 +405,43 @@ mod tests {
         // Renaming onto another card is refused.
         save(folder, "Other", card.clone(), Some(&image), None).unwrap();
         assert!(save(folder, "Other", edited, None, Some(&renamed)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sorts_cards_into_folders() {
+        let dir = temp_dir("folders");
+        let folder = dir.to_str().unwrap();
+        let image = write_image(&dir, 300, 300);
+        let card = json!({ "name": "Mika", "tags": [] });
+        let path = save(folder, "Mika", card.clone(), Some(&image), None).unwrap();
+
+        create_folder(folder, "Outfits/Summer").unwrap();
+        assert!(create_folder(folder, "Outfits/Summer").is_err(), "already exists");
+        assert!(create_folder(folder, "prompts").is_err(), "library folder");
+        assert!(create_folder(folder, "a/../b").is_err());
+        assert!(create_folder(folder, "bad:name").is_err());
+        std::fs::create_dir_all(dir.join("plans")).unwrap();
+        assert_eq!(list_folders(folder).unwrap(), vec!["Outfits", "Outfits/Summer"]);
+
+        // Moving a card, and never onto another.
+        let moved = move_card(folder, &path, "Outfits/Summer").unwrap();
+        assert!(Path::new(&moved).exists() && !Path::new(&path).exists());
+        let cards = list(folder).unwrap();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].folder, "Outfits/Summer");
+        save(folder, "Mika", card, Some(&image), None).unwrap();
+        assert!(move_card(folder, &moved, "").is_err(), "a Mika is already there");
+        assert!(move_card(folder, &image, "Outfits").is_err(), "not a card");
+
+        // Only empty folders go; renaming keeps the cards.
+        assert!(remove_folder(folder, "Outfits/Summer").is_err());
+        rename_folder(folder, "Outfits", "Clothes").unwrap();
+        assert!(list(folder).unwrap().iter().any(|c| c.folder == "Clothes/Summer"));
+        create_folder(folder, "Empty").unwrap();
+        remove_folder(folder, "Empty").unwrap();
+        assert!(!dir.join("Empty").exists());
+        assert!(remove_folder(folder, "").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

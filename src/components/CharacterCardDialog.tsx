@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import RefMarker from "./RefMarker";
 import {
   PARTS,
   SHOW_OPTIONS,
@@ -10,6 +11,7 @@ import {
   listCards,
   loadCardFolder,
   saveCardFolder,
+  type CardExtra,
   type CardFile,
   type CardLink,
   type Part,
@@ -38,6 +40,14 @@ const secondaryButtonStyle: React.CSSProperties = {
   color: "var(--text)",
 };
 const labelStyle: React.CSSProperties = { fontSize: 12, fontWeight: 600, color: "var(--muted)" };
+const selectStyle: React.CSSProperties = {
+  padding: "5px 8px",
+  borderRadius: 7,
+  border: "1px solid var(--border)",
+  background: "var(--bg-page)",
+  color: "var(--text)",
+  fontSize: 13,
+};
 
 const chip = (on: boolean): React.CSSProperties => ({
   padding: "4px 12px",
@@ -51,21 +61,39 @@ const chip = (on: boolean): React.CSSProperties => ({
   cursor: "pointer",
 });
 
+/** Where the picked card goes: a new character, in place of one, or added to one that has a card. */
+type Target = { kind: "new" } | { kind: "replace"; slot: number } | { kind: "add"; slot: number; mode: CardExtra["mode"] };
+
+const targetValue = (t: Target) => (t.kind === "new" ? "new" : t.kind === "replace" ? `replace:${t.slot}` : `${t.mode}:${t.slot}`);
+function parseTarget(v: string): Target {
+  if (v === "new") return { kind: "new" };
+  const [k, n] = v.split(":");
+  const slot = Number(n);
+  return k === "replace" ? { kind: "replace", slot } : { kind: "add", slot, mode: k === "all" ? "all" : "outfit" };
+}
+
 /**
  * Picks a character card and fills a character with its prompt, leaving out
- * the parts the chosen view won't show.
+ * the parts the chosen view won't show, or adds it to a character that
+ * already has a card (an outfit, say), linking both cards to that character.
  */
 export default function CharacterCardDialog({
   characterCount,
   maxCharacters,
+  cardNames = [],
   onLoad,
+  onAdd,
   onLoadMany,
   onClose,
 }: {
   characterCount: number;
   maxCharacters: number;
+  /** The card each character has now (null: none), so cards can be added to it. */
+  cardNames?: (string | null)[];
   /** `slot` is the character to replace, or null to add a new one. */
   onLoad: (prompt: string, negative: string, slot: number | null, link: CardLink) => void;
+  /** Adds the card to character `slot`, as its outfit or with all its tags. */
+  onAdd?: (slot: number, link: CardLink, mode: CardExtra["mode"], hidden: Set<Part>) => void;
   /** Several cards (Ctrl+click) go into the next free slots. */
   onLoadMany?: (items: { prompt: string; negative: string; link: CardLink }[]) => void;
   onClose: () => void;
@@ -79,7 +107,10 @@ export default function CharacterCardDialog({
   const [options, setOptions] = useState<Set<ShowOption>>(new Set());
   const [hidden, setHidden] = useState<Set<Part>>(new Set());
   const canAdd = characterCount < maxCharacters;
-  const [slot, setSlot] = useState<number | null>(canAdd ? null : 0);
+  const [target, setTarget] = useState<Target>(canAdd ? { kind: "new" } : { kind: "replace", slot: 0 });
+  const slot = target.kind === "new" ? null : target.slot;
+  // "*" shows every folder's cards.
+  const [inFolder, setInFolder] = useState("*");
 
   async function load(f: string) {
     try {
@@ -144,6 +175,8 @@ export default function CharacterCardDialog({
   }
 
   const card = cards?.find((c) => c.path === picked)?.card ?? null;
+  const cardFolders = [...new Set((cards ?? []).map((c) => c.folder))].filter(Boolean).sort((a, b) => a.localeCompare(b));
+  const shown = (cards ?? []).filter((c) => inFolder === "*" || c.folder === inFolder);
   const many = extra.length > 0;
   const room = maxCharacters - characterCount;
   const prompt = card ? buildCharacterPrompt(card, hidden, options) : "";
@@ -203,8 +236,22 @@ export default function CharacterCardDialog({
           </div>
         ) : (
           <>
+            {cardFolders.length > 0 && (
+              <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 13 }}>
+                <span style={labelStyle}>Folder</span>
+                <select value={inFolder} onChange={(e) => setInFolder(e.target.value)} style={selectStyle}>
+                  <option value="*">All folders</option>
+                  <option value="">(card folder)</option>
+                  {cardFolders.map((f) => (
+                    <option key={f} value={f}>
+                      {f.replace(/\//g, " › ")}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(96px, 1fr))", gap: 8 }}>
-              {cards.map((c) => {
+              {shown.map((c) => {
                 const on = c.path === picked || extra.includes(c.path);
                 return (
                   <button
@@ -230,11 +277,14 @@ export default function CharacterCardDialog({
                       cursor: "pointer",
                     }}
                   >
-                    <img
-                      src={convertFileSrc(c.path)}
-                      alt=""
-                      style={{ width: 80, height: 80, objectFit: "cover", borderRadius: 6 }}
-                    />
+                    <span style={{ position: "relative", width: 80, height: 80 }}>
+                      <img
+                        src={convertFileSrc(c.path)}
+                        alt=""
+                        style={{ width: 80, height: 80, objectFit: "cover", borderRadius: 6, display: "block" }}
+                      />
+                      <RefMarker reference={c.card.reference} size="large" />
+                    </span>
                     <span
                       style={{
                         fontSize: 12,
@@ -305,26 +355,37 @@ export default function CharacterCardDialog({
 
             <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 13 }}>
               <span style={labelStyle}>Put it in</span>
-              <select
-                value={slot === null ? "new" : String(slot)}
-                onChange={(e) => setSlot(e.target.value === "new" ? null : Number(e.target.value))}
-                style={{
-                  padding: "5px 8px",
-                  borderRadius: 7,
-                  border: "1px solid var(--border)",
-                  background: "var(--bg-page)",
-                  color: "var(--text)",
-                  fontSize: 13,
-                }}
-              >
+              <select value={targetValue(target)} onChange={(e) => setTarget(parseTarget(e.target.value))} style={selectStyle}>
                 {canAdd && <option value="new">A new character</option>}
                 {Array.from({ length: characterCount }, (_, i) => (
-                  <option key={i} value={i}>
-                    Character {i + 1} (replace)
+                  <option key={`r${i}`} value={`replace:${i}`}>
+                    Character {i + 1} (replace{cardNames[i] ? ` ${cardNames[i]}` : ""})
                   </option>
                 ))}
+                {onAdd &&
+                  cardNames.map((n, i) =>
+                    n ? (
+                      <optgroup key={`a${i}`} label={`Add to character ${i + 1} (${n})`}>
+                        <option value={`outfit:${i}`}>As its outfit (replaces its upper and lower body tags)</option>
+                        <option value={`all:${i}`}>With all its tags</option>
+                      </optgroup>
+                    ) : null,
+                  )}
               </select>
             </label>
+            {target.kind === "add" && (
+              <div style={{ fontSize: 12, color: "var(--muted)", lineHeight: 1.5, marginTop: -6 }}>
+                {target.mode === "outfit"
+                  ? "Only this card's upper and lower body tags go in, replacing the character's own outfit. "
+                  : "Every tag of this card that the character doesn't have yet goes in. "}
+                Both cards stay linked to the character, so view tags and references keep working.
+                {card?.reference?.type === "character" || card?.reference?.type === "character&style"
+                  ? target.mode === "outfit"
+                    ? " This card's Character reference isn't sent as an outfit."
+                    : ""
+                  : ""}
+              </div>
+            )}
           </>
         )}
 
@@ -337,6 +398,10 @@ export default function CharacterCardDialog({
             disabled={!card || (!canAdd && slot === null)}
             onClick={() => {
               if (!card || !picked) return;
+              if (target.kind === "add" && onAdd) {
+                onAdd(target.slot, linkFor(card, picked), target.mode, hidden);
+                return;
+              }
               if (many && onLoadMany) {
                 const files = [picked, ...extra].map((p) => cards!.find((c) => c.path === p)!).slice(0, room);
                 onLoadMany(
@@ -349,7 +414,7 @@ export default function CharacterCardDialog({
               } else onLoad(prompt, card.negative, slot, linkFor(card, picked));
             }}
           >
-            {many ? `Add ${Math.min(room, extra.length + 1)} characters` : "Load"}
+            {target.kind === "add" ? `Add to character ${target.slot + 1}` : many ? `Add ${Math.min(room, extra.length + 1)} characters` : "Load"}
           </button>
         </div>
       </div>

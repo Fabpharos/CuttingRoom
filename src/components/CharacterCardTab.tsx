@@ -9,6 +9,13 @@ import { moveFilesToTrash } from "../lib/nativeOps";
 import { guessName } from "../lib/characterTags";
 import {
   PARTS,
+  CARD_REFERENCE_TYPES,
+  createCardFolder,
+  folderPath,
+  listCardFolders,
+  moveCard,
+  removeCardFolder,
+  renameCardFolder,
   listCards,
   loadCardFolder,
   promptOf,
@@ -28,6 +35,7 @@ import {
 } from "../lib/characterCards";
 import HelpTip from "./HelpTip";
 import AssociationsDialog from "./AssociationsDialog";
+import RefMarker from "./RefMarker";
 
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "webp"];
 
@@ -88,6 +96,8 @@ type PromptChoice = { label: string; prompt: string; negative: string };
 type Draft = {
   /** The card's file when editing one; null for a new card. */
   path: string | null;
+  /** The subfolder it's saved in ("" for the card folder itself). */
+  folder: string;
   /** The image a new card is made from. */
   image: string | null;
   name: string;
@@ -118,6 +128,10 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
   const [dragging, setDragging] = useState(false);
   const [version, setVersion] = useState(0);
   const [showAssociations, setShowAssociations] = useState(false);
+  // Subfolders of the card folder, and the one the list shows.
+  const [folders, setFolders] = useState<string[]>([]);
+  const [subfolder, setSubfolder] = useState("");
+  const [folderPrompt, setFolderPrompt] = useState<{ mode: "new" | "rename"; value: string } | null>(null);
 
   // Prompt boxes marked data-tags get Danbooru tag suggestions.
   const rootRef = useRef<HTMLDivElement>(null);
@@ -143,7 +157,10 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
   async function refresh(f = folder) {
     if (!f) return;
     try {
-      setCards(await listCards(f));
+      const [list, subs] = await Promise.all([listCards(f), listCardFolders(f).catch(() => [] as string[])]);
+      setCards(list);
+      setFolders(subs);
+      setSubfolder((s) => (s === "" || subs.includes(s) ? s : ""));
       setVersion((v) => v + 1);
     } catch (err) {
       setError(String(err));
@@ -161,6 +178,7 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
     const picked = await open({ directory: true, multiple: false });
     if (typeof picked !== "string") return null;
     setFolder(picked);
+    setSubfolder("");
     setDraft(null);
     setDirty(false);
     setError(null);
@@ -177,6 +195,7 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
       setSelected(new Set());
       setDraft({
         path: file.path,
+        folder: file.folder,
         image: null,
         name: file.card.name,
         text: promptOf(file.card.tags),
@@ -211,6 +230,7 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
     setSelected(new Set());
     setDraft({
       path: null,
+      folder: subfolder,
       image,
       name: guessName(tags.map((t) => t.text)),
       text: first?.prompt ?? "",
@@ -340,7 +360,7 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
         swaps: draft.swaps.filter((x) => x.from.trim()),
         reference: draft.reference,
       };
-      const path = await saveCard(f, card, draft.path ? { existing: draft.path } : { image: draft.image! });
+      const path = await saveCard(folderPath(f, draft.folder), card, draft.path ? { existing: draft.path } : { image: draft.image! });
       await refresh(f);
       setDraft({ ...draft, path, image: null, name: card.name, choices: [], choice: 0 });
       setDirty(false);
@@ -379,6 +399,74 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
       }
       await refresh();
       setMessage(`Moved ${fileName(file.path)} to the Recycle Bin.`);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  // The cards in the open folder, and how many cards each folder holds (its subfolders' too).
+  const shownCards = cards.filter((c) => c.folder === subfolder);
+  const folderCounts = new Map<string, number>();
+  for (const c of cards) {
+    const parts = c.folder ? c.folder.split("/") : [];
+    for (let i = 1; i <= parts.length; i++) {
+      const key = parts.slice(0, i).join("/");
+      folderCounts.set(key, (folderCounts.get(key) ?? 0) + 1);
+    }
+  }
+
+  async function runFolderPrompt() {
+    if (!folder || !folderPrompt) return;
+    const name = folderPrompt.value.trim();
+    if (!name) return;
+    if (/[\\/]/.test(name)) {
+      setError("A folder name can't contain / or \\. Open a folder first to make one inside it.");
+      return;
+    }
+    const parent = folderPrompt.mode === "new" ? subfolder : subfolder.split("/").slice(0, -1).join("/");
+    const rel = parent ? `${parent}/${name}` : name;
+    try {
+      if (folderPrompt.mode === "new") await createCardFolder(folder, rel);
+      else await renameCardFolder(folder, subfolder, rel);
+      setFolderPrompt(null);
+      setError(null);
+      // The open card's file moves with a renamed folder.
+      if (folderPrompt.mode === "rename" && draft?.path && (draft.folder === subfolder || draft.folder.startsWith(`${subfolder}/`))) {
+        guard(() => setDraft(null));
+      }
+      await refresh(folder);
+      setSubfolder(rel);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function runRemoveFolder() {
+    if (!folder || !subfolder) return;
+    try {
+      await removeCardFolder(folder, subfolder);
+      const parent = subfolder.split("/").slice(0, -1).join("/");
+      setSubfolder(parent);
+      setError(null);
+      await refresh(folder);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  /** Moves the open card to another folder (a new one just records where it'll be saved). */
+  async function moveDraft(to: string) {
+    if (!draft || !folder || to === draft.folder) return;
+    if (!draft.path) {
+      setDraft({ ...draft, folder: to });
+      return;
+    }
+    try {
+      const path = await moveCard(folder, draft.path, to);
+      setDraft({ ...draft, path, folder: to });
+      setMessage(`Moved ${draft.name || fileName(path)} to ${to || "the card folder"}.`);
+      setError(null);
+      await refresh(folder);
     } catch (err) {
       setError(String(err));
     }
@@ -468,10 +556,23 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
               Choose a folder to keep your cards in.
             </div>
           )}
-          {folder && cards.length === 0 && (
-            <div style={{ fontSize: 12.5, color: "var(--muted)", lineHeight: 1.5 }}>No cards in this folder yet.</div>
+          {folder && (
+            <FolderNav
+              current={subfolder}
+              folders={folders}
+              counts={folderCounts}
+              onOpen={setSubfolder}
+              onNew={() => setFolderPrompt({ mode: "new", value: "" })}
+              onRename={() => setFolderPrompt({ mode: "rename", value: subfolder.split("/").pop() ?? "" })}
+              onRemove={() => void runRemoveFolder()}
+            />
           )}
-          {cards.map((c) => {
+          {folder && shownCards.length === 0 && (
+            <div style={{ fontSize: 12.5, color: "var(--muted)", lineHeight: 1.5 }}>
+              {subfolder ? "No cards in this folder yet." : cards.length === 0 ? "No cards in this folder yet." : "No cards here; open a folder above."}
+            </div>
+          )}
+          {shownCards.map((c) => {
             const isOpen = draft?.path === c.path;
             return (
               <button
@@ -491,11 +592,14 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
                   textAlign: "left",
                 }}
               >
-                <img
-                  src={`${convertFileSrc(c.path)}?v=${version}`}
-                  alt=""
-                  style={{ width: 44, height: 44, objectFit: "cover", borderRadius: 6, flexShrink: 0 }}
-                />
+                <span style={{ position: "relative", width: 44, height: 44, flexShrink: 0 }}>
+                  <img
+                    src={`${convertFileSrc(c.path)}?v=${version}`}
+                    alt=""
+                    style={{ width: 44, height: 44, objectFit: "cover", borderRadius: 6, display: "block" }}
+                  />
+                  <RefMarker reference={c.card.reference} />
+                </span>
                 <span style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis" }}>
                   {c.card.name}
                 </span>
@@ -524,6 +628,24 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
                     style={{ ...textareaStyle, resize: "none" }}
                   />
                 </label>
+                {folder && (folders.length > 0 || draft.folder) && (
+                  <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={labelStyle}>Folder</span>
+                    <select
+                      value={draft.folder}
+                      onChange={(e) => void moveDraft(e.target.value)}
+                      title={draft.path ? "Moves the card to this folder now" : "Where the card will be saved"}
+                      style={{ ...textareaStyle, resize: "none", padding: "5px 8px", flex: 1, minWidth: 0 }}
+                    >
+                      <option value="">(card folder)</option>
+                      {folders.map((f) => (
+                        <option key={f} value={f}>
+                          {f.replace(/\//g, " › ")}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
                 {draft.image && draft.choices.length > 1 && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
                     <span style={labelStyle}>Read the prompt from</span>
@@ -759,10 +881,11 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
                   />
                   <div style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12.5, flex: 1, minWidth: 220 }}>
                     <div style={{ display: "flex", gap: 6 }}>
-                      {(["character", "character&style"] as const).map((t) => (
+                      {CARD_REFERENCE_TYPES.map(({ key: t, label }) => (
                         <button
                           key={t}
                           onClick={() => edit({ reference: { ...draft.reference!, type: t } })}
+                          title={t === "outfit" ? "Outfit references are V5 only; on V4.5 they're left out" : undefined}
                           style={{
                             ...secondaryButtonStyle,
                             padding: "3px 10px",
@@ -772,7 +895,7 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
                             borderColor: draft.reference!.type === t ? "var(--accent)" : "var(--border)",
                           }}
                         >
-                          {t === "character" ? "Character" : "Character & Style"}
+                          {label}
                         </button>
                       ))}
                     </div>
@@ -792,6 +915,7 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
                         />
                       </label>
                     ))}
+                    {(draft.reference.type === "character" || draft.reference.type === "character&style") && (
                     <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
                       <input
                         type="checkbox"
@@ -801,6 +925,7 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
                       />
                       Prefer same outfit (V5)
                     </label>
+                    )}
                     <div style={{ fontSize: 11.5, color: "var(--muted)" }}>
                       Strength above 1 is for V5; V4.5 uses at most 1. Fidelity is V4.5 only.
                     </div>
@@ -916,6 +1041,51 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
         />
       )}
 
+      {folderPrompt && (
+        <div
+          onClick={() => setFolderPrompt(null)}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 300 }}
+        >
+          <form
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              void runFolderPrompt();
+            }}
+            style={{
+              background: "var(--bg-card)",
+              border: "1px solid var(--border)",
+              borderRadius: 12,
+              padding: "20px 22px",
+              width: 360,
+              maxWidth: "90vw",
+              display: "flex",
+              flexDirection: "column",
+              gap: 12,
+            }}
+          >
+            <div style={{ fontSize: 16, fontWeight: 700 }}>
+              {folderPrompt.mode === "new" ? `New folder${subfolder ? ` in ${subfolder.replace(/\//g, " › ")}` : ""}` : "Rename folder"}
+            </div>
+            <input
+              autoFocus
+              value={folderPrompt.value}
+              onChange={(e) => setFolderPrompt({ ...folderPrompt, value: e.target.value })}
+              placeholder="e.g. Outfits"
+              style={{ ...textareaStyle, resize: "none" }}
+            />
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+              <button type="button" style={secondaryButtonStyle} onClick={() => setFolderPrompt(null)}>
+                Cancel
+              </button>
+              <button type="submit" style={{ ...primaryButtonStyle, opacity: folderPrompt.value.trim() ? 1 : 0.5 }} disabled={!folderPrompt.value.trim()}>
+                {folderPrompt.mode === "new" ? "Make folder" : "Rename"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
       {pendingDelete && (
         <ConfirmModal
           title="Delete this card?"
@@ -926,6 +1096,147 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
           onCancel={() => setPendingDelete(null)}
         />
       )}
+    </div>
+  );
+}
+
+function FolderIconSmall() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinejoin="round" style={{ flexShrink: 0 }}>
+      <path d="M3 6.5a1 1 0 0 1 1-1h5l2 2.2h9a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6.5Z" />
+    </svg>
+  );
+}
+
+/**
+ * The card list's folder bar: where you are (each step clickable), the
+ * folders inside it, and small New / Rename / Remove links.
+ */
+function FolderNav({
+  current,
+  folders,
+  counts,
+  onOpen,
+  onNew,
+  onRename,
+  onRemove,
+}: {
+  current: string;
+  folders: string[];
+  counts: Map<string, number>;
+  onOpen: (rel: string) => void;
+  onNew: () => void;
+  onRename: () => void;
+  onRemove: () => void;
+}) {
+  const steps = current ? current.split("/") : [];
+  const children = folders.filter((f) => {
+    if (current === "") return !f.includes("/");
+    return f.startsWith(`${current}/`) && !f.slice(current.length + 1).includes("/");
+  });
+  const link: React.CSSProperties = { fontSize: 12, fontWeight: 600 };
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 2, paddingBottom: 6, borderBottom: "1px solid var(--border)" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap", fontSize: 12, minHeight: 22 }}>
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            onOpen("");
+          }}
+          style={{ ...link, color: current ? "var(--accent)" : "var(--text)" }}
+        >
+          All cards
+        </a>
+        {steps.map((s, i) => {
+          const rel = steps.slice(0, i + 1).join("/");
+          const last = i === steps.length - 1;
+          return (
+            <span key={rel} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <span style={{ color: "var(--muted)" }}>›</span>
+              {last ? (
+                <span style={{ fontWeight: 600 }}>{s}</span>
+              ) : (
+                <a
+                  href="#"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    onOpen(rel);
+                  }}
+                  style={link}
+                >
+                  {s}
+                </a>
+              )}
+            </span>
+          );
+        })}
+      </div>
+      {children.map((f) => (
+        <button
+          key={f}
+          onClick={() => onOpen(f)}
+          title={f}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            padding: "5px 6px",
+            border: "none",
+            borderRadius: 6,
+            background: "transparent",
+            color: "var(--text)",
+            cursor: "pointer",
+            textAlign: "left",
+            fontSize: 13,
+          }}
+        >
+          <span style={{ color: "var(--muted)", display: "flex" }}>
+            <FolderIconSmall />
+          </span>
+          <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600 }}>
+            {f.split("/").pop()}
+          </span>
+          <span style={{ fontSize: 11, color: "var(--muted)", fontFamily: "'IBM Plex Mono', monospace" }}>{counts.get(f) ?? 0}</span>
+        </button>
+      ))}
+      <div style={{ display: "flex", gap: 12, paddingTop: 2 }}>
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            onNew();
+          }}
+          style={link}
+        >
+          + New folder
+        </a>
+        {current && (
+          <>
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                onRename();
+              }}
+              style={link}
+            >
+              Rename
+            </a>
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                onRemove();
+              }}
+              title="Remove this folder (only when it's empty)"
+              style={link}
+            >
+              Remove
+            </a>
+          </>
+        )}
+      </div>
     </div>
   );
 }

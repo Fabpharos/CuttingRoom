@@ -31,10 +31,20 @@ export const GENDERS: { key: Gender; label: string }[] = [
 /** A tag swap the card asks for: `$c1 swap: from$` becomes `to`. */
 export type CardSwap = { from: string; to: string };
 
-/** A Precise Reference image that comes with the card (V4.5 and V5). */
+export type CardReferenceType = "character" | "style" | "outfit" | "character&style";
+
+/** The reference types a card can carry, with their marker on the card's thumbnail. */
+export const CARD_REFERENCE_TYPES: { key: CardReferenceType; label: string; short: string }[] = [
+  { key: "character", label: "Character", short: "C" },
+  { key: "style", label: "Style", short: "S" },
+  { key: "outfit", label: "Outfit", short: "O" },
+  { key: "character&style", label: "Character & Style", short: "C+S" },
+];
+
+/** A Precise Reference image that comes with the card (V4.5 and V5; Outfit is V5 only). */
 export type CardReference = {
   path: string;
-  type: "character" | "character&style";
+  type: CardReferenceType;
   /** 0–5; V4.5 takes at most 1, so it's capped there. */
   strength: number;
   /** 0–1, V4.5 only. */
@@ -73,7 +83,8 @@ export function cleanLabels(labels: string[]): string[] {
   return [...new Set(labels.map((l) => l.trim().toLowerCase()).filter(Boolean))];
 }
 
-export type CardFile = { path: string; card: CharacterCard };
+/** A card on disk; `folder` is its subfolder of the card folder ("" for the folder itself). */
+export type CardFile = { path: string; card: CharacterCard; folder: string };
 
 const isPart = (v: unknown): v is Part => PARTS.some((p) => p.key === v);
 
@@ -87,7 +98,7 @@ function parseReference(raw: unknown): CardReference | null {
   if (typeof r.path !== "string" || !r.path) return null;
   return {
     path: r.path,
-    type: r.type === "character&style" ? "character&style" : "character",
+    type: CARD_REFERENCE_TYPES.some((t) => t.key === r.type) ? (r.type as CardReferenceType) : "character",
     strength: typeof r.strength === "number" && Number.isFinite(r.strength) ? Math.min(5, Math.max(0, r.strength)) : 1,
     fidelity: unit(r.fidelity, 1),
     preferSameOutfit: r.preferSameOutfit === true,
@@ -127,11 +138,11 @@ export function parseCard(raw: unknown): CharacterCard | null {
 }
 
 export async function listCards(folder: string): Promise<CardFile[]> {
-  const raw = await invoke<{ path: string; card: unknown }[]>("list_character_cards", { folder });
+  const raw = await invoke<{ path: string; card: unknown; folder?: string }[]>("list_character_cards", { folder });
   return raw
     .flatMap((f) => {
       const card = parseCard(f.card);
-      return card ? [{ path: f.path, card }] : [];
+      return card ? [{ path: f.path, card, folder: typeof f.folder === "string" ? f.folder : "" }] : [];
     })
     .sort((a, b) => a.card.name.localeCompare(b.card.name, undefined, { numeric: true, sensitivity: "base" }));
 }
@@ -153,6 +164,35 @@ export function saveCard(
     image: "image" in source ? source.image : null,
     existing: "existing" in source ? source.existing : null,
   });
+}
+
+// --- Subfolders of the card folder ("Outfits", "Outfits/Summer") ---
+
+export function listCardFolders(folder: string): Promise<string[]> {
+  return invoke("list_card_folders", { folder });
+}
+
+export function createCardFolder(folder: string, rel: string): Promise<void> {
+  return invoke("create_card_folder", { folder, rel });
+}
+
+export function renameCardFolder(folder: string, from: string, to: string): Promise<void> {
+  return invoke("rename_card_folder", { folder, from, to });
+}
+
+/** Removes an empty subfolder (Rust refuses one with anything in it). */
+export function removeCardFolder(folder: string, rel: string): Promise<void> {
+  return invoke("remove_card_folder", { folder, rel });
+}
+
+/** Moves a card into the subfolder `to` ("" for the card folder itself); returns its new path. */
+export function moveCard(folder: string, card: string, to: string): Promise<string> {
+  return invoke("move_character_card", { folder, card, to });
+}
+
+/** The directory a subfolder is in on disk. */
+export function folderPath(folder: string, rel: string): string {
+  return rel ? `${folder.replace(/[\\/]+$/, "")}\\${rel.replace(/\//g, "\\")}` : folder;
 }
 
 // The card folder is shared by the Character Cards tab and Generate.
@@ -250,7 +290,107 @@ export type CardLink = {
   negative?: string;
   /** The card's file, when known. */
   path?: string;
+  /** Other cards added to this same character (an outfit, say). */
+  extras?: CardExtra[];
 };
+
+/**
+ * A card added to a character that already has one, so both describe the
+ * same NovelAI character. "outfit" takes only the card's upper and lower body
+ * tags, in place of the character's own; "all" adds every tag of it.
+ */
+export type CardExtra = { link: CardLink; mode: "outfit" | "all" };
+
+/** The parts an outfit covers. */
+export const OUTFIT_PARTS: Part[] = ["upperBody", "lowerBody"];
+
+/** The tags an extra card brings to the character. */
+export function extraTags(extra: CardExtra): CardTag[] {
+  return extra.mode === "outfit" ? extra.link.tags.filter((t) => OUTFIT_PARTS.includes(t.part)) : extra.link.tags;
+}
+
+/**
+ * Every tag a character's prompt may hold from its cards, with its part: the
+ * main card's (minus its outfit when an outfit card replaces it) and the
+ * extras'. Used to drop what each image hides.
+ */
+export function linkTags(link: CardLink): CardTag[] {
+  const extras = link.extras ?? [];
+  const outfitReplaced = extras.some((e) => e.mode === "outfit");
+  const own = outfitReplaced ? link.tags.filter((t) => !OUTFIT_PARTS.includes(t.part)) : link.tags;
+  return [...own, ...extras.flatMap(extraTags)];
+}
+
+/**
+ * Adds `card` to a character whose prompt is `text` and whose card is
+ * `link`. As an outfit, the tags of the character's current outfit (its own
+ * card's, or an earlier outfit card's) leave the prompt and the new card's
+ * upper and lower body tags go in; an earlier outfit card is replaced. With
+ * "all", every tag the prompt doesn't have yet is added. `hidden` parts are
+ * left out, as when loading a card.
+ */
+export function addCardToCharacter(
+  text: string,
+  link: CardLink,
+  card: CardLink,
+  mode: CardExtra["mode"],
+  hidden: Set<Part> = new Set(),
+): { text: string; link: CardLink } {
+  let tags = splitTags(text);
+  let extras = link.extras ?? [];
+  if (mode === "outfit") {
+    // What the character wears now: an earlier outfit card's, or its own card's.
+    const current = extras.some((e) => e.mode === "outfit")
+      ? extras.filter((e) => e.mode === "outfit").flatMap(extraTags)
+      : link.tags.filter((t) => OUTFIT_PARTS.includes(t.part));
+    const drop = new Map<string, number>();
+    for (const t of current) drop.set(bareTag(t.text), (drop.get(bareTag(t.text)) ?? 0) + 1);
+    tags = tags.filter((tag) => {
+      const k = bareTag(tag);
+      const n = drop.get(k) ?? 0;
+      if (n === 0) return true;
+      drop.set(k, n - 1);
+      return false;
+    });
+    extras = extras.filter((e) => e.mode !== "outfit");
+  }
+  const extra: CardExtra = { link: { ...card, extras: undefined }, mode };
+  const have = new Set(tags.map(bareTag));
+  for (const t of extraTags(extra)) {
+    if (t.part !== "other" && hidden.has(t.part)) continue;
+    if (have.has(bareTag(t.text))) continue;
+    have.add(bareTag(t.text));
+    tags.push(t.text);
+  }
+  return { text: tags.join(", "), link: { ...link, extras: [...extras, extra] } };
+}
+
+/** Takes an added card back off a character: its tags leave the prompt (an outfit card's give way to the main card's outfit). */
+export function removeExtraCard(text: string, link: CardLink, index: number): { text: string; link: CardLink } {
+  const extras = link.extras ?? [];
+  const gone = extras[index];
+  if (!gone) return { text, link };
+  const drop = new Map<string, number>();
+  for (const t of extraTags(gone)) drop.set(bareTag(t.text), (drop.get(bareTag(t.text)) ?? 0) + 1);
+  const tags = splitTags(text).filter((tag) => {
+    const k = bareTag(tag);
+    const n = drop.get(k) ?? 0;
+    if (n === 0) return true;
+    drop.set(k, n - 1);
+    return false;
+  });
+  const rest = extras.filter((_, i) => i !== index);
+  if (gone.mode === "outfit") {
+    const have = new Set(tags.map(bareTag));
+    for (const t of link.tags.filter((t) => OUTFIT_PARTS.includes(t.part))) {
+      if (!have.has(bareTag(t.text))) {
+        have.add(bareTag(t.text));
+        tags.push(t.text);
+      }
+    }
+  }
+  return { text: tags.join(", "), link: { ...link, extras: rest.length > 0 ? rest : undefined } };
+}
 
 /** The link a character keeps to `card`. */
 export function linkFor(card: CharacterCard, path?: string): CardLink {
@@ -307,7 +447,7 @@ export function adaptCardCharacter(
   if (hidden.size === 0) return { text, views, hidden: [] };
   // How many of each card tag belong to a hidden part.
   const drop = new Map<string, number>();
-  for (const t of link.tags) {
+  for (const t of linkTags(link)) {
     if (t.part !== "other" && hidden.has(t.part)) drop.set(bareTag(t.text), (drop.get(bareTag(t.text)) ?? 0) + 1);
   }
   const kept = splitTags(text).flatMap(ungroup).filter((tag) => {
@@ -321,7 +461,7 @@ export function adaptCardCharacter(
 }
 
 /** A link read back from saved settings, or null if it isn't one. */
-export function parseCardLink(raw: unknown): CardLink | null {
+export function parseCardLink(raw: unknown, depth = 0): CardLink | null {
   if (typeof raw !== "object" || raw === null) return null;
   const r = raw as Record<string, unknown>;
   if (typeof r.name !== "string" || !Array.isArray(r.tags)) return null;
@@ -340,5 +480,14 @@ export function parseCardLink(raw: unknown): CardLink | null {
     reference: full?.reference ?? null,
     negative: typeof r.negative === "string" ? r.negative : undefined,
     path: typeof r.path === "string" ? r.path : undefined,
+    // Added cards are one level deep.
+    extras:
+      depth === 0 && Array.isArray(r.extras)
+        ? r.extras.flatMap((x): CardExtra[] => {
+            const e = x as Record<string, unknown> | null;
+            const link = e ? parseCardLink(e.link, 1) : null;
+            return link && (e!.mode === "outfit" || e!.mode === "all") ? [{ link, mode: e!.mode }] : [];
+          })
+        : undefined,
   };
 }
