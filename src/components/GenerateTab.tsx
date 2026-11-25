@@ -3605,6 +3605,18 @@ export default function GenerateTab({
                     {REFERENCE_KIND_LABELS[k]}
                   </button>
                 ))}
+              {takesPreferSameOutfit(model, r.kind) && (
+                <label style={{ display: "flex", alignItems: "center", gap: 5, marginLeft: 4 }}>
+                  <input
+                    type="checkbox"
+                    checked={r.preferSameOutfit === true}
+                    disabled={generating}
+                    onChange={(e) => updateReference(i, { preferSameOutfit: e.target.checked })}
+                    style={{ accentColor: "var(--accent)" }}
+                  />
+                  Prefer same outfit
+                </label>
+              )}
                 <a
                   href="#"
                   onClick={(e) => {
@@ -3642,18 +3654,6 @@ export default function GenerateTab({
                     onChange={(e) => updateReference(i, { fidelity: Number(e.target.value) })}
                     style={{ flex: 1, accentColor: "var(--accent)" }}
                   />
-                </label>
-              )}
-              {takesPreferSameOutfit(model, r.kind) && (
-                <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <input
-                    type="checkbox"
-                    checked={r.preferSameOutfit === true}
-                    disabled={generating}
-                    onChange={(e) => updateReference(i, { preferSameOutfit: e.target.checked })}
-                    style={{ accentColor: "var(--accent)" }}
-                  />
-                  Prefer same outfit
                 </label>
               )}
             </div>

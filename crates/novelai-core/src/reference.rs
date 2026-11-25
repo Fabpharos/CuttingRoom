@@ -22,10 +22,9 @@
 // fields as V4.5; an outfit reference's caption is "costume"; Character,
 // Style and "character&style" captions are as on V4.5; every secondary
 // strength is 0; a strength of 1.2 is recorded as 1.2; a Character reference
-// with "Prefer same outfit" is "character_mainoutfit". A Character & Style
-// reference made with "Prefer same outfit" ticked is recorded as plain
-// "character&style", so the switch changes nothing there and the app only
-// offers it on Character references.
+// with "Prefer same outfit" is "character_mainoutfit". Character & Style is
+// the other way round: plain "character&style" with it ticked and
+// "character&style_anyoutfit" without.
 
 use super::*;
 
@@ -67,14 +66,21 @@ pub fn max_reference_strength(model: &str) -> f64 {
     }
 }
 
-/// The base caption V5 is sent for a reference, as V5 samples record them:
-/// an outfit reference is "costume", and a Character reference with "Prefer
-/// same outfit" is "character_mainoutfit". Other types ignore the switch (a
-/// Character & Style sample made with it ticked records "character&style").
+/// The base caption V5 is sent for a reference, as V5 samples record them.
+/// "Prefer same outfit" adds a suffix to Character when ticked and to
+/// Character & Style when unticked:
+///
+/// | type            | unticked                    | ticked                 |
+/// |-----------------|-----------------------------|------------------------|
+/// | Character       | `character`                 | `character_mainoutfit` |
+/// | Character&Style | `character&style_anyoutfit` | `character&style`      |
+///
+/// Style is "style" and Outfit is "costume"; the switch doesn't apply.
 pub fn v5_caption(kind: &str, prefer_same_outfit: bool) -> String {
-    match kind {
-        "outfit" => "costume".into(),
-        "character" if prefer_same_outfit => "character_mainoutfit".into(),
+    match (kind, prefer_same_outfit) {
+        ("outfit", _) => "costume".into(),
+        ("character", true) => "character_mainoutfit".into(),
+        ("character&style", false) => "character&style_anyoutfit".into(),
         _ => kind.to_string(),
     }
 }
@@ -278,6 +284,7 @@ mod tests {
 
         assert_eq!(v5_caption("character", false), "character");
         assert_eq!(v5_caption("character&style", true), "character&style");
+        assert_eq!(v5_caption("character&style", false), "character&style_anyoutfit");
         assert_eq!(v5_caption("style", true), "style");
 
         r.precise_references[2].strength = 5.5;

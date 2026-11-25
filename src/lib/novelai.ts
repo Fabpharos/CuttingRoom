@@ -311,12 +311,11 @@ export function maxReferenceStrength(model: string): number {
 }
 
 /**
- * Whether "Prefer same outfit" applies: V5 Character references. (NovelAI's
- * site shows it on Character & Style too, but records the same request either
- * way, so it isn't offered there.)
+ * Whether "Prefer same outfit" applies: V5 Character and Character & Style
+ * references, as on NovelAI's site (`v5_caption` in Rust writes it).
  */
 export function takesPreferSameOutfit(model: string, kind: ReferenceKind): boolean {
-  return model.startsWith("nai-diffusion-5") && kind === "character";
+  return model.startsWith("nai-diffusion-5") && (kind === "character" || kind === "character&style");
 }
 
 /** What a request should cost; `anlas` is null when it can't be priced. */
