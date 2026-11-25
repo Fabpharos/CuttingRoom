@@ -36,6 +36,7 @@ import {
 import HelpTip from "./HelpTip";
 import AssociationsDialog from "./AssociationsDialog";
 import CardTree from "./CardTree";
+import { forgetThumbnail } from "../lib/thumbnails";
 
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "webp"];
 
@@ -98,7 +99,7 @@ type Draft = {
   path: string | null;
   /** The subfolder it's saved in ("" for the card folder itself). */
   folder: string;
-  /** The image a new card is made from. */
+  /** The image a new card is made from, or a saved card's replacement picture. */
   image: string | null;
   name: string;
   text: string;
@@ -239,10 +240,10 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
       ...CARD_V2_DEFAULTS,
       gender: guessGender(tags),
       labels: "",
-      // The image the card is made from is its reference unless the user
-      // removes it or picks another (it only costs anything when Generate
-      // sends it, which shows the price and asks first).
-      reference: { path: image, type: "character", strength: 1, fidelity: 1, preferSameOutfit: false },
+      // The card's own picture (the image it's made from, kept at full size)
+      // is its reference unless the user removes it or picks another (it only
+      // costs anything when Generate sends it, which shows the price and asks first).
+      reference: { path: image, self: true, type: "character", strength: 1, fidelity: 1, preferSameOutfit: false },
       choices,
       choice: 0,
     });
@@ -360,9 +361,12 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
         swaps: draft.swaps.filter((x) => x.from.trim()),
         reference: draft.reference,
       };
-      const path = await saveCard(folderPath(f, draft.folder), card, draft.path ? { existing: draft.path } : { image: draft.image! });
+      const path = await saveCard(folderPath(f, draft.folder), card, { existing: draft.path, image: draft.image });
+      if (draft.image) forgetThumbnail(path);
       await refresh(f);
-      setDraft({ ...draft, path, image: null, name: card.name, choices: [], choice: 0 });
+      // A card that is its own reference now points at the saved file.
+      const reference = draft.reference?.self ? { ...draft.reference, path } : draft.reference;
+      setDraft({ ...draft, path, image: null, reference, name: card.name, choices: [], choice: 0 });
       setDirty(false);
       setMessage(`Saved ${fileName(path)}.`);
     } catch (err) {
@@ -372,11 +376,25 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
     }
   }
 
-  /** Uses the card's own picture as its reference: the source image of a new card, or the saved card's thumbnail. */
+  /** Uses the card's own picture as its reference; it follows the card when it's moved or renamed. */
   function useOwnImage() {
     const path = draft?.image ?? draft?.path;
     if (!draft || !path) return;
-    edit({ reference: { type: "character", strength: 1, fidelity: 1, preferSameOutfit: false, ...draft.reference, path } });
+    edit({ reference: { type: "character", strength: 1, fidelity: 1, preferSameOutfit: false, ...draft.reference, path, self: true } });
+  }
+
+  /** Gives a saved card a new picture (e.g. the full-size image a small card was made from). */
+  async function replacePicture() {
+    const picked = await open({
+      directory: false,
+      multiple: false,
+      filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp"] }],
+    });
+    if (typeof picked !== "string" || !draft) return;
+    edit({
+      image: picked,
+      reference: draft.reference?.self ? { ...draft.reference, path: picked } : draft.reference,
+    });
   }
 
   async function chooseReference() {
@@ -386,7 +404,7 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
       filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp"] }],
     });
     if (typeof picked !== "string" || !draft) return;
-    edit({ reference: { type: "character", strength: 1, fidelity: 1, preferSameOutfit: false, ...draft.reference, path: picked } });
+    edit({ reference: { type: "character", strength: 1, fidelity: 1, preferSameOutfit: false, ...draft.reference, path: picked, self: false } });
   }
 
   async function runDelete(file: CardFile) {
@@ -494,8 +512,8 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
           Character prompt presets for NovelAI. Make a card from a NovelAI image (open or drop one): its character
           prompt is split into tags, with eye and hair tags sorted automatically, and you sort the rest into face,
           upper body and lower body. In Generate, <b>Load character card</b> fills a character with it and can leave
-          out what won't be seen (facing away, closed eyes, upper or lower body). Cards are saved as small PNGs in
-          the folder you choose.
+          out what won't be seen (facing away, closed eyes, upper or lower body). Cards are saved as full-size PNGs in
+          the folder you choose, so a card's own picture can be its Precise Reference.
         </div>
       </div>
 
@@ -586,11 +604,22 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
           <div style={{ ...cardStyle, flex: 1, minWidth: 360, display: "flex", flexDirection: "column", gap: 14 }}>
             <div style={{ display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
               {imageSrc && (
-                <img
-                  src={imageSrc}
-                  alt=""
-                  style={{ width: 150, maxHeight: 220, objectFit: "contain", borderRadius: 6, flexShrink: 0 }}
-                />
+                <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "center", flexShrink: 0 }}>
+                  <img src={imageSrc} alt="" style={{ width: 150, maxHeight: 220, objectFit: "contain", borderRadius: 6 }} />
+                  {draft.path && (
+                    <a
+                      href="#"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        void replacePicture();
+                      }}
+                      title="Give this card a new picture, kept at full size (saved when you save the card)"
+                      style={{ fontSize: 12, fontWeight: 600 }}
+                    >
+                      Replace picture…
+                    </a>
+                  )}
+                </div>
               )}
               <div style={{ flex: 1, minWidth: 220, display: "flex", flexDirection: "column", gap: 10 }}>
                 <label style={{ display: "flex", flexDirection: "column", gap: 5 }}>
@@ -841,7 +870,7 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
                 Precise Reference
                 <HelpTip
                   lines={[
-                    { text: "A reference image that comes with the card, so the character stays the same across images. A new card uses the image it's made from; Remove it to make a card without one." },
+                    { text: "A reference image that comes with the card, so the character stays the same across images. A new card uses its own picture (saved at full size, and it follows the card when it's moved or renamed); Remove it to make a card without one. Cards made before 1.7.3 have a small picture: Replace picture… gives one the full-size image." },
                     { text: "V5 and V4.5. NovelAI charges 5 Anlas per image for each reference; Generate shows the price and asks first." },
                   ]}
                 />
@@ -936,10 +965,10 @@ export default function CharacterCardTab({ active }: { active: boolean }) {
                         e.preventDefault();
                         useOwnImage();
                       }}
-                      title={draft.image ? "Use the image this card is made from" : "Use this card's picture (its saved thumbnail, up to 512 pixels)"}
+                      title="Use this card's own picture; it follows the card when it's moved or renamed"
                       style={{ fontWeight: 600 }}
                     >
-                      {draft.image ? "Use this image" : "Use the card's picture"}
+                      Use the card's picture
                     </a>
                   )}
                   <a

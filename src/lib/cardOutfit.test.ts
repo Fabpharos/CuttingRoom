@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { addCardToCharacter, adaptCardCharacter, linkTags, parseCardLink, removeExtraCard, type CardLink } from "./characterCards";
+import { addCardToCharacter, adaptCardCharacter, linkTags, parseCard, parseCardLink, removeExtraCard, type CardLink } from "./characterCards";
 
 const mika: CardLink = {
   name: "Mika",
@@ -65,4 +65,21 @@ test("added cards survive saving and reading back", () => {
   const back = parseCardLink(JSON.parse(JSON.stringify(r.link)));
   assert.equal(back?.extras?.[0].link.name, "Swimsuit");
   assert.equal(back?.extras?.[0].mode, "outfit");
+});
+
+test("a card that is its own reference follows its file", () => {
+  const card = parseCard({
+    version: 2,
+    name: "Mika",
+    tags: [],
+    reference: { path: "", self: true, type: "outfit", strength: 2, fidelity: 1 },
+  });
+  assert.equal(card?.reference?.self, true);
+  assert.equal(card?.reference?.type, "outfit");
+  // A saved link uses the card file it points at.
+  const link = parseCardLink({ name: "Mika", tags: [], path: "C:/cards/Outfits/Mika.png", reference: card?.reference });
+  assert.equal(link?.reference?.path, "C:/cards/Outfits/Mika.png");
+  // A reference that isn't the card keeps its own path; one with no path and not self is none.
+  assert.equal(parseCard({ version: 2, name: "A", tags: [], reference: { path: "C:/x.png" } })?.reference?.path, "C:/x.png");
+  assert.equal(parseCard({ version: 2, name: "A", tags: [], reference: { path: "" } })?.reference, null);
 });
